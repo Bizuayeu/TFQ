@@ -85,3 +85,31 @@ Measured directly on **NVIDIA GB10** (48 SMs, ~273 GB/s LPDDR5X peak bandwidth, 
 | `down` | `[5120 × 17408]` | 0.168 ms | **265.0 GB/s** | 0.178 ms | **250.1 GB/s** | **23.95 TFLOP/s** (1.91 ms) |
 | `qkv` (L2-hot) | `[10240 × 5120]` | 0.063 ms | **413.0 GB/s** | 0.080 ms | 326.7 GB/s | **27.22 TFLOP/s** (0.99 ms) |
 | `lm_head` | `[248320 × 5120]` | 2.792 ms | **227.7 GB/s** | 4.042 ms | 157.3 GB/s | — |
+
+---
+
+## 5. End-to-End Speculative Decoding Benchmarks (Metal & CUDA)
+
+All speculative decoding measurements below were verified **100% bit-exact** (`--no-drafts` SHA == drafted SHA at `temperature = 0.0`) on native TensorFold runtimes.
+
+### Apple Silicon Metal (Apple M5 Ultra)
+
+| Model | Target Size | Drafter | Plain (`--no-drafts`) | Drafted Decode | Speedup | Parity |
+|---|---:|---|---:|---:|---:|---|
+| **Qwen3.8-27B-TFQ3** | 14.37 GiB | **DFlash2** | 44.2 tok/s | **77.4 tok/s** (5.95 tok/round) | **+75%** | Bit-exact |
+| **GLM-5.3-Flash-TFQ3** | 129.97 GiB | **MTP + copies** | 69.2 tok/s | **95.2 tok/s** | **+38%** | Bit-exact |
+| **GLM-5.3-Flash-TFQ3** | 129.97 GiB | **DFlash2 (4-bit)** | 69.2 tok/s | **85.3 tok/s** | **+23%** | Bit-exact |
+| **Qwen3.8-Flash-Next-TFQ3** | 78.99 GiB | **MTP (`d3`) + copies** | 82.9 tok/s | **154.5 tok/s** | **+86%** | Bit-exact |
+
+### NVIDIA CUDA (NVIDIA GB10, SM 12.1, Direct PTX `m16n8k16` Split-K=8)
+
+- **Live `Qwen3.8-27B-TFQ3` (`tensorfold-native serve`, greedy `temp=0`, 256 completion tokens):**
+
+| Prompt Mode | `--no-drafts` | **+ DFlash2** | **+ DSpine** | Bit-Exact (`nodraft == DFlash2 == DSpine`) |
+|---|---:|---:|---:|---|
+| Coding (`thinking=False`) | 15.1 tok/s | **52.5 tok/s** (**3.48×**, 4.65 tok/round) | **56.6 tok/s** (**3.75×**, 5.12 tok/round) | **100% bit-exact** (`sha=738f62e12436`) |
+| Reasoning (`thinking=True`) | 15.1 tok/s | **43.8 tok/s** (**2.90×**, 3.94 tok/round) | **45.6 tok/s** (**3.02×**, 4.34 tok/round) | **100% bit-exact** (`sha=1454fc526024`) |
+
+- **Real-Shard CUDA Parity & Drafter Verification (`GLM-5.3-Flash` & `Qwen3.8-Flash-Next`):**
+  - **GLM-5.3-Flash** (`nonmoe.tffpw` 4b/5b `sk8` + `fused`, `layer_03.tffpw` 288-expert 3b/4b/5b MoE `top_k=8`): `cos = 0.999997–1.000000` vs `fp64`, bit-exact `rows=1 == rows=16` (`0` diffs), `215–244 GB/s` dense; live `GLM-5.3-Flash-DFlash2` (`bits=4` and BF16) verified end-to-end with shared TFQ3 `DraftHead`.
+  - **Qwen3.8-Flash-Next** (`layer_00.tffpw` target MoE & `mtp_00.tffpw` MTP drafter MoE, 512 experts, 3b/4b/5b `top_k=10` + 3-bit/32 PLE): `cos = 0.999998–1.000000` vs `fp64`, bit-exact `rows=1 == rows=16` (`0/25,600` diffs).
