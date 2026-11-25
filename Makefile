@@ -33,7 +33,7 @@ tools: $(BUILD)/tfq3-inspect $(BUILD)/tfq3-qwen27-package
 
 metal: generic qwen27 flashnext glm tfq4 $(BUILD)/tfq3-metal-test $(BUILD)/tfq3-metal-test.metallib $(BUILD)/tfq4-metal-test $(BUILD)/tfq4-metal-test.metallib
 
-cuda: tools $(BUILD)/tfq3-generic-convert-cuda $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq4-convert-cuda $(BUILD)/tfq3-cuda-test
+cuda: tools $(BUILD)/tfq3-generic-convert-cuda $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq3-ernie-convert-cuda $(BUILD)/tfq4-convert-cuda $(BUILD)/tfq3-cuda-test
 
 generic: $(BUILD)/tfq3-generic-convert $(BUILD)/tfq3-generic-convert.metallib
 
@@ -122,6 +122,9 @@ $(BUILD)/tfq3-flashnext-convert-cuda: src/converters/flashnext/convert.cu src/co
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
 $(BUILD)/tfq3-glm-convert-cuda: src/converters/glm/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp | $(BUILD)
+	$(NVCC) $(NVCCFLAGS) $< -o $@
+
+$(BUILD)/tfq3-ernie-convert-cuda: src/converters/ernie/convert.cu src/converters/cuda_encode_common.cuh | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
 $(BUILD)/tfq3-cuda-test: src/tools/tfq3_cuda_bench.cu src/kernels/cuda/tfq3_cuda.cuh | $(BUILD)
