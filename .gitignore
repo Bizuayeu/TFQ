@@ -1,0 +1,9 @@
+build/
+*.air
+*.metallib
+*.o
+.DS_Store
+__pycache__/
+*.pyc
+*.tffpw
+pw_v3_tables.bin

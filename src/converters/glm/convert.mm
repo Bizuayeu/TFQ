@@ -1,0 +1,839 @@
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#include <mach-o/dyld.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
+#include <map>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <vector>
+
+// ============================================================================
+// TFF-PrismWave v3 (2D-AffineCoset/half4) Production GPU Converter (Apple M5)
+//   - Generates deterministic 16KB pw_v3_tables.bin (exact fp16 LUTs & c64)
+//   - --mode heat543 / heat43 / heat443 : Converts FP8 MoE layers -> layer_XX.tffpw (version=3)
+//   - --mode nonmoe : Converts big 8-bit/64 non-MoE + L07-44 shared -> nonmoe.tffpw ("TFPN", v3)
+// ============================================================================
+
+static constexpr uint32_t MAGIC_TFPW = 0x57504654u; // "TFPW"
+static constexpr uint32_t MAGIC_TFPN = 0x4E504654u; // "TFPN"
+static constexpr uint32_t MAGIC_PWV3 = 0x33565750u; // "PWV3"
+static constexpr uint32_t FORMAT_VER = 3u;
+static constexpr size_t   ALIGN_16K  = 16384;
+
+static inline size_t align_up(size_t x, size_t a) { return (x + a - 1) & ~(a - 1); }
+
+struct PwV3TablesFile {
+    uint32_t magic;
+    uint32_t version;
+    float    a3, b3, a4, b4, a5, b5;
+    uint32_t pad0[8];            // 64 bytes
+    uint32_t lut3_u32[256];      // 1024 bytes  (off 64)
+    uint32_t lut4_u32[1024];     // 4096 bytes  (off 1088)
+    uint32_t lut5_u32[1024];     // 4096 bytes  (off 5184)
+    uint16_t c64_3[64][4];       // 512 bytes   (off 9280)
+    uint16_t c64_4[64][4];       // 512 bytes   (off 9792)
+    uint16_t c64_5[64][4];       // 512 bytes   (off 10304)
+    uint8_t  pad1[16384 - 10816];
+};
+static_assert(sizeof(PwV3TablesFile) == 16384, "PwV3TablesFile must be 16384 bytes");
+
+struct PrismLayerHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t layer_idx;
+    uint32_t num_experts;
+    uint32_t num_tensors;
+    uint32_t hidden_size;
+    uint32_t moe_inter;
+    uint32_t reserved0;
+    uint64_t raw_fp8_bytes;
+    uint64_t stream_words;
+    uint64_t scale_halfs;
+    uint64_t off_meta;
+    uint64_t off_scales;
+    uint64_t off_weights;
+    uint64_t reserved1[4];
+    uint8_t  meta_tag[32];
+};
+static_assert(sizeof(PrismLayerHeader) == 144, "Header must be 144 bytes");
+
+struct PrismExpertMeta {
+    uint32_t b_bits;
+    uint32_t heat_rank;
+    uint64_t gate_word_off;
+    uint64_t up_word_off;
+    uint64_t down_word_off;
+    uint32_t gate_sc_off;
+    uint32_t up_sc_off;
+    uint32_t down_sc_off;
+    float    gate_snr_db;
+    float    up_snr_db;
+    float    down_snr_db;
+    uint32_t reserved[2];
+};
+static_assert(sizeof(PrismExpertMeta) == 64, "ExpertMeta must be 64 bytes");
+
+struct NonMoeHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t num_tensors;
+    uint32_t pad0;
+    uint64_t off_meta;
+    uint64_t off_scales;
+    uint64_t off_weights;
+    uint64_t total_scale_halfs;
+    uint64_t total_weight_words;
+    uint64_t pad1;
+};
+static_assert(sizeof(NonMoeHeader) == 64, "NonMoeHeader must be 64 bytes");
+
+struct NonMoeTensorMeta {
+    char     name[80];
+    uint32_t R;
+    uint32_t C;
+    uint32_t b_bits;
+    uint32_t sc_off;
+    uint64_t word_off;
+    uint64_t word_count;
+    float    snr_db;
+    uint32_t pad[3];
+};
+static_assert(sizeof(NonMoeTensorMeta) == 128, "NonMoeTensorMeta must be 128 bytes");
+
+struct MatParams { uint32_t R, C, b_bits; float shrink; };
+struct EncParams { uint32_t R, C, b_bits, stream_off, n_streams; };
+struct P2 { float x, y; };
+
+static inline uint16_t f32_to_f16(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
+static inline float f16_to_f32(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
+static inline uint32_t pack_h2(float x, float y) { return (uint32_t)f32_to_f16(x) | ((uint32_t)f32_to_f16(y) << 16); }
+
+static double inv_norm_cdf(double p) {
+    p = std::min(1.0 - 1e-12, std::max(1e-12, p));
+    static const double a[6]={-3.969683028665376e+01,2.209460984245205e+02,-2.759285104469687e+02,1.383577518672690e+02,-3.066479806614716e+01,2.506628277459239e+00};
+    static const double b[5]={-5.447609879822406e+01,1.615858368580409e+02,-1.556989798598866e+02,6.680131188771972e+01,-1.328068155288572e+01};
+    static const double c[6]={-7.784894002430293e-03,-3.223964580411365e-01,-2.400758277161838e+00,-2.549732539343734e+00,4.374664141464968e+00,2.938163982698783e+00};
+    static const double d[4]={ 7.784695709041462e-03,3.224671290700398e-01,2.445134137142996e+00,3.754408661907416e+00};
+    if (p < 0.02425) { double q=sqrt(-2*log(p)); return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0); }
+    else if (p <= 0.97575) { double q=p-0.5,r=q*q; return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q/(((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1.0); }
+    else { double q=sqrt(-2*log(1-p)); return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0); }
+}
+
+static std::vector<P2> train_2d(int K, int seed, int n_iter) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int NS = 200000;
+    std::vector<P2> data(NS);
+    for (int i = 0; i < NS; ++i) data[i] = {nd(rng), nd(rng)};
+    std::vector<P2> cen(K);
+    const double phi2 = 1.3247179572447460, a1 = 1.0/phi2, a2 = 1.0/(phi2*phi2);
+    for (int i = 0; i < K; ++i) {
+        double u1 = fmod(0.5 + (i+0.5)*a1 + 0.031*seed, 1.0);
+        double u2 = fmod(0.5 + (i+0.5)*a2 + 0.067*seed, 1.0);
+        cen[i] = {(float)inv_norm_cdf(u1), (float)inv_norm_cdf(u2)};
+    }
+    std::vector<double> sx(K), sy(K); std::vector<int> cnt(K);
+    for (int it = 0; it < n_iter; ++it) {
+        std::fill(sx.begin(), sx.end(), 0.0); std::fill(sy.begin(), sy.end(), 0.0); std::fill(cnt.begin(), cnt.end(), 0);
+        for (int i = 0; i < NS; ++i) {
+            float x = data[i].x, y = data[i].y; int bi = 0; float bd = 1e30f;
+            for (int k = 0; k < K; ++k) { float dx=x-cen[k].x, dy=y-cen[k].y, d=dx*dx+dy*dy; if (d < bd) { bd=d; bi=k; } }
+            sx[bi] += x; sy[bi] += y; cnt[bi]++;
+        }
+        for (int k = 0; k < K; ++k) if (cnt[k]) { cen[k].x = (float)(sx[k]/cnt[k]); cen[k].y = (float)(sy[k]/cnt[k]); }
+    }
+    return cen;
+}
+
+static void fill_c64(uint16_t out[64][4], float alpha, float beta) {
+    for (int i = 0; i < 64; ++i) {
+        float sx = (i & 1) ? -1.0f : 1.0f;
+        float sy = (i & 2) ? -1.0f : 1.0f;
+        double u0 = fmod((i + 0.5) * 0.6180339887498949, 1.0) * 2.0 - 1.0;
+        double u1 = fmod((i + 0.5) * 0.3819660112501051, 1.0) * 2.0 - 1.0;
+        double u2 = fmod((i + 0.5) * 0.7548776662466927, 1.0) * 2.0 - 1.0;
+        double u3 = fmod((i + 0.5) * 0.5698402909980532, 1.0) * 2.0 - 1.0;
+        out[i][0] = f32_to_f16(sx * (1.0f + alpha * (float)u0));
+        out[i][1] = f32_to_f16(sy * (1.0f + alpha * (float)u1));
+        out[i][2] = f32_to_f16(beta * (float)u2);
+        out[i][3] = f32_to_f16(beta * (float)u3);
+    }
+}
+
+static void load_or_generate_tables(const std::string& path, PwV3TablesFile& tbl) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f) {
+        size_t nr = fread(&tbl, 1, sizeof(tbl), f);
+        fclose(f);
+        if (nr == sizeof(tbl) && tbl.magic == MAGIC_PWV3 && tbl.version == 3u) {
+            printf("Loaded existing v3 tables from %s\n", path.c_str());
+            return;
+        }
+    }
+    printf("Generating deterministic TFF-PrismWave v3 2D-AffineCoset tables -> %s ...\n", path.c_str());
+    fflush(stdout);
+    memset(&tbl, 0, sizeof(tbl));
+    tbl.magic = MAGIC_PWV3; tbl.version = 3u;
+    tbl.a3 = 0.22f; tbl.b3 = 0.38f;
+    tbl.a4 = 0.18f; tbl.b4 = 0.30f;
+    tbl.a5 = 0.10f; tbl.b5 = 0.18f;
+    for (int c = 0; c < 4; ++c) {
+        auto t3 = train_2d(64, 10 + c, 40);
+        for (int i = 0; i < 64; ++i) tbl.lut3_u32[i * 4 + c] = pack_h2(t3[i].x, t3[i].y);
+    }
+    for (int c = 0; c < 4; ++c) {
+        auto t4 = train_2d(256, 100 + c, 35);
+        for (int i = 0; i < 256; ++i) tbl.lut4_u32[i * 4 + c] = pack_h2(t4[i].x, t4[i].y);
+    }
+    auto t5 = train_2d(1024, 500, 30);
+    for (int i = 0; i < 1024; ++i) tbl.lut5_u32[i] = pack_h2(t5[i].x, t5[i].y);
+    fill_c64(tbl.c64_3, tbl.a3, tbl.b3);
+    fill_c64(tbl.c64_4, tbl.a4, tbl.b4);
+    fill_c64(tbl.c64_5, tbl.a5, tbl.b5);
+    FILE* fo = fopen(path.c_str(), "wb");
+    if (!fo) { fprintf(stderr, "Cannot write %s\n", path.c_str()); exit(1); }
+    fwrite(&tbl, 1, sizeof(tbl), fo);
+    fclose(fo);
+    printf("Saved %s (16,384 bytes)\n", path.c_str());
+}
+
+static std::vector<uint16_t> build_grid(const uint32_t* lut_u32, int lut_size, int N_sym, int C_shift, int G, int KC) {
+    int N_cb = lut_size / N_sym;
+    const float RMAX = 3.2f;
+    std::vector<uint16_t> grid((size_t)N_cb * G * G * KC);
+    std::vector<P2> pts(lut_size);
+    for (int i = 0; i < lut_size; ++i) {
+        pts[i] = {f16_to_f32((uint16_t)(lut_u32[i] & 0xFFFFu)), f16_to_f32((uint16_t)(lut_u32[i] >> 16))};
+    }
+    for (int c = 0; c < N_cb; ++c) {
+        for (int gy = 0; gy < G; ++gy) {
+            float cy = -RMAX + (gy + 0.5f) * (2.0f * RMAX / G);
+            for (int gx = 0; gx < G; ++gx) {
+                float cx = -RMAX + (gx + 0.5f) * (2.0f * RMAX / G);
+                std::vector<std::pair<float, uint16_t>> dl(N_sym);
+                for (int i = 0; i < N_sym; ++i) {
+                    int idx = (i << C_shift) | c;
+                    float dx = pts[idx].x - cx, dy = pts[idx].y - cy;
+                    dl[i] = {dx * dx + dy * dy, (uint16_t)i};
+                }
+                std::partial_sort(dl.begin(), dl.begin() + KC, dl.end());
+                size_t base = (((size_t)c * G + gy) * G + gx) * KC;
+                for (int k = 0; k < KC; ++k) grid[base + k] = dl[k].second;
+            }
+        }
+    }
+    return grid;
+}
+
+// Fast mmap safetensors reader with cached open shards
+struct ShardCache {
+    struct Meta { uint64_t off, len; int R, C; };
+    struct Entry {
+        int fd = -1; uint8_t* ptr = nullptr; size_t len = 0; uint64_t data_base = 0;
+        std::map<std::string, Meta> tensors;
+    };
+    std::string model_dir;
+    std::map<std::string, std::string> weight_map;
+    std::map<std::string, Entry> shards;
+
+    void init(const std::string& dir) {
+        model_dir = dir;
+        std::ifstream f(dir + "/model.safetensors.index.json");
+        std::string txt((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        size_t pos = txt.find("\"weight_map\"");
+        if (pos == std::string::npos) { fprintf(stderr, "No weight_map in %s\n", dir.c_str()); exit(1); }
+        pos = txt.find('{', pos);
+        size_t end = txt.find('}', pos);
+        std::string body = txt.substr(pos + 1, end - pos - 1);
+        size_t i = 0;
+        while (i < body.size()) {
+            size_t q1 = body.find('"', i); if (q1 == std::string::npos) break;
+            size_t q2 = body.find('"', q1 + 1);
+            size_t q3 = body.find('"', q2 + 1);
+            size_t q4 = body.find('"', q3 + 1);
+            weight_map[body.substr(q1 + 1, q2 - q1 - 1)] = body.substr(q3 + 1, q4 - q3 - 1);
+            i = q4 + 1;
+        }
+    }
+
+    bool has_tensor(const std::string& name) const { return weight_map.count(name) > 0; }
+
+    Entry& get_shard(const std::string& fn) {
+        auto it = shards.find(fn);
+        if (it != shards.end()) return it->second;
+        Entry e;
+        std::string full = model_dir + "/" + fn;
+        e.fd = open(full.c_str(), O_RDONLY);
+        if (e.fd < 0) { fprintf(stderr, "Cannot open %s\n", full.c_str()); exit(1); }
+        struct stat st{}; fstat(e.fd, &st); e.len = st.st_size;
+        e.ptr = (uint8_t*)mmap(nullptr, e.len, PROT_READ, MAP_PRIVATE, e.fd, 0);
+        uint64_t hlen = 0; memcpy(&hlen, e.ptr, 8);
+        e.data_base = 8 + hlen;
+        std::string hdr((const char*)e.ptr + 8, hlen);
+        size_t p = 0;
+        while (true) {
+            size_t dk = hdr.find("\"data_offsets\"", p);
+            if (dk == std::string::npos) break;
+            size_t open_brace = hdr.rfind('{', dk);
+            size_t close_brace = hdr.find('}', dk);
+            size_t colon = hdr.rfind(':', open_brace);
+            size_t q2 = hdr.rfind('"', colon);
+            size_t q1 = hdr.rfind('"', q2 - 1);
+            std::string tname = hdr.substr(q1 + 1, q2 - q1 - 1);
+            std::string obj = hdr.substr(open_brace, close_brace - open_brace + 1);
+            size_t lb = hdr.find('[', dk), cm = hdr.find(',', lb), rb = hdr.find(']', cm);
+            uint64_t o0 = std::stoull(hdr.substr(lb + 1, cm - lb - 1));
+            uint64_t o1 = std::stoull(hdr.substr(cm + 1, rb - cm - 1));
+            int R = 0, C = 0;
+            size_t sp = obj.find("\"shape\"");
+            if (sp != std::string::npos) {
+                size_t slb = obj.find('[', sp), srb = obj.find(']', slb);
+                std::string sbody = obj.substr(slb + 1, srb - slb - 1);
+                size_t scm = sbody.find(',');
+                if (scm != std::string::npos) { R = std::stoi(sbody.substr(0, scm)); C = std::stoi(sbody.substr(scm + 1)); }
+            }
+            e.tensors[tname] = {o0, o1 - o0, R, C};
+            p = close_brace + 1;
+        }
+        shards[fn] = std::move(e);
+        return shards[fn];
+    }
+
+    const uint8_t* get_tensor(const std::string& name, size_t* out_len = nullptr, int* out_R = nullptr, int* out_C = nullptr) {
+        auto it = weight_map.find(name);
+        if (it == weight_map.end()) { fprintf(stderr, "Missing tensor %s\n", name.c_str()); exit(1); }
+        Entry& sh = get_shard(it->second);
+        auto tit = sh.tensors.find(name);
+        if (tit == sh.tensors.end()) { fprintf(stderr, "Missing %s in %s\n", name.c_str(), it->second.c_str()); exit(1); }
+        if (out_len) *out_len = tit->second.len;
+        if (out_R) *out_R = tit->second.R;
+        if (out_C) *out_C = tit->second.C;
+        return sh.ptr + sh.data_base + tit->second.off;
+    }
+
+    ~ShardCache() {
+        for (auto& kv : shards) { if (kv.second.ptr) munmap(kv.second.ptr, kv.second.len); if (kv.second.fd >= 0) close(kv.second.fd); }
+    }
+};
+
+static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_path) {
+    std::map<int, std::vector<int>> counts;
+    std::ifstream f(trace_path);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("LAYER ", 0) == 0) {
+            int lyr = 0, eid = 0; long long cnt = 0;
+            if (sscanf(line.c_str(), "LAYER %d E%d %lld", &lyr, &eid, &cnt) == 3) {
+                if (!counts.count(lyr)) counts[lyr].assign(288, 0);
+                if (eid >= 0 && eid < 288) counts[lyr][eid] += (int)cnt;
+            }
+        }
+    }
+    std::map<int, std::vector<int>> ranks;
+    for (auto& kv : counts) {
+        std::vector<int> order(288); std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            return (kv.second[a] != kv.second[b]) ? (kv.second[a] > kv.second[b]) : (a < b);
+        });
+        std::vector<int> r(288);
+        for (int idx = 0; idx < 288; ++idx) r[order[idx]] = idx;
+        ranks[kv.first] = std::move(r);
+    }
+    return ranks;
+}
+
+static std::string default_metallib(const char* name) {
+    uint32_t sz = 0;
+    _NSGetExecutablePath(nullptr, &sz);
+    std::string exe(sz, '\0');
+    if (_NSGetExecutablePath(&exe[0], &sz) == 0) {
+        size_t sl = exe.find_last_of('/');
+        if (sl != std::string::npos) return exe.substr(0, sl + 1) + name;
+    }
+    return name;
+}
+
+int main(int argc, char** argv) {
+    std::string model_dir   = "";
+    std::string out_dir     = "";
+    std::string trace_path  = "";
+    std::string mode        = "heat43"; // heat543 | heat43 | heat443 | nonmoe
+    std::string metallib    = default_metallib("tfq3-glm-convert.metallib");
+    std::string tables_path = "";
+    int l_start = 3, l_end = 44;
+    bool skip_existing = false;
+    bool shared_pw4 = true;
+    bool fast4b = false;
+    bool head_pw5 = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "-h" || a == "--help") { model_dir.clear(); break; }
+        else if (a == "--model" && i + 1 < argc) model_dir = argv[++i];
+        else if (a == "--out" && i + 1 < argc) out_dir = argv[++i];
+        else if (a == "--trace" && i + 1 < argc) trace_path = argv[++i];
+        else if (a == "--mode" && i + 1 < argc) mode = argv[++i];
+        else if (a == "--metallib" && i + 1 < argc) metallib = argv[++i];
+        else if (a == "--tables" && i + 1 < argc) tables_path = argv[++i];
+        else if (a == "--layers" && i + 2 < argc) { l_start = atoi(argv[++i]); l_end = atoi(argv[++i]); }
+        else if (a == "--skip-existing") skip_existing = true;
+        else if (a == "--shared-pw5") shared_pw4 = false;
+        else if (a == "--fast4b") fast4b = true;
+        else if (a == "--head-pw5") head_pw5 = true;
+    }
+    if (model_dir.empty() || out_dir.empty()) {
+        fprintf(stderr, "Usage: %s --model <dir> --out <dir> [--mode heat543|heat43|heat443|nonmoe] [--layers S E] [--trace <file>] [--fast4b] [--shared-pw5] [--head-pw5] [--skip-existing] [--tables <path>] [--metallib <path>]\n", argv[0]);
+        return 1;
+    }
+    mkdir(out_dir.c_str(), 0755);
+    if (tables_path.empty()) tables_path = out_dir + "/pw_v3_tables.bin";
+
+    PwV3TablesFile tbl;
+    load_or_generate_tables(tables_path, tbl);
+
+    auto grid3 = build_grid(tbl.lut3_u32,  256,   64, 2, 16,  8);
+    auto grid4 = build_grid(tbl.lut4_u32, 1024,  256, 2, 16, 10);
+    auto grid5 = build_grid(tbl.lut5_u32, 1024, 1024, 0, 32, 12);
+
+    @autoreleasepool {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        id<MTLCommandQueue> q = [dev newCommandQueue];
+        NSError* err = nil;
+        id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:metallib.c_str()]] error:&err];
+        if (!lib) { fprintf(stderr, "metallib err: %s\n", [[err localizedDescription] UTF8String]); return 1; }
+        auto get_pso = [&](const char* name) {
+            NSError* e = nil;
+            id<MTLComputePipelineState> p = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:[NSString stringWithUTF8String:name]] error:&e];
+            if (!p) { fprintf(stderr, "pso %s err: %s\n", name, [[e localizedDescription] UTF8String]); exit(1); }
+            return p;
+        };
+
+        auto pso_fp8_row  = get_pso("fp8_dequant_row_fwht");
+        auto pso_q8_row   = get_pso("q8_64_dequant_row_fwht");
+        auto pso_col_fwht = get_pso("col_fwht_and_ss");
+        auto pso_pack_nax = get_pso("finalize_scales_and_pack_nax");
+        id<MTLComputePipelineState> pso_enc[6] = {};
+        pso_enc[3] = get_pso("prism_encode_v3_b3");
+        pso_enc[4] = get_pso("prism_encode_v3_b4");
+        pso_enc[5] = get_pso("prism_encode_v3_b5");
+        auto pso_snr = get_pso("prism_verify_v3_snr");
+
+        float fp8_lut[256];
+        for (int i = 0; i < 256; ++i) {
+            int s = (i >> 7) & 1, e = (i >> 3) & 15, m = i & 7;
+            float v = (e == 0) ? (m / 8.0f) * powf(2.0f, -6.0f) : (e == 15 && m == 7) ? 0.0f : (1.0f + m / 8.0f) * powf(2.0f, (float)(e - 7));
+            fp8_lut[i] = s ? -v : v;
+        }
+        id<MTLBuffer> buf_fp8_lut = [dev newBufferWithBytes:fp8_lut length:1024 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_lut[6] = {}, buf_c64[6] = {}, buf_grid[6] = {};
+        buf_lut[3]  = [dev newBufferWithBytes:tbl.lut3_u32 length:sizeof(tbl.lut3_u32) options:MTLResourceStorageModeShared];
+        buf_lut[4]  = [dev newBufferWithBytes:tbl.lut4_u32 length:sizeof(tbl.lut4_u32) options:MTLResourceStorageModeShared];
+        buf_lut[5]  = [dev newBufferWithBytes:tbl.lut5_u32 length:sizeof(tbl.lut5_u32) options:MTLResourceStorageModeShared];
+        buf_c64[3]  = [dev newBufferWithBytes:tbl.c64_3    length:sizeof(tbl.c64_3)    options:MTLResourceStorageModeShared];
+        buf_c64[4]  = [dev newBufferWithBytes:tbl.c64_4    length:sizeof(tbl.c64_4)    options:MTLResourceStorageModeShared];
+        buf_c64[5]  = [dev newBufferWithBytes:tbl.c64_5    length:sizeof(tbl.c64_5)    options:MTLResourceStorageModeShared];
+        buf_grid[3] = [dev newBufferWithBytes:grid3.data() length:grid3.size() * 2 options:MTLResourceStorageModeShared];
+        buf_grid[4] = [dev newBufferWithBytes:grid4.data() length:grid4.size() * 2 options:MTLResourceStorageModeShared];
+        buf_grid[5] = [dev newBufferWithBytes:grid5.data() length:grid5.size() * 2 options:MTLResourceStorageModeShared];
+
+        ShardCache cache;
+        cache.init(model_dir);
+
+        // ====================================================================
+        // MODE A: NON-MOE CONVERSION -> nonmoe.tffpw ("TFPN", v3, ~4.21 GB)
+        // ====================================================================
+        if (mode == "nonmoe") {
+            struct Task { std::string name; uint32_t R, C, bits; };
+            std::vector<Task> tasks;
+            const uint32_t nb_proj = fast4b ? 4u : 5u;
+            const uint32_t nb_head = (fast4b && !head_pw5) ? 4u : 5u;
+            for (int l = 0; l < 45; ++l) {
+                char p[160];
+                snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.q_proj", l);
+                if (cache.has_tensor(std::string(p) + ".weight")) {
+                    // KDA: q_proj, k_proj, v_proj CONTIGUOUS at PW4, o_proj at nb_proj (4b in fast4b)!
+                    for (const char* s : {"q_proj", "k_proj", "v_proj"}) {
+                        snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.%s", l, s);
+                        tasks.push_back({p, 8192, 4096, 4});
+                    }
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.o_proj", l);
+                    tasks.push_back({p, 4096, 8192, nb_proj});
+                } else {
+                    // MLA: q_b_proj [16384, 1536] + indexer.wq_b [4096, 1536] CONTIGUOUS (merged 20480x1536!) + o_proj!
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.q_b_proj", l);
+                    if (cache.has_tensor(std::string(p) + ".weight")) tasks.push_back({p, 16384, 1536, nb_proj});
+                    if (fast4b) {
+                        snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.indexer.wq_b", l);
+                        if (cache.has_tensor(std::string(p) + ".weight")) tasks.push_back({p, 4096, 1536, nb_proj});
+                    }
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.o_proj", l);
+                    if (cache.has_tensor(std::string(p) + ".weight")) tasks.push_back({p, 4096, 16384, nb_proj});
+                }
+                if (l < 3) {
+                    // Dense MLP: gate_proj, up_proj CONTIGUOUS, down_proj!
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.gate_proj", l); tasks.push_back({p, 12288, 4096, nb_proj});
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.up_proj",   l); tasks.push_back({p, 12288, 4096, nb_proj});
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.down_proj", l); tasks.push_back({p, 4096, 12288, nb_proj});
+                } else if (fast4b && l >= 3 && l < 7) {
+                    // Boundary Shared experts L03-L06 at PW5 (29.35 dB, fused in dec_*_543!)
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", l); tasks.push_back({p, 2048, 4096, 5});
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.shared_experts.up_proj",   l); tasks.push_back({p, 2048, 4096, 5});
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.shared_experts.down_proj", l); tasks.push_back({p, 4096, 2048, 5});
+                } else if (l >= 7) {
+                    // Deep Shared experts L07-L44: PW4 (23.35 dB -> ZERO 5b code in *_43!) or PW5
+                    uint32_t sb = shared_pw4 ? 4u : 5u;
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", l); tasks.push_back({p, 2048, 4096, sb});
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.shared_experts.up_proj",   l); tasks.push_back({p, 2048, 4096, sb});
+                    snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.shared_experts.down_proj", l); tasks.push_back({p, 4096, 2048, sb});
+                }
+            }
+            tasks.push_back({"lm_head", 154880, 4096, nb_head});
+
+            // Max chunk: 16384 x 4096 = 67.1M elems (lm_head chunked by 8192 rows!)
+            const size_t MAX_E = 16384ULL * 4096ULL;
+            const size_t HIST_SLOTS = 2097152ULL; // 2M pair-slots * 512 * 4B = 4.0 GB!
+            id<MTLBuffer> buf_q8_w   = [dev newBufferWithLength:MAX_E options:MTLResourceStorageModeShared];
+            id<MTLBuffer> buf_q8_s   = [dev newBufferWithLength:(MAX_E / 64) * 2 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> buf_q8_b   = [dev newBufferWithLength:(MAX_E / 64) * 2 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> buf_w_tmp  = [dev newBufferWithLength:MAX_E * 4 options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> buf_w_rot  = [dev newBufferWithLength:MAX_E * 4 options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> buf_blk_ss = [dev newBufferWithLength:8192 * 4 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> buf_str    = [dev newBufferWithLength:MAX_E * 4 options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> buf_hist   = [dev newBufferWithLength:HIST_SLOTS * 512ULL * 4ULL options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> buf_pack   = [dev newBufferWithLength:MAX_E options:MTLResourceStorageModeShared]; // max 5b < 1B/elem
+            id<MTLBuffer> buf_sc     = [dev newBufferWithLength:8192 * 2 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> buf_se     = [dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
+
+            std::vector<NonMoeTensorMeta> metas(tasks.size());
+            uint64_t total_sc = 0, total_wd = 0;
+            for (size_t i = 0; i < tasks.size(); ++i) {
+                memset(&metas[i], 0, sizeof(NonMoeTensorMeta));
+                strncpy(metas[i].name, tasks[i].name.c_str(), 79);
+                metas[i].R = tasks[i].R; metas[i].C = tasks[i].C; metas[i].b_bits = tasks[i].bits;
+                uint64_t sc_cnt = (uint64_t)(tasks[i].R / 128) * (tasks[i].C / 128);
+                uint64_t wd_cnt = (uint64_t)(tasks[i].R / 16) * (tasks[i].C / 128) * (tasks[i].bits * 2u) * 32u;
+                metas[i].sc_off = (uint32_t)total_sc; total_sc += sc_cnt;
+                metas[i].word_off = total_wd; metas[i].word_count = wd_cnt; total_wd += wd_cnt;
+            }
+            std::vector<uint16_t> all_scales(total_sc);
+            std::vector<uint32_t> all_weights(total_wd);
+
+            printf("====================================================================================================\n");
+            printf("TFF-PrismWave v3 NON-MOE CONVERTER | %zu tensors | total=%.3f GB\n",
+                   tasks.size(), (double)(total_wd * 4ULL + total_sc * 2ULL) / 1e9);
+            printf("====================================================================================================\n");
+            fflush(stdout);
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            double snr_sum[6] = {}; int snr_cnt[6] = {};
+            for (size_t ti = 0; ti < tasks.size(); ++ti) {
+                const auto& t = tasks[ti];
+                const uint8_t* w_ptr = cache.get_tensor(t.name + ".weight");
+                const uint8_t* s_ptr = cache.get_tensor(t.name + ".scales");
+                const uint8_t* b_ptr = cache.get_tensor(t.name + ".biases");
+                uint32_t chunk_R = (t.R > 16384u) ? 8192u : t.R;
+                double tot_sig = 0.0, tot_err = 0.0;
+
+                for (uint32_t r0 = 0; r0 < t.R; r0 += chunk_R) {
+                    uint32_t sr = std::min(chunk_R, t.R - r0);
+                    memcpy([buf_q8_w contents], w_ptr + (size_t)r0 * t.C, (size_t)sr * t.C);
+                    memcpy([buf_q8_s contents], s_ptr + (size_t)r0 * (t.C / 64) * 2, (size_t)sr * (t.C / 64) * 2);
+                    memcpy([buf_q8_b contents], b_ptr + (size_t)r0 * (t.C / 64) * 2, (size_t)sr * (t.C / 64) * 2);
+                    size_t n_blks = (size_t)(sr / 128) * (t.C / 128);
+                    memset([buf_blk_ss contents], 0, n_blks * 4);
+                    memset([buf_se contents], 0, 8);
+
+                    MatParams mp = {sr, t.C, t.bits, 1.0f};
+                    uint32_t total_streams = (sr / 16) * 32;
+                    uint32_t n_pairs = t.C / 4;
+                    uint32_t batch_sz = (uint32_t)std::max<size_t>(1, HIST_SLOTS / n_pairs);
+
+                    @autoreleasepool {
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:pso_q8_row];
+                    [enc setBuffer:buf_q8_w offset:0 atIndex:0]; [enc setBuffer:buf_q8_s offset:0 atIndex:1];
+                    [enc setBuffer:buf_q8_b offset:0 atIndex:2]; [enc setBuffer:buf_w_tmp offset:0 atIndex:3];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(t.C / 128, sr, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                    [enc setComputePipelineState:pso_col_fwht];
+                    [enc setBuffer:buf_w_tmp offset:0 atIndex:0]; [enc setBuffer:buf_w_rot offset:0 atIndex:1];
+                    [enc setBuffer:buf_blk_ss offset:0 atIndex:2]; [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(t.C, sr / 128, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                    [enc setComputePipelineState:pso_pack_nax];
+                    [enc setBuffer:buf_w_rot offset:0 atIndex:0]; [enc setBuffer:buf_blk_ss offset:0 atIndex:1];
+                    [enc setBuffer:buf_sc offset:0 atIndex:2]; [enc setBuffer:buf_str offset:0 atIndex:3];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(sr / 16, t.C / 128, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                    [enc setComputePipelineState:pso_enc[t.bits]];
+                    for (uint32_t off = 0; off < total_streams; off += batch_sz) {
+                        uint32_t cnt = std::min(batch_sz, total_streams - off);
+                        EncParams ep = {sr, t.C, t.bits, off, cnt};
+                        [enc setBuffer:buf_str offset:0 atIndex:0];
+                        [enc setBuffer:buf_lut[t.bits] offset:0 atIndex:1];
+                        [enc setBuffer:buf_c64[t.bits] offset:0 atIndex:2];
+                        [enc setBuffer:buf_grid[t.bits] offset:0 atIndex:3];
+                        [enc setBuffer:buf_hist offset:0 atIndex:4];
+                        [enc setBuffer:buf_pack offset:0 atIndex:5];
+                        [enc setBytes:&ep length:sizeof(ep) atIndex:6];
+                        [enc dispatchThreadgroups:MTLSizeMake(cnt, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    }
+
+                    [enc setComputePipelineState:pso_snr];
+                    [enc setBuffer:buf_pack offset:0 atIndex:0]; [enc setBuffer:buf_sc offset:0 atIndex:1];
+                    [enc setBuffer:buf_lut[t.bits] offset:0 atIndex:2]; [enc setBuffer:buf_c64[t.bits] offset:0 atIndex:3];
+                    [enc setBuffer:buf_w_rot offset:0 atIndex:4]; [enc setBuffer:buf_se offset:0 atIndex:5];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:6];
+                    [enc dispatchThreadgroups:MTLSizeMake(sr / 16, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                    }
+                    const float* se = (const float*)[buf_se contents];
+                    tot_sig += se[0]; tot_err += se[1];
+                    size_t sc_off_chunk = (size_t)(r0 / 128) * (t.C / 128);
+                    size_t wd_off_chunk = (size_t)(r0 / 16) * (t.C / 128) * (t.bits * 2u) * 32u;
+                    size_t wd_cnt_chunk = (size_t)(sr / 16) * (t.C / 128) * (t.bits * 2u) * 32u;
+                    memcpy(all_scales.data() + metas[ti].sc_off + sc_off_chunk, [buf_sc contents], n_blks * 2);
+                    memcpy(all_weights.data() + metas[ti].word_off + wd_off_chunk, [buf_pack contents], wd_cnt_chunk * 4);
+                }
+                float snr = (float)(10.0 * log10(tot_sig / std::max(1e-18, tot_err)));
+                metas[ti].snr_db = snr;
+                snr_sum[t.bits] += snr; snr_cnt[t.bits]++;
+                if ((ti + 1) % 25 == 0 || ti + 1 == tasks.size() || snr < 22.0f) {
+                    double el = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+                    printf("  [%3zu/%zu] %-56s [%6u,%5u] %ub SNR=%5.2f dB (%.1fs)\n",
+                           ti + 1, tasks.size(), t.name.c_str(), t.R, t.C, t.bits, snr, el);
+                    fflush(stdout);
+                }
+            }
+
+            uint64_t off_meta    = sizeof(NonMoeHeader);
+            uint64_t off_scales  = align_up(off_meta + metas.size() * sizeof(NonMoeTensorMeta), ALIGN_16K);
+            uint64_t off_weights = align_up(off_scales + all_scales.size() * 2ULL, ALIGN_16K);
+            NonMoeHeader hdr{};
+            hdr.magic = MAGIC_TFPN; hdr.version = FORMAT_VER; hdr.num_tensors = (uint32_t)metas.size();
+            hdr.off_meta = off_meta; hdr.off_scales = off_scales; hdr.off_weights = off_weights;
+            hdr.total_scale_halfs = all_scales.size(); hdr.total_weight_words = all_weights.size();
+
+            std::string out_path = out_dir + "/nonmoe.tffpw";
+            FILE* fout = fopen(out_path.c_str(), "wb");
+            fwrite(&hdr, 1, sizeof(hdr), fout);
+            fwrite(metas.data(), sizeof(NonMoeTensorMeta), metas.size(), fout);
+            size_t cur = off_meta + metas.size() * sizeof(NonMoeTensorMeta);
+            std::vector<uint8_t> zeros(ALIGN_16K, 0);
+            if (off_scales > cur) fwrite(zeros.data(), 1, off_scales - cur, fout);
+            fwrite(all_scales.data(), 2, all_scales.size(), fout);
+            cur = off_scales + all_scales.size() * 2ULL;
+            if (off_weights > cur) fwrite(zeros.data(), 1, off_weights - cur, fout);
+            fwrite(all_weights.data(), 4, all_weights.size(), fout);
+            size_t end_pos = off_weights + all_weights.size() * 4ULL;
+            size_t pad_end = align_up(end_pos, ALIGN_16K) - end_pos;
+            if (pad_end) fwrite(zeros.data(), 1, pad_end, fout);
+            fclose(fout);
+            double el = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+            printf("NON-MOE DONE in %.1fs -> %s (%.3f GB) | Mean SNR: 4b=%.2f dB (n=%d), 5b=%.2f dB (n=%d)\n",
+                   el, out_path.c_str(), (double)(end_pos + pad_end) / 1e9,
+                   snr_cnt[4] ? snr_sum[4]/snr_cnt[4] : 0.0, snr_cnt[4],
+                   snr_cnt[5] ? snr_sum[5]/snr_cnt[5] : 0.0, snr_cnt[5]);
+            return 0;
+        }
+
+        // ====================================================================
+        // MODE B: MOE LAYER CONVERSION -> layer_XX.tffpw ("TFPW", version=3)
+        // ====================================================================
+        const size_t MAX_ELEMS = 2048 * 4096;
+        const int BATCH_STREAMS = 4096;
+        id<MTLBuffer> buf_fp8_in   = [dev newBufferWithLength:MAX_ELEMS options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_sc_inv   = [dev newBufferWithLength:512 * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_w_tmp    = [dev newBufferWithLength:MAX_ELEMS * 4 options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> buf_w_rot    = [dev newBufferWithLength:MAX_ELEMS * 4 options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> buf_blk_ss   = [dev newBufferWithLength:512 * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_streams  = [dev newBufferWithLength:MAX_ELEMS * 4 options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> buf_hist     = [dev newBufferWithLength:(size_t)BATCH_STREAMS * 1024 * 512 * 4 options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> buf_mat_pack = [dev newBufferWithLength:(size_t)256 * 16 * 10 * 32 * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_mat_sc   = [dev newBufferWithLength:512 * 2 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_se_out   = [dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
+
+        auto heat_ranks = load_heat_ranks(trace_path);
+        const int H = 4096, I = 2048, N_EXP = 288;
+        const char* proj_names[3] = {"gate_proj", "up_proj", "down_proj"};
+        const int proj_R[3] = {I, I, H};
+        const int proj_C[3] = {H, H, I};
+
+        printf("============================================================================================================\n");
+        printf("TFF-PrismWave v3 MOE CONVERTER | mode=%s | layers=%d..%d | out=%s\n", mode.c_str(), l_start, l_end, out_dir.c_str());
+        printf("============================================================================================================\n");
+        fflush(stdout);
+
+        auto t_all = std::chrono::high_resolution_clock::now();
+        for (int lyr = l_start; lyr <= l_end; ++lyr) {
+            char out_path[512];
+            snprintf(out_path, sizeof(out_path), "%s/layer_%02d.tffpw", out_dir.c_str(), lyr);
+            if (skip_existing) {
+                struct stat cst{};
+                if (stat(out_path, &cst) == 0 && cst.st_size > 1000000000LL) {
+                    printf("L%02d SKIP (exists: %.3f GB)\n", lyr, (double)cst.st_size / 1e9);
+                    fflush(stdout);
+                    continue;
+                }
+            }
+            auto t_lyr = std::chrono::high_resolution_clock::now();
+            std::vector<int> ranks(N_EXP);
+            if (heat_ranks.count(lyr)) ranks = heat_ranks[lyr];
+            else std::iota(ranks.begin(), ranks.end(), 0);
+
+            std::vector<PrismExpertMeta> metas(N_EXP);
+            memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
+            uint64_t cur_word = 0; uint32_t cur_sc = 0;
+            for (int e = 0; e < N_EXP; ++e) {
+                int r = ranks[e];
+                uint32_t b = 4;
+                if (mode == "heat543")       b = (r < 64) ? 5u : (r < 160 ? 4u : 3u);
+                else if (mode == "heat443")  b = (r < 160) ? 4u : 3u;
+                else if (mode == "heat43")   b = (r < 96) ? 4u : 3u;
+                else if (mode == "uniform4") b = 4u;
+                else if (mode == "uniform3") b = 3u;
+                metas[e].b_bits = b; metas[e].heat_rank = (uint32_t)r;
+                uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;
+                metas[e].gate_word_off = cur_word; cur_word += wpm;
+                metas[e].up_word_off   = cur_word; cur_word += wpm;
+                metas[e].down_word_off = cur_word; cur_word += wpm;
+                metas[e].gate_sc_off = cur_sc; cur_sc += 512;
+                metas[e].up_sc_off   = cur_sc; cur_sc += 512;
+                metas[e].down_sc_off = cur_sc; cur_sc += 512;
+            }
+            std::vector<uint16_t> all_scales(cur_sc);
+            std::vector<uint32_t> all_weights(cur_word);
+            double snr_sum[6] = {}; int snr_cnt[6] = {};
+
+            for (int e = 0; e < N_EXP; ++e) {
+                uint32_t b = metas[e].b_bits;
+                uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;
+                for (int p = 0; p < 3; ++p) {
+                    int R = proj_R[p], C = proj_C[p];
+                    char base[256];
+                    snprintf(base, sizeof(base), "model.language_model.layers.%d.mlp.experts.%d.%s", lyr, e, proj_names[p]);
+                    size_t nw = 0, ns = 0;
+                    const uint8_t* w_ptr = cache.get_tensor(std::string(base) + ".weight", &nw);
+                    const uint8_t* s_ptr = cache.get_tensor(std::string(base) + ".weight_scale_inv", &ns);
+                    memcpy([buf_fp8_in contents], w_ptr, nw);
+                    memcpy([buf_sc_inv contents], s_ptr, ns);
+                    memset([buf_blk_ss contents], 0, 512 * 4);
+                    memset([buf_se_out contents], 0, 8);
+
+                    MatParams mp = {(uint32_t)R, (uint32_t)C, b, 1.0f};
+                    int total_streams = (R / 16) * 32;
+                    int batch_sz = (C == 2048) ? (BATCH_STREAMS * 2) : BATCH_STREAMS;
+
+                    @autoreleasepool {
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+                    [enc setComputePipelineState:pso_fp8_row];
+                    [enc setBuffer:buf_fp8_in offset:0 atIndex:0]; [enc setBuffer:buf_sc_inv offset:0 atIndex:1];
+                    [enc setBuffer:buf_fp8_lut offset:0 atIndex:2]; [enc setBuffer:buf_w_tmp offset:0 atIndex:3];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(C / 128, R, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                    [enc setComputePipelineState:pso_col_fwht];
+                    [enc setBuffer:buf_w_tmp offset:0 atIndex:0]; [enc setBuffer:buf_w_rot offset:0 atIndex:1];
+                    [enc setBuffer:buf_blk_ss offset:0 atIndex:2]; [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    [enc dispatchThreadgroups:MTLSizeMake(C, R / 128, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                    [enc setComputePipelineState:pso_pack_nax];
+                    [enc setBuffer:buf_w_rot offset:0 atIndex:0]; [enc setBuffer:buf_blk_ss offset:0 atIndex:1];
+                    [enc setBuffer:buf_mat_sc offset:0 atIndex:2]; [enc setBuffer:buf_streams offset:0 atIndex:3];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(R / 16, C / 128, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                    [enc setComputePipelineState:pso_enc[b]];
+                    for (int off = 0; off < total_streams; off += batch_sz) {
+                        int cnt = std::min(batch_sz, total_streams - off);
+                        EncParams ep = {(uint32_t)R, (uint32_t)C, b, (uint32_t)off, (uint32_t)cnt};
+                        [enc setBuffer:buf_streams offset:0 atIndex:0];
+                        [enc setBuffer:buf_lut[b] offset:0 atIndex:1];
+                        [enc setBuffer:buf_c64[b] offset:0 atIndex:2];
+                        [enc setBuffer:buf_grid[b] offset:0 atIndex:3];
+                        [enc setBuffer:buf_hist offset:0 atIndex:4];
+                        [enc setBuffer:buf_mat_pack offset:0 atIndex:5];
+                        [enc setBytes:&ep length:sizeof(ep) atIndex:6];
+                        [enc dispatchThreadgroups:MTLSizeMake(cnt, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    }
+
+                    [enc setComputePipelineState:pso_snr];
+                    [enc setBuffer:buf_mat_pack offset:0 atIndex:0]; [enc setBuffer:buf_mat_sc offset:0 atIndex:1];
+                    [enc setBuffer:buf_lut[b] offset:0 atIndex:2]; [enc setBuffer:buf_c64[b] offset:0 atIndex:3];
+                    [enc setBuffer:buf_w_rot offset:0 atIndex:4]; [enc setBuffer:buf_se_out offset:0 atIndex:5];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:6];
+                    [enc dispatchThreadgroups:MTLSizeMake(R / 16, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                    [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                    }
+
+                    const float* se = (const float*)[buf_se_out contents];
+                    float snr = (float)(10.0 * log10((double)se[0] / std::max(1e-18, (double)se[1])));
+                    if (snr < 10.0f || std::isnan(snr)) {
+                        fprintf(stderr, "FATAL: Bad SNR %.3f on L%d E%d %s!\n", snr, lyr, e, proj_names[p]);
+                        return 2;
+                    }
+                    snr_sum[b] += snr; snr_cnt[b]++;
+                    uint64_t w_off = (p == 0) ? metas[e].gate_word_off : (p == 1 ? metas[e].up_word_off : metas[e].down_word_off);
+                    uint32_t s_off = (p == 0) ? metas[e].gate_sc_off   : (p == 1 ? metas[e].up_sc_off   : metas[e].down_sc_off);
+                    if (p == 0) metas[e].gate_snr_db = snr; else if (p == 1) metas[e].up_snr_db = snr; else metas[e].down_snr_db = snr;
+                    memcpy(all_scales.data() + s_off, [buf_mat_sc contents], 512 * 2);
+                    memcpy(all_weights.data() + w_off, [buf_mat_pack contents], wpm * 4);
+                }
+            }
+
+            uint64_t off_meta    = sizeof(PrismLayerHeader);
+            uint64_t off_scales  = align_up(off_meta + metas.size() * sizeof(PrismExpertMeta), ALIGN_16K);
+            uint64_t off_weights = align_up(off_scales + all_scales.size() * 2ULL, ALIGN_16K);
+            PrismLayerHeader hdr{};
+            hdr.magic = MAGIC_TFPW; hdr.version = FORMAT_VER; hdr.layer_idx = (uint32_t)lyr;
+            hdr.num_experts = N_EXP; hdr.num_tensors = N_EXP * 3; hdr.hidden_size = H; hdr.moe_inter = I;
+            hdr.raw_fp8_bytes = (uint64_t)N_EXP * 3ULL * H * I;
+            hdr.stream_words = all_weights.size(); hdr.scale_halfs = all_scales.size();
+            hdr.off_meta = off_meta; hdr.off_scales = off_scales; hdr.off_weights = off_weights;
+            snprintf((char*)hdr.meta_tag, 32, "v3_%s", mode.c_str());
+
+            std::string tmp_path = std::string(out_path) + ".tmp";
+            FILE* fout = fopen(tmp_path.c_str(), "wb");
+            fwrite(&hdr, 1, sizeof(hdr), fout);
+            fwrite(metas.data(), sizeof(PrismExpertMeta), metas.size(), fout);
+            std::vector<uint8_t> zeros(ALIGN_16K, 0);
+            size_t cur = off_meta + metas.size() * sizeof(PrismExpertMeta);
+            if (off_scales > cur) fwrite(zeros.data(), 1, off_scales - cur, fout);
+            fwrite(all_scales.data(), 2, all_scales.size(), fout);
+            cur = off_scales + all_scales.size() * 2ULL;
+            if (off_weights > cur) fwrite(zeros.data(), 1, off_weights - cur, fout);
+            fwrite(all_weights.data(), 4, all_weights.size(), fout);
+            size_t end_pos = off_weights + all_weights.size() * 4ULL;
+            size_t pad_end = align_up(end_pos, ALIGN_16K) - end_pos;
+            if (pad_end) fwrite(zeros.data(), 1, pad_end, fout);
+            fclose(fout);
+            rename(tmp_path.c_str(), out_path);
+
+            double dt = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t_lyr).count();
+            double tot_dt = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t_all).count();
+            printf("L%02d [%s] %.3f GB in %4.1fs (tot %5.1fs) | SNR:", lyr, mode.c_str(), (double)(end_pos + pad_end) / 1e9, dt, tot_dt);
+            for (int b = 3; b <= 5; ++b) if (snr_cnt[b]) printf(" %db=%.2fdB", b, snr_sum[b]/snr_cnt[b]);
+            printf("\n"); fflush(stdout);
+        }
+    }
+    return 0;
+}
