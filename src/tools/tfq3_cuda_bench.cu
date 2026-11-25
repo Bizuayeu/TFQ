@@ -364,8 +364,87 @@ static void run_parity_suite() {
         cudaFree(d_W); cudaFree(d_X); cudaFree(d_Y);
     }
 
+    // 4. Long-context prefill (BM=64) + Zero-Repack Tensor-Parallel (Row-TP & Col-TP, tp=2,4) vs fp64
+    for (uint32_t bits : {3u, 4u, 5u}) {
+        const uint32_t N = 512u, K = 1024u, rows = 96u;
+        size_t nw = (size_t)(N / 16u) * (K / 128u) * (bits * 2u) * 32ull;
+        size_t ns = (size_t)(N / 128u) * (K / 128u);
+        std::vector<uint32_t> h_W(nw);
+        std::vector<__half> h_sc(ns);
+        std::vector<uint16_t> h_X(rows * K);
+        for (auto& w : h_W) w = rng();
+        for (auto& s : h_sc) s = __float2half(0.03f + 0.02f * ((float)(rng() & 255u) / 255.0f));
+        for (auto& x : h_X) x = h_f32_to_bf16(((int)(rng() % 201u) - 100) * 0.01f);
+        std::vector<double> W_rot;
+        h_decode_wrot(h_W.data(), h_sc.data(), h_tbl, bits, N, K, W_rot);
+
+        uint32_t* d_W; __half* d_sc; uint16_t* d_X; float* d_Y;
+        CUDA_CHECK(cudaMalloc(&d_W, nw * 4)); CUDA_CHECK(cudaMalloc(&d_sc, ns * 2));
+        CUDA_CHECK(cudaMalloc(&d_X, rows * K * 2)); CUDA_CHECK(cudaMalloc(&d_Y, rows * N * 4));
+        CUDA_CHECK(cudaMemcpy(d_W, h_W.data(), nw * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_sc, h_sc.data(), ns * 2, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_X, h_X.data(), rows * K * 2, cudaMemcpyHostToDevice));
+
+        // 4a. Full BM=64 prefill kernel vs fp64
+        CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X, d_Y, d_xrot, d_yr, 0, bits, rows, N, K, K, N, 0u, true));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> h_Y_full(rows * N);
+        CUDA_CHECK(cudaMemcpy(h_Y_full.data(), d_Y, rows * N * 4, cudaMemcpyDeviceToHost));
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        std::vector<double> xm(K), ref_row(N);
+        for (uint32_t m = 0; m < rows; ++m) {
+            for (uint32_t c = 0; c < K; ++c) xm[c] = (double)h_bf16_to_f32(h_X[(size_t)m * K + c]);
+            h_mv_ref(W_rot, xm.data(), N, K, 0u, ref_row.data());
+            for (uint32_t r = 0; r < N; ++r) {
+                double g = h_Y_full[(size_t)m * N + r], ref = ref_row[r];
+                dot += g * ref; na += g * g; nb += ref * ref;
+            }
+        }
+        double cos_full = dot / (std::sqrt(na * nb) + 1e-30);
+        if (cos_full < 0.99999) { fprintf(stderr, "FAIL prefill %ub cos=%.8f\n", bits, cos_full); exit(1); }
+
+        // 4b. Col-TP (tp=2,4): slice N into tp independent ranks -> concat must match full bit-exact
+        for (uint32_t tp : {2u, 4u}) {
+            uint32_t n_loc = N / tp;
+            std::vector<float> h_cat(rows * N, 0.0f);
+            for (uint32_t rank = 0; rank < tp; ++rank) {
+                CUDA_CHECK(tfq3::launch_dense_tp(d_W, d_sc, d_tbl, d_X, d_Y, d_xrot, bits, rows, N, K,
+                                                 rank * n_loc, n_loc, 0u, K, K, n_loc, true));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<float> h_part(rows * n_loc);
+                CUDA_CHECK(cudaMemcpy(h_part.data(), d_Y, rows * n_loc * 4, cudaMemcpyDeviceToHost));
+                for (uint32_t m = 0; m < rows; ++m)
+                    memcpy(&h_cat[(size_t)m * N + rank * n_loc], &h_part[(size_t)m * n_loc], n_loc * 4);
+            }
+            for (size_t i = 0; i < h_Y_full.size(); ++i) {
+                if (h_cat[i] != h_Y_full[i]) { fprintf(stderr, "FAIL Col-TP=%u %ub mismatch at %zu\n", tp, bits, i); exit(1); }
+            }
+        }
+
+        // 4c. Row-TP (tp=2,4): slice K into tp independent ranks with zero-repack state resume -> AllReduce(SUM) == full
+        for (uint32_t tp : {2u, 4u}) {
+            uint32_t k_loc = K / tp;
+            std::vector<float> h_sum(rows * N, 0.0f);
+            for (uint32_t rank = 0; rank < tp; ++rank) {
+                CUDA_CHECK(tfq3::launch_dense_tp(d_W, d_sc, d_tbl, d_X + rank * k_loc, d_Y, d_xrot, bits, rows, N, K,
+                                                 0u, N, rank * k_loc, k_loc, K, N, true));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<float> h_part(rows * N);
+                CUDA_CHECK(cudaMemcpy(h_part.data(), d_Y, rows * N * 4, cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < h_sum.size(); ++i) h_sum[i] += h_part[i];
+            }
+            double dtp = 0.0, n1 = 0.0, n2 = 0.0;
+            for (size_t i = 0; i < h_sum.size(); ++i) {
+                dtp += (double)h_sum[i] * h_Y_full[i]; n1 += (double)h_sum[i] * h_sum[i]; n2 += (double)h_Y_full[i] * h_Y_full[i];
+            }
+            double cos_tp = dtp / (std::sqrt(n1 * n2) + 1e-30);
+            if (cos_tp < 0.999999) { fprintf(stderr, "FAIL Row-TP=%u %ub cos=%.8f\n", tp, bits, cos_tp); exit(1); }
+        }
+        cudaFree(d_W); cudaFree(d_sc); cudaFree(d_X); cudaFree(d_Y);
+    }
+
     cudaFree(d_tbl); cudaFree(d_xrot); cudaFree(d_yr);
-    printf("PASS tfq3_cuda_test (3b/4b/5b PTX m16n8k16 sk8+fused + bit-exact r1==r16==r32 + mixed-bit MoE + bf16 mv1/mm)\n");
+    printf("PASS tfq3_cuda_test (3b/4b/5b PTX sk8+fused+prefill64 + bit-exact r1==r16==r32 + Col-TP/Row-TP 2,4 + mixed-bit MoE + bf16)\n");
 }
 
 static void run_bench() {
@@ -386,11 +465,11 @@ static void run_bench() {
     };
     __half* d_xrot; float* d_yr; uint16_t *d_X, *d_Y;
     const size_t max_yr = 64ull * 34816ull * 8ull;
-    CUDA_CHECK(cudaMalloc(&d_xrot, 512ull * 17408ull * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_xrot, 1024ull * 17408ull * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_yr, max_yr * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_X, 512ull * 17408ull * 2ull));
-    CUDA_CHECK(cudaMalloc(&d_Y, 512ull * 248320ull * 2ull));
-    CUDA_CHECK(cudaMemset(d_X, 0x3C, 512ull * 17408ull * 2ull));
+    CUDA_CHECK(cudaMalloc(&d_X, 1024ull * 17408ull * 2ull));
+    CUDA_CHECK(cudaMalloc(&d_Y, 1024ull * 248320ull * 2ull));
+    CUDA_CHECK(cudaMemset(d_X, 0x3C, 1024ull * 17408ull * 2ull));
 
     cudaEvent_t ev0, ev1;
     CUDA_CHECK(cudaEventCreate(&ev0)); CUDA_CHECK(cudaEventCreate(&ev1));
@@ -403,8 +482,8 @@ static void run_bench() {
         CUDA_CHECK(cudaMemset(d_W, 0x5A, nw * 4)); CUDA_CHECK(cudaMemset(d_sc, 0x2E, ns * 2));
         double bytes = (double)(nw * 4 + ns * 2);
 
-        for (uint32_t rows : {1u, 16u, 256u}) {
-            if (rows == 256u && s.N == 248320u) continue;
+        for (uint32_t rows : {1u, 16u, 64u, 256u, 1024u}) {
+            if (rows >= 256u && s.N == 248320u) continue;
             for (int w = 0; w < 5; ++w) CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X, d_Y, d_xrot, d_yr, max_yr, bits, rows, s.N, s.K, s.K, s.N, 0u));
             CUDA_CHECK(cudaDeviceSynchronize());
             int iters = (rows <= 16u) ? 50 : 10;
@@ -415,7 +494,7 @@ static void run_bench() {
             double avg_ms = ms / iters;
             double gbps = (bytes / 1e9) / (avg_ms / 1e3);
             double tflops = (2.0 * rows * s.N * s.K / 1e12) / (avg_ms / 1e3);
-            printf("  %-8s [%6u x %5u] 4b rows=%3u : %7.3f ms | %6.1f GB/s | %5.2f TFLOP/s\n", s.name, s.N, s.K, rows, avg_ms, gbps, tflops);
+            printf("  %-8s [%6u x %5u] 4b rows=%4u : %7.3f ms | %6.1f GB/s | %5.2f TFLOP/s\n", s.name, s.N, s.K, rows, avg_ms, gbps, tflops);
         }
         cudaFree(d_W); cudaFree(d_sc);
     }

@@ -75,9 +75,24 @@ struct TfpnTensorMeta {
     uint64_t word_off;    // start offset in u32 words inside `weights`
     uint64_t word_count;  // exact word count: (R/16) * (C/128) * (b_bits * 2) * 32
     float    snr_db;      // encoder-measured quantization SNR in dB
-    uint32_t pad[3];      // 0
+    uint32_t pad[3];      // [0] = orig_R (0 -> R), [1] = orig_C (0 -> C), [2] = flags bitmask
 };
 ```
+
+### Backward-Compatible Metadata Extension (`pad[3]`)
+Model-agnostic conversions (arbitrary matrix dimensions zero-padded to multiples of 128, plus optional vision / drafter / embedding quantization) record metadata inside the existing `pad[3]` words with zero format break:
+- `pad[0]`: unpadded original row count `orig_R` (`0` on legacy shards → treat as `R`).
+- `pad[1]`: unpadded original column count `orig_C` (`0` on legacy shards → treat as `C`).
+- `pad[2]`: flags bitmask (`0` on legacy shards):
+  - `bit 0` (`0x1`): tensor was zero-padded to `[R, C]` from `[orig_R, orig_C]`.
+  - `bit 1` (`0x2`): vision encoder / multimodal projector tensor (`--quantize-vision`).
+  - `bit 2` (`0x4`): speculative drafter tensor (`--quantize-drafter`).
+  - `bit 3` (`0x8`): token embedding table (`--quantize-embed`).
+
+### Zero-Repack Tensor Parallelism (`Col-TP` & `Row-TP`)
+Because every `128 × 128` tile is independently rotated and every column block `bc` carries its exact 32-bit state hash inside the final `u32` word of block `bc - 1`, any `TFPN` or `TFPW` weight matrix can be sharded across `TP` ranks at runtime with **zero weight repacking**:
+- **Column-TP (`n_start, n_end` multiples of 128):** each rank computes output rows `[n_start, n_end)` independently.
+- **Row-TP (`k_start, k_end` multiples of 128):** each rank rotates its input slice `X[:, k_start:k_end]` using sign offset `k_sign_off = k_start`, resumes the per-lane state hash at `bc0 = k_start / 128` directly from `bc0 - 1`'s last packed word (zero overhead), multiplies `[k_start, k_end)`, and sums partial outputs via `AllReduce` before applying the final inverse row-FWHT-128.
 
 ### Tensor Scale & Weight Indexing
 

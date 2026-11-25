@@ -113,3 +113,51 @@ All speculative decoding measurements below were verified **100% bit-exact** (`-
 - **Real-Shard CUDA Parity & Drafter Verification (`GLM-5.3-Flash` & `Qwen3.8-Flash-Next`):**
   - **GLM-5.3-Flash** (`nonmoe.tffpw` 4b/5b `sk8` + `fused`, `layer_03.tffpw` 288-expert 3b/4b/5b MoE `top_k=8`): `cos = 0.999997–1.000000` vs `fp64`, bit-exact `rows=1 == rows=16` (`0` diffs), `215–244 GB/s` dense; live `GLM-5.3-Flash-DFlash2` (`bits=4` and BF16) verified end-to-end with shared TFQ3 `DraftHead`.
   - **Qwen3.8-Flash-Next** (`layer_00.tffpw` target MoE & `mtp_00.tffpw` MTP drafter MoE, 512 experts, 3b/4b/5b `top_k=10` + 3-bit/32 PLE): `cos = 0.999998–1.000000` vs `fp64`, bit-exact `rows=1 == rows=16` (`0/25,600` diffs).
+
+---
+
+## 6. Model-Agnostic Converter (`--target-gib` / `--fit auto` / Drafter & Embed)
+
+Measured live across **Apple M5 Max (Metal)** and **NVIDIA GB10 (CUDA `sm_121`)** using `tfq3-generic-convert` / `tfq3-generic-convert-cuda` (100% data-free, arbitrary padded `[R, C]`):
+
+| Model | Mode / Flags | Backend | Quantized Tensors | Bit Allocation | Output Size | Mean SNR | Time |
+|---|---|---|---:|---|---:|---:|---:|
+| **Qwen2.5-1.5B** (BF16) | `--bits 4 --quantize-embed` | Metal (M5 Max) | 197 | all 4b (`4.001 bpw`) | 0.719 GiB | **23.36 dB** | 23.2 s |
+| **Qwen2.5-1.5B** (BF16) | `--target-gib 0.65 --quantize-embed` | Metal (M5 Max) | 197 | `3b:44 / 4b:146 / 5b:7` (`3.614 bpw`) | **0.650 GiB** (exact) | `17.33 / 23.35 / 29.18 dB` | 23.2 s |
+| **Meta-Llama-3.1-8B-Instruct** | `--target-gib 5.0 --dry-run` | Metal (M5 Max) | 225 (+66 res) | `4b:51 / 5b:174` (`4.602 bpw`) | **5.000 GiB** (exact) | planned (2 shards) | <0.1 s |
+| **Qwen3.8-27B-DFlash2** (Drafter) | `--quantize-drafter --bits 4` | Metal (M5 Max) | 47 | all 4b (`4.001 bpw`) | 0.837 GiB (+0.237 res) | **23.32 dB** | 27.7 s |
+| **Qwen3.8-27B-DFlash2** (Drafter) | `--quantize-drafter --bits 4` | CUDA (GB10) | 47 | all 4b (`4.001 bpw`) | 0.837 GiB (+0.237 res) | **23.32 dB** (exact parity) | 26.2 s |
+| **Qwen3.8-27B-DSpine** (Drafter) | `--quantize-drafter --fit auto` | CUDA (GB10) | 40 | auto-5b (`5.001 bpw`, 97.3 GiB budget) | 1.009 GiB | **28.33 dB** | 25.6 s |
+
+---
+
+## 7. Long-Context Prefill & Zero-Repack Tensor-Parallel Microbenchmarks
+
+### NVIDIA GB10 (`BM=64, BN=128` CUDA Tensor Core Prefill + Zero-Repack `Col-TP` / `Row-TP`)
+Verified via `make test-cuda CUDA_ARCH=sm_121`: `PASS` across 3b/4b/5b `prefill64` vs `fp64` and bit-exact `Col-TP` & `Row-TP` at `tp = 2, 4` (`~2.6×` faster prefill than `BM=16`):
+
+| Projection | Shape `[N × K]` | `rows` | Latency | Throughput |
+|---|---|---:|---:|---:|
+| `qkv` | `[10240 × 5120]` | 1024 | 3.708 ms | **28.96 TFLOP/s** |
+| `lm_head` | `[248320 × 5120]` | 64 | 6.029 ms | **26.99 TFLOP/s** |
+| `gate+up` | `[34816 × 5120]` | 256 | 3.426 ms | **26.64 TFLOP/s** |
+| `down` | `[5120 × 17408]` | 1024 | 7.388 ms | **24.71 TFLOP/s** |
+
+### Apple M5 Max (`BM=32, BN=128` Standalone Metal `simdgroup_matrix` Prefill + Zero-Repack TP)
+Verified via `make test-metal` (`src/kernels/metal/tfq3_metal.metal`): `PASS` across 3b/4b/5b `prefill32` vs `fp64` and bit-exact `Col-TP = 4` & `Row-TP = 4`:
+
+| Projection | Shape `[N × K]` | `rows` | Throughput |
+|---|---|---:|---:|
+| `gate+up` | `[34816 × 5120]` | 512 | **12.01 TFLOP/s** |
+| `qkv` | `[10240 × 5120]` | 512 | **11.43 TFLOP/s** |
+| `down` | `[5120 × 17408]` | 512 | **11.32 TFLOP/s** |
+
+*(AMD ROCm/HIP portable kernels live in `src/kernels/hip/tfq3_hip.h` with explicit `width=32` wave32/wave64 shuffles and pass strict `clang++ -Wall -Wextra` syntax/type checks; hardware benchmarks on AMD GPUs are pending.)*
+
+---
+
+## 8. Sub-3-Bit Research Prototype (`TFQ4-E8P`, `2.0–2.25 bpw`)
+
+See [`docs/TFQ4_SUB3BIT.md`](TFQ4_SUB3BIT.md) for full details (`reference/tfq4_lattice.py` & `src/tools/tfq4_e8_bench.cu`):
+- **Quality on real BF16 LLM weights (`Qwen2.5-1.5B`, `Llama-3.1-8B`):** `TFQ4-E8P (2.00 bpw, 4 KiB LUT)` achieves **`10.20–10.21 dB` SNR** (`+3.46 dB` above uniform 2-bit affine at 20% smaller size); `2.25 bpw (16 KiB LUT)` achieves **`11.64–11.65 dB`**.
+- **NVIDIA GB10 CUDA decode (`fp64` parity `cos = 1.00000000`):** **`281.9 GB/s`** (`0.119 ms`, `MoE-8E gate+up`), **`258.0 GB/s`** (`0.173 ms`, `Qwen27 gate+up`), **`318.9 GB/s`** (`0.070 ms`, `Qwen27 down`).

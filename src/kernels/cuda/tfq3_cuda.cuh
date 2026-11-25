@@ -63,6 +63,14 @@ struct DenseDims {
     uint32_t row_off;
 };
 
+struct TpRange {
+    uint32_t strip_off;
+    uint32_t sc_row_off;
+    uint32_t bc0;
+    uint32_t bc1;
+    uint32_t n_bc_total;
+};
+
 __device__ __forceinline__ __half2 u32_to_h2(uint32_t u) {
     return *reinterpret_cast<const __half2*>(&u);
 }
@@ -136,18 +144,20 @@ __device__ __forceinline__ float pw_glu(float g, float u, float lim, uint32_t ac
 __global__ void tfq3_fwht_x_kernel(
     const uint16_t* __restrict__ X,
     __half* __restrict__ X_rot,
-    DenseDims d
+    DenseDims d,
+    uint32_t k_sign_off = 0u
 ) {
     const uint32_t lane = threadIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t c0 = blockIdx.x * 128u;
+    const uint32_t cs = c0 + k_sign_off;
     if (row >= d.rows || c0 >= d.k) return;
     const uint16_t* src = X + static_cast<uint64_t>(row) * d.ldx + c0;
     float4 v;
-    v.x = bf16_to_f32(src[lane +  0u]) * pw_sgn(0x12345678u, c0 + lane +  0u);
-    v.y = bf16_to_f32(src[lane + 32u]) * pw_sgn(0x12345678u, c0 + lane + 32u);
-    v.z = bf16_to_f32(src[lane + 64u]) * pw_sgn(0x12345678u, c0 + lane + 64u);
-    v.w = bf16_to_f32(src[lane + 96u]) * pw_sgn(0x12345678u, c0 + lane + 96u);
+    v.x = bf16_to_f32(src[lane +  0u]) * pw_sgn(0x12345678u, cs + lane +  0u);
+    v.y = bf16_to_f32(src[lane + 32u]) * pw_sgn(0x12345678u, cs + lane + 32u);
+    v.z = bf16_to_f32(src[lane + 64u]) * pw_sgn(0x12345678u, cs + lane + 64u);
+    v.w = bf16_to_f32(src[lane + 96u]) * pw_sgn(0x12345678u, cs + lane + 96u);
     pw_fwht128_simd4(v, lane);
     __half* dst = X_rot + static_cast<uint64_t>(row) * d.k + c0;
     dst[lane +  0u] = __float2half(v.x);
@@ -450,6 +460,145 @@ __global__ void tfq3_mma_fused_kernel(
     }
 }
 
+// High-throughput Long-Context Prefill & Zero-Repack Tensor-Parallel Kernel (BM=64, BN=128, 4x weight reuse):
+// grid=(N_local/128, ceil(rows/64)), block=256. Supports arbitrary Row-TP (bc0..bc1) and Col-TP (strip_off/sc_row_off).
+template <uint32_t BITS>
+__global__ void tfq3_mma_prefill_tp_kernel(
+    const uint32_t* __restrict__ W,
+    const __half* __restrict__ scales,
+    const PwV3Tables* __restrict__ T,
+    const __half* __restrict__ X_rot,
+    void* __restrict__ OUT,
+    DenseDims d,
+    TpRange tp,
+    uint32_t out_f32
+) {
+    const uint32_t rb = blockIdx.x, r0 = rb * 128u, m0 = blockIdx.y * 64u;
+    if (m0 >= d.rows) return;
+    const uint32_t nb = (d.rows - m0) < 64u ? (d.rows - m0) : 64u;
+    const uint32_t tid = threadIdx.x, sg = tid >> 5, lane = tid & 31u;
+    const uint32_t strip = tp.strip_off + rb * 8u + sg;
+    const uint32_t* w_s = W + static_cast<uint64_t>(strip) * tp.n_bc_total * (BITS * 2u) * 32ull;
+    const __half* sc0 = scales + static_cast<uint64_t>(tp.sc_row_off + rb) * tp.n_bc_total;
+    uint32_t st = pw_init_st<BITS>(w_s, tp.bc0, lane);
+    const int2 home = pw_frag_home(lane);
+
+    __shared__ union {
+        struct { __half a[64 * 136]; __half b[8][16 * 24]; } ab;
+        float f[64 * 128];
+    } sm;
+
+    float acc[4][8];
+    #pragma unroll
+    for (int ms = 0; ms < 4; ++ms) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) acc[ms][i] = 0.0f;
+    }
+
+    for (uint32_t bc = tp.bc0; bc < tp.bc1; ++bc) {
+        const uint32_t x_col = (bc - tp.bc0) << 7;
+        #pragma unroll
+        for (uint32_t u = 0u; u < 4u; ++u) {
+            uint32_t idx = tid + u * 256u;
+            uint32_t rl = idx >> 4, cl = (idx & 15u) << 3;
+            uint4 v = (rl < nb) ? *reinterpret_cast<const uint4*>(X_rot + static_cast<uint64_t>(m0 + rl) * d.k + x_col + cl) : make_uint4(0u, 0u, 0u, 0u);
+            *reinterpret_cast<uint4*>(sm.ab.a + rl * 136u + cl) = v;
+        }
+        __syncthreads();
+
+        float b0[4][8];
+        #pragma unroll
+        for (int ms = 0; ms < 4; ++ms) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) b0[ms][i] = 0.0f;
+        }
+        __half2 q0a, q0b, q1a, q1b;
+        if constexpr (BITS == 4u) {
+            const uint4* p = reinterpret_cast<const uint4*>(w_s + static_cast<uint64_t>(bc) * 8ull * 32ull);
+            for (uint32_t h = 0u; h < 2u; ++h) {
+                uint4 v = __ldg(&p[h * 32u + lane]);
+                uint32_t uv[4] = {v.x, v.y, v.z, v.w};
+                int kb = static_cast<int>(h * 4u);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    pw_v3_q8_4b(st, uv[j], T, q0a, q0b, q1a, q1b);
+                    pw_stage_b24(sm.ab.b[sg], q0a, q0b, q1a, q1b, home);
+                    __syncwarp();
+                    #pragma unroll
+                    for (int ms = 0; ms < 4; ++ms) {
+                        if (ms * 16u < nb) pw_mma_f16_16x16x16(b0[ms], sm.ab.a + ms * 16u * 136u, kb + j, sm.ab.b[sg], lane);
+                    }
+                }
+            }
+        } else if constexpr (BITS == 3u) {
+            for (uint32_t h = 0u; h < 2u; ++h) {
+                const uint32_t* p = w_s + (static_cast<uint64_t>(bc) * 6ull + h * 3ull) * 32ull + lane;
+                uint32_t a0 = __ldg(&p[0]), a1 = __ldg(&p[32]), a2 = __ldg(&p[64]);
+                uint32_t mv[4] = {a0 >> 8, ((a0 << 16) | (a1 >> 16)) & 0xFFFFFFu, ((a1 << 8) | (a2 >> 24)) & 0xFFFFFFu, a2 & 0xFFFFFFu};
+                int kb = static_cast<int>(h * 4u);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    pw_v3_q8_3b(st, mv[j], T, q0a, q0b, q1a, q1b);
+                    pw_stage_b24(sm.ab.b[sg], q0a, q0b, q1a, q1b, home);
+                    __syncwarp();
+                    #pragma unroll
+                    for (int ms = 0; ms < 4; ++ms) {
+                        if (ms * 16u < nb) pw_mma_f16_16x16x16(b0[ms], sm.ab.a + ms * 16u * 136u, kb + j, sm.ab.b[sg], lane);
+                    }
+                }
+            }
+        } else {
+            for (uint32_t h = 0u; h < 2u; ++h) {
+                const uint32_t* p = w_s + (static_cast<uint64_t>(bc) * 10ull + h * 5ull) * 32ull + lane;
+                uint32_t w0 = __ldg(&p[0]), w1 = __ldg(&p[32]), w2 = __ldg(&p[64]), w3 = __ldg(&p[96]), w4 = __ldg(&p[128]);
+                uint32_t hv[4] = {w0 >> 24, (w1 >> 16) & 255u, (w2 >> 8) & 255u, w3 & 255u};
+                uint32_t lv[4] = {(w0 << 8) | (w1 >> 24), (w1 << 16) | (w2 >> 16), (w2 << 24) | (w3 >> 8), w4};
+                int kb = static_cast<int>(h * 4u);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    pw_v3_q8_5b(st, hv[j], lv[j], T, q0a, q0b, q1a, q1b);
+                    pw_stage_b24(sm.ab.b[sg], q0a, q0b, q1a, q1b, home);
+                    __syncwarp();
+                    #pragma unroll
+                    for (int ms = 0; ms < 4; ++ms) {
+                        if (ms * 16u < nb) pw_mma_f16_16x16x16(b0[ms], sm.ab.a + ms * 16u * 136u, kb + j, sm.ab.b[sg], lane);
+                    }
+                }
+            }
+        }
+        float fsv = __half2float(__ldg(&sc0[bc]));
+        #pragma unroll
+        for (int ms = 0; ms < 4; ++ms) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) acc[ms][i] = fmaf(b0[ms][i], fsv, acc[ms][i]);
+        }
+        __syncthreads();
+    }
+
+    const uint32_t g = lane >> 2, t = (lane & 3u) << 1, col = sg * 16u + t;
+    #pragma unroll
+    for (int ms = 0; ms < 4; ++ms) {
+        uint32_t rm = static_cast<uint32_t>(ms) * 16u;
+        *reinterpret_cast<float2*>(sm.f + (rm + g) * 128u + col) = make_float2(acc[ms][0], acc[ms][1]);
+        *reinterpret_cast<float2*>(sm.f + (rm + g) * 128u + col + 8u) = make_float2(acc[ms][4], acc[ms][5]);
+        *reinterpret_cast<float2*>(sm.f + (rm + g + 8u) * 128u + col) = make_float2(acc[ms][2], acc[ms][3]);
+        *reinterpret_cast<float2*>(sm.f + (rm + g + 8u) * 128u + col + 8u) = make_float2(acc[ms][6], acc[ms][7]);
+    }
+    __syncthreads();
+
+    const uint32_t sr0 = pw_sr0(r0 + d.row_off, d.sr_split);
+    for (uint32_t m = sg; m < nb; m += 8u) {
+        const float* ys = sm.f + m * 128u;
+        float4 v = make_float4(ys[lane], ys[lane + 32u], ys[lane + 64u], ys[lane + 96u]);
+        pw_fwht128_simd4(v, lane);
+        const uint64_t base = static_cast<uint64_t>(m0 + m) * d.ldo + r0;
+        pw_store(OUT, base + lane +  0u, v.x * pw_sgn(0x9E3779B9u, sr0 + lane +  0u), out_f32);
+        pw_store(OUT, base + lane + 32u, v.y * pw_sgn(0x9E3779B9u, sr0 + lane + 32u), out_f32);
+        pw_store(OUT, base + lane + 64u, v.z * pw_sgn(0x9E3779B9u, sr0 + lane + 64u), out_f32);
+        pw_store(OUT, base + lane + 96u, v.w * pw_sgn(0x9E3779B9u, sr0 + lane + 96u), out_f32);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // 4. Fused Routed MoE Kernels (Mixed 3b / 4b / 5b HeatAlloc Experts)
 // ----------------------------------------------------------------------------
@@ -715,12 +864,40 @@ inline cudaError_t launch_dense(
         else if (bits == 4u) tfq3_mma_sk8_kernel<4u><<<g, 128, 0, stream>>>(W, scales, T, xrot_buf, yr_buf, d);
         else tfq3_mma_sk8_kernel<5u><<<g, 128, 0, stream>>>(W, scales, T, xrot_buf, yr_buf, d);
         tfq3_fwht_y_kernel<<<dim3(n / 128u, rows, 1), 32, 0, stream>>>(yr_buf, Y, d, out_f32 ? 1u : 0u);
+    } else if (rows >= 32u) {
+        TpRange tp{0u, 0u, 0u, n_bc, n_bc};
+        dim3 g(n / 128u, (rows + 63u) / 64u, 1u);
+        if (bits == 3u) tfq3_mma_prefill_tp_kernel<3u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y, d, tp, out_f32 ? 1u : 0u);
+        else if (bits == 4u) tfq3_mma_prefill_tp_kernel<4u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y, d, tp, out_f32 ? 1u : 0u);
+        else tfq3_mma_prefill_tp_kernel<5u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y, d, tp, out_f32 ? 1u : 0u);
     } else {
         dim3 g(n / 128u, (rows + 15u) / 16u, 1u);
         if (bits == 3u) tfq3_mma_fused_kernel<3u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y, d, out_f32 ? 1u : 0u);
         else if (bits == 4u) tfq3_mma_fused_kernel<4u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y, d, out_f32 ? 1u : 0u);
         else tfq3_mma_fused_kernel<5u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y, d, out_f32 ? 1u : 0u);
     }
+    return cudaGetLastError();
+}
+
+// Zero-repack Multi-GPU Tensor Parallel launch (Row-TP slices K in 128-multiples; Col-TP slices N in 128-multiples).
+inline cudaError_t launch_dense_tp(
+    const uint32_t* W, const __half* scales, const PwV3Tables* T,
+    const uint16_t* X_local, void* Y_local, __half* xrot_buf,
+    uint32_t bits, uint32_t rows,
+    uint32_t n_full, uint32_t k_full,
+    uint32_t n_off, uint32_t n_local,
+    uint32_t k_off, uint32_t k_local,
+    uint32_t ldx_local, uint32_t ldo_local,
+    bool out_f32 = false, cudaStream_t stream = nullptr
+) {
+    DenseDims d{rows, n_local, k_local, ldx_local, ldo_local, 0u, 1u, n_off};
+    TpRange tp{n_off >> 4, n_off >> 7, k_off >> 7, (k_off + k_local) >> 7, k_full >> 7};
+    (void)n_full;
+    tfq3_fwht_x_kernel<<<dim3(k_local >> 7, rows, 1), 32, 0, stream>>>(X_local, xrot_buf, d, k_off);
+    dim3 g(n_local >> 7, (rows + 63u) / 64u, 1u);
+    if (bits == 3u) tfq3_mma_prefill_tp_kernel<3u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y_local, d, tp, out_f32 ? 1u : 0u);
+    else if (bits == 4u) tfq3_mma_prefill_tp_kernel<4u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y_local, d, tp, out_f32 ? 1u : 0u);
+    else tfq3_mma_prefill_tp_kernel<5u><<<g, 256, 0, stream>>>(W, scales, T, xrot_buf, Y_local, d, tp, out_f32 ? 1u : 0u);
     return cudaGetLastError();
 }
 

@@ -16,11 +16,17 @@ Usage:
 
 Options:
   -o, --out DIR              Output TFQ3 directory (default: <model>-TFQ3)
-  --family NAME              auto | qwen27 | flashnext | glm (default: auto from config.json)
-  --profile PROFILE          Qwen3.8-27B bit profile: 4b | 3.5b | 3b (default: 4b)
+  --family NAME              auto | generic | qwen27 | flashnext | glm (default: auto)
+  --profile PROFILE          Bit profile: 4b | 3.5b | 3b | 5b (default: 4b)
+  --bits N                   Uniform bit width for generic converter: 3 | 4 | 5
+  --target-gib GB            Fit total checkpoint into GB via data-free sensitivity allocation
+  --fit auto|GB              Auto-size to local GPU memory budget (or explicit GB)
   --residual MODE            Qwen3.8-27B residual precision: auto | bf16 | q8 (default: auto)
-  --head-bits N              Qwen3.8-27B lm_head bits: 0 | 4 | 5 (default: 4)
+  --head-bits N              lm_head bits: 0 | 4 | 5 (default: 4)
   --ple-bits N               Qwen3.8-Flash-Next PLE bits: 3 | 4 (default: 3)
+  --quantize-vision          Also quantize vision tower linears (generic converter)
+  --quantize-drafter         Quantize standalone DFlash2 / DSpine drafter checkpoint
+  --quantize-embed           Also quantize embed_tokens table (generic converter)
   --trace FILE               Optional HeatAlloc expert routing trace (Flash-Next / GLM)
   --nonmoe-model DIR         Optional 8-bit source for GLM nonmoe.tffpw
   --skip-existing            Resume MoE conversion, skipping finished shards
@@ -242,7 +248,7 @@ run_doctor() {
         fi
     fi
     echo "lib_dir:  ${lib_dir}"
-    for b in "tfq3-qwen27-convert${suffix}" "tfq3-qwen27-package" "tfq3-flashnext-convert${suffix}" "tfq3-glm-convert${suffix}" "tfq3-inspect"; do
+    for b in "tfq3-generic-convert${suffix}" "tfq3-qwen27-convert${suffix}" "tfq3-qwen27-package" "tfq3-flashnext-convert${suffix}" "tfq3-glm-convert${suffix}" "tfq3-inspect"; do
         if [ -x "$lib_dir/$b" ]; then
             echo "  [ok]    $b"
         else
@@ -273,9 +279,15 @@ run_convert() {
     local out_dir=""
     local family="auto"
     local profile="4b"
+    local bits_override=""
+    local target_gib=""
+    local fit_mode=""
     local residual="auto"
     local head_bits="4"
     local ple_bits="3"
+    local quantize_vision=0
+    local quantize_drafter=0
+    local quantize_embed=0
     local trace_file=""
     local nonmoe_model=""
     local skip_existing=0
@@ -287,10 +299,16 @@ run_convert() {
             -h|--help) usage; exit 0 ;;
             -o|--out) [ $# -ge 2 ] || die "--out requires a directory"; out_dir="$2"; shift 2 ;;
             --family) [ $# -ge 2 ] || die "--family requires a value"; family="$2"; shift 2 ;;
-            --profile) [ $# -ge 2 ] || die "--profile requires 4b|3.5b|3b"; profile="$2"; shift 2 ;;
+            --profile) [ $# -ge 2 ] || die "--profile requires 4b|3.5b|3b|5b"; profile="$2"; shift 2 ;;
+            --bits) [ $# -ge 2 ] || die "--bits requires 3|4|5"; bits_override="$2"; shift 2 ;;
+            --target-gib) [ $# -ge 2 ] || die "--target-gib requires GB"; target_gib="$2"; shift 2 ;;
+            --fit) [ $# -ge 2 ] || die "--fit requires auto or GB"; fit_mode="$2"; shift 2 ;;
             --residual) [ $# -ge 2 ] || die "--residual requires auto|bf16|q8"; residual="$2"; shift 2 ;;
             --head-bits) [ $# -ge 2 ] || die "--head-bits requires 0|4|5"; head_bits="$2"; shift 2 ;;
             --ple-bits) [ $# -ge 2 ] || die "--ple-bits requires 3|4"; ple_bits="$2"; shift 2 ;;
+            --quantize-vision) quantize_vision=1; shift ;;
+            --quantize-drafter) quantize_drafter=1; shift ;;
+            --quantize-embed) quantize_embed=1; shift ;;
             --trace) [ $# -ge 2 ] || die "--trace requires a file path"; trace_file="$2"; shift 2 ;;
             --nonmoe-model) [ $# -ge 2 ] || die "--nonmoe-model requires a directory"; nonmoe_model="$2"; shift 2 ;;
             --skip-existing) skip_existing=1; shift ;;
@@ -347,10 +365,13 @@ run_convert() {
     fi
 
     if [ "$family" = "auto" ]; then
-        family="$detected_family"
-    fi
-    if [ "$family" = "unknown" ]; then
-        die "unsupported model_type '${model_type}' in ${src_dir}. Supported TFQ3 families: qwen3_5 (Qwen3.8-27B), qwen4_exp (Qwen3.8-Flash-Next), glm5_next (GLM-5.3-Flash)."
+        if [ -n "$target_gib" ] || [ -n "$fit_mode" ] || [ -n "$bits_override" ] || [ "$quantize_vision" -eq 1 ] || [ "$quantize_drafter" -eq 1 ] || [ "$quantize_embed" -eq 1 ]; then
+            family="generic"
+        elif [ "$detected_family" != "unknown" ]; then
+            family="$detected_family"
+        else
+            family="generic"
+        fi
     fi
 
     local lib_dir suffix inspect_bin
@@ -365,6 +386,26 @@ run_convert() {
     echo "  backend:  $([ "$(uname -s)" = "Darwin" ] && echo "Apple Silicon Metal" || echo "NVIDIA CUDA")"
 
     case "$family" in
+        generic)
+            local conv_bin
+            conv_bin="$(require_tool "$lib_dir" "tfq3-generic-convert${suffix}")"
+            local g_flags=(--model "$src_dir" --out "$out_dir" --profile "$profile" --head-bits "$head_bits")
+            [ -n "$bits_override" ] && g_flags+=(--bits "$bits_override")
+            [ -n "$target_gib" ] && g_flags+=(--target-gib "$target_gib")
+            [ -n "$fit_mode" ] && g_flags+=(--fit "$fit_mode")
+            [ "$quantize_vision" -eq 1 ] && g_flags+=(--quantize-vision)
+            [ "$quantize_drafter" -eq 1 ] && g_flags+=(--quantize-drafter)
+            [ "$quantize_embed" -eq 1 ] && g_flags+=(--quantize-embed)
+            echo ""
+            if [ "$DRY_RUN" -eq 1 ] && [ -d "$src_dir" ]; then
+                "$conv_bin" "${g_flags[@]}" --dry-run
+            else
+                echo "=== [1/2] Quantizing & packaging model (100% data-free generic TFQ3) ==="
+                run_cmd "$conv_bin" "${g_flags[@]}"
+                echo "=== [2/2] Validating TFQ3 checkpoint ==="
+                run_cmd "$inspect_bin" "$out_dir"
+            fi
+            ;;
         qwen27)
             case "$profile" in 4b|3.5b|3b) ;; *) die "invalid --profile '${profile}' (expected 4b, 3.5b, or 3b)" ;; esac
             if [ "$residual" = "auto" ]; then residual="$auto_res"; fi

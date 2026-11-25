@@ -127,7 +127,14 @@ static bool inspect_tfpn(const std::string& path, bool verbose) {
         cnt[m.b_bits]++;
         snr_sum[m.b_bits] += m.snr_db;
         if (verbose) {
-            printf("  %-52.80s [%6u, %5u] %ub  SNR=%5.2f dB\n", m.name, m.R, m.C, m.b_bits, m.snr_db);
+            uint32_t orig_r = m.pad[0] ? m.pad[0] : m.R;
+            uint32_t orig_c = m.pad[1] ? m.pad[1] : m.C;
+            if (orig_r != m.R || orig_c != m.C) {
+                printf("  %-52.80s [%6u, %5u] (pad %ux%u) %ub  SNR=%5.2f dB\n",
+                       m.name, orig_r, orig_c, m.R, m.C, m.b_bits, m.snr_db);
+            } else {
+                printf("  %-52.80s [%6u, %5u] %ub  SNR=%5.2f dB\n", m.name, m.R, m.C, m.b_bits, m.snr_db);
+            }
         }
     }
     double bpw = params_total ? (double)(h.total_weight_words * 32ULL + h.total_scale_halfs * 16ULL) / (double)params_total : 0.0;

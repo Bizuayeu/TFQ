@@ -420,6 +420,19 @@ __global__ void bf16_row_fwht_kernel(const uint16_t* __restrict__ W_bf16, float*
     dst[lane +  0u] = v.x; dst[lane + 32u] = v.y; dst[lane + 64u] = v.z; dst[lane + 96u] = v.w;
 }
 
+__global__ void f32_row_fwht_kernel(const float* __restrict__ W_in, float* __restrict__ W_tmp, MatParams P) {
+    uint32_t r = blockIdx.y, bc = blockIdx.x, c0 = bc * 128u, lane = threadIdx.x;
+    const float* row = W_in + static_cast<uint64_t>(r) * P.C + c0;
+    float4 v;
+    v.x = row[lane +  0u] * enc_sgn_bit(0x12345678u, c0 + lane +  0u);
+    v.y = row[lane + 32u] * enc_sgn_bit(0x12345678u, c0 + lane + 32u);
+    v.z = row[lane + 64u] * enc_sgn_bit(0x12345678u, c0 + lane + 64u);
+    v.w = row[lane + 96u] * enc_sgn_bit(0x12345678u, c0 + lane + 96u);
+    enc_fwht128_simd4(v, lane);
+    float* dst = W_tmp + static_cast<uint64_t>(r) * P.C + c0;
+    dst[lane +  0u] = v.x; dst[lane + 32u] = v.y; dst[lane + 64u] = v.z; dst[lane + 96u] = v.w;
+}
+
 __global__ void q8_64_dequant_row_fwht_kernel(
     const uint8_t* __restrict__ W_q8, const uint16_t* __restrict__ S_bf16, const uint16_t* __restrict__ B_bf16,
     float* __restrict__ W_tmp, MatParams P

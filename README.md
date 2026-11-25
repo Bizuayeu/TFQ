@@ -28,19 +28,25 @@ curl -fsSL https://raw.githubusercontent.com/ashhart/TFQ/main/install.sh | bash
 
 *(Prefer building from a local clone? Run `git clone https://github.com/ashhart/TFQ.git && cd TFQ && make install`.)*
 
-### 2. Convert any supported model
+### 2. Convert any Safetensors model (or fit to your exact RAM/VRAM budget)
 
-Pass a **Hugging Face repo ID** (auto-resolves your local HF cache or pulls it) or a **local directory**. `tfq3` auto-detects the model family (`Qwen3.8-27B`, `Qwen3.8-Flash-Next`, `GLM-5.3-Flash`), BF16 vs. 8-bit residual precision, and Metal vs. CUDA GPU backend, then packages and validates the finished checkpoint:
+Pass a **Hugging Face repo ID** (auto-resolves your local HF cache or pulls it) or a **local directory**. `tfq3` works on **any Hugging Face Safetensors architecture** (BF16/F16/F32/FP8/MLX-Q8, arbitrary matrix shapes automatically zero-padded to 128-multiples), has dedicated recipes for `Qwen3.8-27B`, `Qwen3.8-Flash-Next`, and `GLM-5.3-Flash`, and supports data-free mixed 3b/4b/5b budget allocation (`--target-gib` / `--fit auto`) plus vision, drafter, and embedding quantization:
 
 ```bash
-# Convert a model (defaults to 4-bit TFQ3 into ./<ModelName>-TFQ3)
+# Convert any model (defaults to 4-bit TFQ3 into ./<ModelName>-TFQ3)
 tfq3 Qwen/Qwen3.8-27B
+tfq3 meta-llama/Llama-3.1-8B-Instruct --target-gib 5.0
 
-# Or directly from TensorFold (auto-pulls if needed, then converts):
+# Auto-fit to this machine's available GPU memory (mixed 3b/4b/5b sensitivity planner)
+tfq3 /path/to/any-safetensors-model --fit auto
+
+# Quantize vision encoders, speculative drafters, or token embeddings to pure TFQ3
+tfq3 /path/to/Qwen3.8-27B-DFlash2 --quantize-drafter --bits 4
+tfq3 /path/to/Qwen2.5-1.5B --target-gib 0.65 --quantize-embed
+
+# Or directly from TensorFold (auto-pulls if needed; falls back to built-in zero-install Zig encoder if tfq3 isn't installed):
 tensorfold tfq3 Qwen/Qwen3.8-27B
-
-# Pick a custom output directory or compact 3.5-bit / 3-bit profile
-tfq3 /path/to/Qwen3.8-27B --profile 3.5b --out ./Qwen3.8-27B-TFQ3-3p5b
+tensorfold tfq3 /path/to/any-model --fit auto --native
 
 # Inspect & validate any TFQ3 checkpoint (or check your GPU toolchain)
 tfq3 inspect -v ./Qwen3.8-27B-TFQ3
@@ -97,22 +103,30 @@ git clone https://github.com/ashhart/TFQ.git
 cd TFQ
 
 # macOS (Apple Silicon Metal):
-make install  # builds Metal GPU converters + metallibs and installs `tfq3` into ~/.local/bin
-make test     # runs Python mathematical reference self-test
+make install      # builds Metal GPU converters + metallibs and installs `tfq3` into ~/.local/bin
+make test         # runs Python mathematical reference self-test
+make test-metal   # fp64 Metal parity (3b/4b/5b BM=32 simdgroup_matrix prefill + Col-TP/Row-TP=4) + bench
 
 # Linux (NVIDIA CUDA — pass CUDA_ARCH=sm_80 / sm_86 / sm_89 / sm_90 / sm_100 / sm_121):
 make install CUDA_ARCH=sm_121
-make test-cuda CUDA_ARCH=sm_121   # fp64 GPU parity (dense PTX m16n8k16 + mixed-bit MoE + bit-exact r1==r16==r32) + bench
+make test-cuda CUDA_ARCH=sm_121   # fp64 GPU parity (sk8 + fused + BM=64 prefill + Col-TP/Row-TP 2,4 + MoE) + bench
+
+# Linux (AMD ROCm / HIP — portable wave32/wave64 kernel library):
+make hip && make test-hip         # requires hipcc + ROCm GPU (syntax-verified on host; hardware bench pending)
 ```
 
 Built artifacts in `build/`:
-- `tfq3-qwen27-convert` (Metal) / `tfq3-qwen27-convert-cuda` (CUDA) & `tfq3-qwen27-package` — Dense `Qwen3.8-27B` converter (BF16 & MLX 8-bit/64)
+- `tfq3-generic-convert` (Metal) / `tfq3-generic-convert-cuda` (CUDA) — Model-agnostic Safetensors converter (BF16/F16/F32/FP8/MLX-Q8, arbitrary padded `[R, C]`, `--target-gib`, `--fit auto`, `--quantize-vision`/`--quantize-drafter`/`--quantize-embed`)
+- `tfq3-qwen27-convert` (Metal) / `tfq3-qwen27-convert-cuda` (CUDA) & `tfq3-qwen27-package` — Dedicated `Qwen3.8-27B` converter
 - `tfq3-flashnext-convert` (Metal) / `tfq3-flashnext-convert-cuda` (CUDA) — `Qwen3.8-Flash-Next` 512-expert MoE + PLE converter
 - `tfq3-glm-convert` (Metal) / `tfq3-glm-convert-cuda` (CUDA) — `GLM-5.3-Flash` 288-expert MoE + Non-MoE converter
-- `tfq3-cuda-test` — Standalone CUDA `fp64` parity test (dense + mixed-bit MoE + bit-exact speculative verify) & throughput benchmark
-- `tfq3-inspect` — Cross-platform validator and inspector for `pw_v3_tables.bin`, `TFPN`, and `TFPW` shards
+- `tfq3-metal-test` / `tfq3-cuda-test` / `tfq3-hip-test` — Standalone `fp64` parity tests & prefill/TP throughput benchmarks
+- `tfq3-inspect` — Cross-platform validator and inspector for `pw_v3_tables.bin`, `TFPN` (including padded dimensions), and `TFPW` shards
 
-Reusable header-only CUDA inference kernels live in [`src/kernels/cuda/tfq3_cuda.cuh`](src/kernels/cuda/tfq3_cuda.cuh) (2D FWHT-128, bank-conflict-free direct PTX `m16n8k16` split-K=8 & fused dense kernels bit-exact across `rows = 1..64`, fused mixed-bit 3b/4b/5b routed MoE kernels, and BF16 residual GEMV/GEMM — zero `<mma.h>` dependency, verified to `265 GB/s` at `rows=1` and `225–248 GB/s` at `rows=16` on NVIDIA GB10).
+Reusable standalone inference kernel libraries:
+- **NVIDIA CUDA** ([`src/kernels/cuda/tfq3_cuda.cuh`](src/kernels/cuda/tfq3_cuda.cuh)): 2D FWHT-128, direct PTX `m16n8k16` split-K=8 & fused dense kernels bit-exact across `rows = 1..64`, `BM=64, BN=128` Tensor Core long-context prefill (`24.7–29.0 TFLOP/s` on GB10), zero-repack `Col-TP` & `Row-TP`, fused mixed-bit 3b/4b/5b MoE, and BF16 residual kernels.
+- **Apple Silicon Metal** ([`src/kernels/metal/tfq3_metal.metal`](src/kernels/metal/tfq3_metal.metal)): standalone `simdgroup_matrix` `BM=32, BN=128` prefill (`12.01 TFLOP/s` on M5 Max) and zero-repack `Col-TP` / `Row-TP`.
+- **AMD ROCm / HIP** ([`src/kernels/hip/tfq3_hip.h`](src/kernels/hip/tfq3_hip.h)): portable wave32/wave64 (`width=32` shuffles) dense, zero-repack `Col-TP`/`Row-TP`, and fused mixed-bit MoE kernels.
 
 ---
 
@@ -209,9 +223,10 @@ python3 reference/tfq3_reference.py --shard /path/to/qwen27_tfq3-00001-of-00004.
 ## Documentation
 
 - **[`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md)** — Mathematical formulation of `2D FWHT-128`, `2D-AffineCoset/half4` vector quantization, zero-calibration design, state-hash split-K resume, and both Apple Silicon Metal and NVIDIA CUDA Tensor Core execution.
-- **[`docs/FORMAT_SPEC.md`](docs/FORMAT_SPEC.md)** — Byte-level cross-platform binary specification for `pw_v3_tables.bin` (`PWV3`), dense/non-MoE shards (`TFPN`), and MoE layer shards (`TFPW`) for implementing loaders in any Metal or CUDA inference engine.
-- **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)** — Full KL divergence, perplexity, SNR, Metal + CUDA throughput, speculative decoding (`DFlash2` / `DSpine` / `MTP`), and memory footprint measurements across `Qwen3.8-27B`, `Qwen3.8-Flash-Next`, and `GLM-5.3-Flash`.
-- **[`reference/tfq3_reference.py`](reference/tfq3_reference.py)** — Clean, standalone NumPy reference implementation matching both Metal and CUDA kernels.
+- **[`docs/FORMAT_SPEC.md`](docs/FORMAT_SPEC.md)** — Byte-level cross-platform binary specification for `pw_v3_tables.bin` (`PWV3`), dense/non-MoE shards (`TFPN`, including padded arbitrary dimensions and zero-repack Row/Col-TP), and MoE layer shards (`TFPW`).
+- **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)** — Full KL divergence, perplexity, SNR, Metal + CUDA decode/prefill/TP throughput, speculative decoding (`DFlash2` / `DSpine` / `MTP`), model-agnostic budget allocation, and memory footprints.
+- **[`docs/TFQ4_SUB3BIT.md`](docs/TFQ4_SUB3BIT.md)** — Next-gen sub-3-bit (`2.0–2.25 bpw`) `D4` & `E8P` cold-expert lattice prototype (`10.21 dB` SNR on real BF16 LLM weights, `258–319 GB/s` CUDA decode on NVIDIA GB10).
+- **[`reference/tfq3_reference.py`](reference/tfq3_reference.py)** & **[`reference/tfq4_lattice.py`](reference/tfq4_lattice.py)** — Clean, standalone NumPy reference implementations for TFQ3 and TFQ4-E8P.
 
 ---
 

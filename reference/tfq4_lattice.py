@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""
+TFQ4 Research Prototype: Data-Free Sub-3-Bit (2.0-2.5 bpw) D4 & E8 Lattice Quantization
+after TFQ3's exact 2D FWHT-128 rotation, benchmarked on synthetic Gaussian and real BF16 LLM weights.
+
+Compares:
+  - Uniform 2-bit & 3-bit affine (g64) baselines
+  - TFQ4-D4 (2.0 bpw = 8b/4D, 2.25 bpw = 9b/4D): 4D checkerboard lattice D4 spherical codebook
+  - TFQ4-E8 (2.0 bpw = 16b/8D via E8P 256-abs-codebook x 256 parity-signs, 2.25 bpw = 18b/8D):
+    8D Gosset lattice E8 = D8 U (D8 + 1/2), exact O(1) Conway-Sloane nearest-point quantization
+  - Exact disk footprint projections for GLM-5.3-Flash (288E) and Qwen3.8-Flash-Next (512E)
+    cold-expert compression (fitting 200B-300B MoEs into 64-96 GB unified memory).
+"""
+import argparse
+import glob
+import json
+import math
+import os
+import struct
+import numpy as np
+
+
+def sgn_vec(seed: int, n: int) -> np.ndarray:
+    idx = np.arange(n, dtype=np.uint32)
+    h = ((np.uint32(seed) ^ idx) * np.uint32(2654435761)) >> np.uint32(31)
+    return np.where(h == 1, -1.0, 1.0).astype(np.float32)
+
+
+def fwht128_rows(x: np.ndarray) -> np.ndarray:
+    orig_shape = x.shape
+    a = x.reshape(-1, 128).astype(np.float32, copy=True)
+    h = 1
+    while h < 128:
+        a = a.reshape(-1, 128 // (2 * h), 2, h)
+        u = a[:, :, 0, :].copy()
+        v = a[:, :, 1, :]
+        a[:, :, 0, :] = u + v
+        a[:, :, 1, :] = u - v
+        a = a.reshape(-1, 128)
+        h <<= 1
+    a *= (1.0 / math.sqrt(128.0))
+    return a.reshape(orig_shape)
+
+
+def fwht2d_128(W: np.ndarray) -> np.ndarray:
+    R, C = W.shape
+    assert R % 128 == 0 and C % 128 == 0
+    X = W.astype(np.float32) * sgn_vec(0x12345678, C)[None, :]
+    X = fwht128_rows(X)
+    X = X * sgn_vec(0x9E3779B9, R)[:, None]
+    X = fwht128_rows(X.T).T
+    return X
+
+
+def inv_fwht2d_128(W_rot: np.ndarray) -> np.ndarray:
+    R, C = W_rot.shape
+    X = fwht128_rows(W_rot.T).T * sgn_vec(0x9E3779B9, R)[:, None]
+    X = fwht128_rows(X) * sgn_vec(0x12345678, C)[None, :]
+    return X
+
+
+def snr_db(ref: np.ndarray, approx: np.ndarray) -> float:
+    r = ref.astype(np.float64)
+    d = r - approx.astype(np.float64)
+    sig = float(np.sum(r * r))
+    err = float(np.sum(d * d))
+    return 10.0 * math.log10(sig / max(err, 1e-30))
+
+
+def quant_uniform_affine(W: np.ndarray, bits: int, group: int = 64) -> np.ndarray:
+    R, C = W.shape
+    G = W.reshape(-1, group).astype(np.float32)
+    qmax = float((1 << bits) - 1)
+    lo = G.min(axis=1, keepdims=True)
+    hi = G.max(axis=1, keepdims=True)
+    sc = np.maximum((hi - lo) / qmax, 1e-12)
+    q = np.clip(np.rint((G - lo) / sc), 0.0, qmax)
+    return (q * sc + lo).reshape(R, C)
+
+
+# ----------------------------------------------------------------------------
+# Exact Conway-Sloane D_n & E_8 lattice nearest-point quantizers
+# ----------------------------------------------------------------------------
+def nearest_dn(x: np.ndarray) -> np.ndarray:
+    """Nearest point in D_n = {z in Z^n : sum(z) is even}, vectorized over last axis."""
+    f = np.rint(x)
+    odd = (np.sum(f, axis=-1).astype(np.int64) & 1) != 0
+    if not np.any(odd):
+        return f
+    diff = x - f
+    worst = np.argmax(np.abs(diff), axis=-1)
+    idx_odd = np.nonzero(odd)[0]
+    w_odd = worst[idx_odd]
+    step = np.where(diff[idx_odd, w_odd] >= 0.0, 1.0, -1.0)
+    f[idx_odd, w_odd] += step
+    return f
+
+
+def nearest_e8(x: np.ndarray) -> np.ndarray:
+    """Exact O(1) Conway-Sloane nearest point in E_8 = D_8 U (D_8 + 0.5)."""
+    p0 = nearest_dn(x)
+    p1 = nearest_dn(x - 0.5) + 0.5
+    d0 = np.sum((x - p0) ** 2, axis=-1)
+    d1 = np.sum((x - p1) ** 2, axis=-1)
+    return np.where((d0 <= d1)[:, None], p0, p1)
+
+
+def build_d4_codebook(n_codes: int = 256) -> np.ndarray:
+    """Spherical truncated D4 + (1/2,1/2,1/2,1/2) shifted lattice codebook of size n_codes."""
+    # Enumerate low-norm points in D4 + (0.25,0.25,0.25,0.25) offset to break origin tie
+    pts = []
+    for a in range(-3, 4):
+        for b in range(-3, 4):
+            for c in range(-3, 4):
+                for d in range(-3, 4):
+                    if ((a + b + c + d) & 1) == 0:
+                        v = np.array([a, b, c, d], dtype=np.float32) + 0.25
+                        pts.append((float(np.dot(v, v)), v))
+    pts.sort(key=lambda x: x[0])
+    cb = np.stack([p[1] for p in pts[:n_codes]], axis=0)
+    # Normalize variance to 1.0 per coordinate
+    cb /= math.sqrt(float(np.mean(cb * cb)))
+    return cb.astype(np.float32)
+
+
+def build_e8p_abs_codebook(n_abs: int = 256) -> np.ndarray:
+    """
+    Build an E8P-style compact 256-entry positive-orthant E8 codebook (2.0 bpw total:
+    8 bits abs-index + 8 bits sign pattern with E8 even/odd parity = 16 bits / 8 dims = 2.0 bpw!).
+    Total GPU LUT size: 256 * 8 * 2B = 4 KiB (fits entirely in L1 / shared memory!).
+    """
+    # Positive orthant half-integer shifted E8 points: |v_i| in {0.25, 0.75, 1.25, 1.75, 2.25}
+    # (equivalent to 0.5 * (odd integers) shifted by 0.25 -> every sign flip stays in shifted E8!)
+    vals = [0.25, 0.75, 1.25, 1.75, 2.25]
+    cands = []
+    # Enumerate sorted 8-tuples by squared norm, then generate unique permutations up to n_abs
+    # Using exact half-integer E8 + 0.25 shells gives exact zero-collision signed codebooks.
+    rng = np.random.default_rng(2026)
+    # Generate dense set of unique non-negative vectors from |E8 + 0.25|
+    seen = set()
+    # Analytical shells: all vectors with entries in {0.25, 0.75, 1.25, 1.75}
+    # Count of 0.75, 1.25, 1.75 controls norm; prioritize lowest norms first.
+    def add_vec(v):
+        k = tuple(int(round(x * 4)) for x in v)
+        if k not in seen:
+            seen.add(k)
+            cands.append((float(np.dot(v, v)), np.array(v, dtype=np.float32)))
+
+    # Shell 0: all 0.25 (1 vec)
+    add_vec([0.25] * 8)
+    # Shell 1-4: 1..4 entries elevated to 0.75 / 1.25 / 1.75 (exact E8-like spherical shell coverage)
+    for idx in range(8):
+        v = [0.25] * 8; v[idx] = 0.75; add_vec(v)
+        v = [0.25] * 8; v[idx] = 1.25; add_vec(v)
+        v = [0.25] * 8; v[idx] = 1.75; add_vec(v)
+    for i in range(8):
+        for j in range(i + 1, 8):
+            v = [0.25] * 8; v[i] = 0.75; v[j] = 0.75; add_vec(v)
+            v = [0.25] * 8; v[i] = 1.25; v[j] = 0.75; add_vec(v)
+            v = [0.25] * 8; v[i] = 0.75; v[j] = 1.25; add_vec(v)
+            v = [0.25] * 8; v[i] = 1.25; v[j] = 1.25; add_vec(v)
+    for i in range(8):
+        for j in range(i + 1, 8):
+            for k in range(j + 1, 8):
+                v = [0.25] * 8; v[i] = 0.75; v[j] = 0.75; v[k] = 0.75; add_vec(v)
+                v = [0.25] * 8; v[i] = 1.25; v[j] = 0.75; v[k] = 0.75; add_vec(v)
+    # Initialize from sorted spherical E8 shells, topped up to n_abs from |N(0,1)^8|,
+    # then refine with 25 Lloyd-Max steps (100% data-free synthetic Gaussian!).
+    cands.sort(key=lambda x: x[0])
+    pts = np.abs(rng.standard_normal((131072, 8)).astype(np.float32))
+    init_list = [c[1] for c in cands[:n_abs]]
+    if len(init_list) < n_abs:
+        extra = pts[:n_abs - len(init_list)]
+        cb = np.vstack([np.stack(init_list, axis=0), extra]).astype(np.float32)
+    else:
+        cb = np.stack(init_list, axis=0).astype(np.float32)
+    for _ in range(25):
+        # Assign in chunks
+        sums = np.zeros_like(cb, dtype=np.float64)
+        cnts = np.zeros(n_abs, dtype=np.int64)
+        cb_n2 = np.sum(cb * cb, axis=1)[None, :]
+        for s0 in range(0, len(pts), 16384):
+            p = pts[s0:s0 + 16384]
+            d = cb_n2 - 2.0 * (p @ cb.T)
+            idx = np.argmin(d, axis=1)
+            np.add.at(sums, idx, p)
+            np.add.at(cnts, idx, 1)
+        valid = cnts > 0
+        cb[valid] = (sums[valid] / cnts[valid, None]).astype(np.float32)
+    return cb
+
+
+def quant_tfq4_d4(W_rot: np.ndarray, cb: np.ndarray, shrink: float = 0.90) -> np.ndarray:
+    """Blockwise 128x128 RMS scaled 4D D4 codebook quantization (2.0 bpw @ 256, 2.25 bpw @ 512)."""
+    R, C = W_rot.shape
+    out = np.empty_like(W_rot)
+    cb_n2 = np.sum(cb * cb, axis=1)[None, :]
+    for br in range(R // 128):
+        for bc in range(C // 128):
+            blk = W_rot[br * 128:(br + 1) * 128, bc * 128:(bc + 1) * 128]
+            rms = math.sqrt(float(np.mean(blk * blk)) + 1e-12) * shrink
+            v = (blk / rms).reshape(-1, 4)
+            idx = np.argmin(cb_n2 - 2.0 * (v @ cb.T), axis=1)
+            out[br * 128:(br + 1) * 128, bc * 128:(bc + 1) * 128] = (cb[idx] * rms).reshape(128, 128)
+    return out
+
+
+def quant_tfq4_e8p(W_rot: np.ndarray, abs_cb: np.ndarray) -> np.ndarray:
+    """
+    2.0 bpw (256 abs x 256 signs = 65,536 effective 8D codewords) or 2.25 bpw (1024 abs x 256 signs).
+    Each 128x128 tile stores ONE fp16 scale -> +0.001 bpw overhead!
+    """
+    R, C = W_rot.shape
+    out = np.empty_like(W_rot)
+    cb_n2 = np.sum(abs_cb * abs_cb, axis=1)[None, :]
+    for br in range(R // 128):
+        for bc in range(C // 128):
+            blk = W_rot[br * 128:(br + 1) * 128, bc * 128:(bc + 1) * 128]
+            rms = math.sqrt(float(np.mean(blk * blk)) + 1e-12)
+            v = (blk / rms).reshape(-1, 8)
+            sgn = np.where(v >= 0.0, 1.0, -1.0).astype(np.float32)
+            av = np.abs(v)
+            idx = np.argmin(cb_n2 - 2.0 * (av @ abs_cb.T), axis=1)
+            q = abs_cb[idx] * sgn
+            # Optimal per-tile least-squares scalar refinement (stored as the same single fp16 tile scale!)
+            alpha = float(np.sum(v * q) / max(float(np.sum(q * q)), 1e-12))
+            out[br * 128:(br + 1) * 128, bc * 128:(bc + 1) * 128] = (q * (rms * alpha)).reshape(128, 128)
+    return out
+
+
+def quant_tfq4_e8_exact_lattice(W_rot: np.ndarray, step: float) -> tuple[np.ndarray, float]:
+    """Exact unbounded Conway-Sloane E8 lattice (measures information-theoretic E8 rate-distortion bound)."""
+    R, C = W_rot.shape
+    out = np.empty_like(W_rot)
+    ent_bits = []
+    for br in range(R // 128):
+        for bc in range(C // 128):
+            blk = W_rot[br * 128:(br + 1) * 128, bc * 128:(bc + 1) * 128]
+            rms = math.sqrt(float(np.mean(blk * blk)) + 1e-12)
+            v = (blk / rms).reshape(-1, 8)
+            q = nearest_e8(v / step) * step
+            out[br * 128:(br + 1) * 128, bc * 128:(bc + 1) * 128] = (q * rms).reshape(128, 128)
+            # Empirical entropy estimate (bits/dim)
+            codes = np.rint(q / step * 2.0).astype(np.int16)
+            _, cnts = np.unique(codes, axis=0, return_counts=True)
+            p = cnts / np.sum(cnts)
+            ent_bits.append(float(-np.sum(p * np.log2(p))) / 8.0)
+    return out, float(np.mean(ent_bits))
+
+
+def load_real_bf16_tensor(model_dir: str, tensor_name: str, max_r: int = 1024, max_c: int = 1024) -> np.ndarray:
+    idx_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.isfile(idx_path):
+        wm = json.load(open(idx_path))["weight_map"]
+        fn = wm[tensor_name]
+    else:
+        fn = "model.safetensors"
+    fp = os.path.join(model_dir, fn)
+    with open(fp, "rb") as f:
+        hlen = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(hlen))
+        meta = hdr[tensor_name]
+        R, C = meta["shape"]
+        o0, o1 = meta["data_offsets"]
+        f.seek(8 + hlen + o0)
+        raw = np.frombuffer(f.read(o1 - o0), dtype=np.uint16).reshape(R, C)
+    rr = min(R, max_r) // 128 * 128
+    cc = min(C, max_c) // 128 * 128
+    u32 = raw[:rr, :cc].astype(np.uint32) << 16
+    return u32.view(np.float32)
+
+
+def eval_matrix(label: str, W: np.ndarray, d4_256, d4_512, e8_256, e8_1024):
+    W_rot = fwht2d_128(W)
+    rng = np.random.default_rng(99)
+    X = rng.standard_normal((16, W.shape[1])).astype(np.float32)
+    Y_ref = X @ W.T
+
+    def report(name: str, bpw: float, W_hat: np.ndarray):
+        Y_hat = X @ W_hat.T
+        cos = float(np.sum(Y_ref * Y_hat) / (np.linalg.norm(Y_ref) * np.linalg.norm(Y_hat) + 1e-30))
+        print(f"  {name:<26s} | {bpw:5.2f} bpw | SNR={snr_db(W, W_hat):6.2f} dB | Y-cos={cos:.6f}")
+
+    print(f"\n=== {label} [{W.shape[0]} x {W.shape[1]}] ===")
+    report("Uniform Affine 2b (g64)", 2.50, quant_uniform_affine(W, 2, 64))
+    report("Uniform Affine 3b (g64)", 3.50, quant_uniform_affine(W, 3, 64))
+    report("TFQ4-D4 (256 codes)",     2.00, inv_fwht2d_128(quant_tfq4_d4(W_rot, d4_256)))
+    report("TFQ4-D4 (512 codes)",     2.25, inv_fwht2d_128(quant_tfq4_d4(W_rot, d4_512)))
+    report("TFQ4-E8P (256x256, 4KiB)",2.00, inv_fwht2d_128(quant_tfq4_e8p(W_rot, e8_256)))
+    report("TFQ4-E8P (1024x256,16KiB)",2.25, inv_fwht2d_128(quant_tfq4_e8p(W_rot, e8_1024)))
+    q_e8, h_e8 = quant_tfq4_e8_exact_lattice(W_rot, step=1.18)
+    report(f"Exact E8 bound (step=1.18)", h_e8, inv_fwht2d_128(q_e8))
+
+
+def print_moe_projections():
+    print("\n=== Projected Cold-Expert TFQ4-E8P (2.0 bpw) MoE Footprints ===")
+    # GLM-5.3-Flash (288E, 42 MoE layers, H=4096, I=2048 -> 304.1B MoE params + ~11.2 GiB non-MoE/residuals)
+    glm_moe_params = 42 * 288 * 3 * 4096 * 2048
+    glm_nonmoe_gib = 11.2
+    for name, f5, f4, f3, f2 in [
+        ("TFQ3 Current (5/4/3b HeatAlloc)",      0.06, 0.24, 0.70, 0.00),
+        ("TFQ4 Hybrid  (4b hot / 3b warm / 2b)", 0.00, 0.15, 0.25, 0.60),
+        ("TFQ4 Ultra   (4b top-10% / 2b cold)",  0.00, 0.10, 0.00, 0.90),
+    ]:
+        avg_bpw = 5 * f5 + 4 * f4 + 3 * f3 + 2 * f2 + 0.002
+        tot = glm_nonmoe_gib + (glm_moe_params * avg_bpw / 8.0) / (1 << 30)
+        print(f"  GLM-5.3-Flash    | {name:<37s} | avg {avg_bpw:.2f} bpw | {tot:6.1f} GiB")
+
+    # Qwen3.8-Flash-Next (512E, 48+1 MoE layers, H=3072, I=512 -> 118.4B MoE params + ~31.0 GiB non-MoE + 3b PLE)
+    fn_moe_params = 49 * 512 * 3 * 3072 * 512
+    fn_nonmoe_gib = 31.0
+    for name, f5, f4, f3, f2 in [
+        ("TFQ3 Current (5/4/3b HeatAlloc)",      0.02, 0.37, 0.61, 0.00),
+        ("TFQ4 Hybrid  (4b hot / 2b cold)",      0.00, 0.20, 0.00, 0.80),
+        ("TFQ4 64GB    (3b hot / 2b cold)",      0.00, 0.00, 0.20, 0.80),
+    ]:
+        avg_bpw = 5 * f5 + 4 * f4 + 3 * f3 + 2 * f2 + 0.002
+        tot = fn_nonmoe_gib + (fn_moe_params * avg_bpw / 8.0) / (1 << 30)
+        print(f"  Flash-Next 512E  | {name:<37s} | avg {avg_bpw:.2f} bpw | {tot:6.1f} GiB")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--qwen25-dir", default="")
+    ap.add_argument("--llama8b-dir", default="")
+    args = ap.parse_args()
+
+    print("Building data-free D4 (256/512) and E8P (256/1024) universal Gaussian codebooks...")
+    d4_256 = build_d4_codebook(256)
+    d4_512 = build_d4_codebook(512)
+    e8_256 = build_e8p_abs_codebook(256)
+    e8_1024 = build_e8p_abs_codebook(1024)
+
+    rng = np.random.default_rng(0)
+    W_gauss = rng.standard_normal((1024, 1024)).astype(np.float32) * 0.02
+    eval_matrix("Synthetic Unit Gaussian", W_gauss, d4_256, d4_512, e8_256, e8_1024)
+
+    if args.qwen25_dir and os.path.isdir(args.qwen25_dir):
+        W_q = load_real_bf16_tensor(args.qwen25_dir, "model.layers.0.mlp.down_proj.weight", 1024, 1024)
+        eval_matrix("Real Qwen2.5-1.5B L0 mlp.down_proj", W_q, d4_256, d4_512, e8_256, e8_1024)
+    if args.llama8b_dir and os.path.isdir(args.llama8b_dir):
+        W_l = load_real_bf16_tensor(args.llama8b_dir, "model.layers.15.mlp.down_proj.weight", 1024, 1024)
+        eval_matrix("Real Llama-3.1-8B L15 mlp.down_proj", W_l, d4_256, d4_512, e8_256, e8_1024)
+
+    print_moe_projections()
+
+
+if __name__ == "__main__":
+    main()
