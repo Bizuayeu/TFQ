@@ -18,6 +18,48 @@ Instead of uniform affine quantization or calibration-dependent Hessian fitting 
 
 ---
 
+## Get Started
+
+### 1. Install `tfq3` (one command — auto-detects Mac Metal or NVIDIA CUDA)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ashhart/TFQ/main/install.sh | bash
+```
+
+*(Prefer building from a local clone? Run `git clone https://github.com/ashhart/TFQ.git && cd TFQ && make install`.)*
+
+### 2. Convert any supported model
+
+Pass a **Hugging Face repo ID** (auto-resolves your local HF cache or pulls it) or a **local directory**. `tfq3` auto-detects the model family (`Qwen3.8-27B`, `Qwen3.8-Flash-Next`, `GLM-5.3-Flash`), BF16 vs. 8-bit residual precision, and Metal vs. CUDA GPU backend, then packages and validates the finished checkpoint:
+
+```bash
+# Convert a model (defaults to 4-bit TFQ3 into ./<ModelName>-TFQ3)
+tfq3 Qwen/Qwen3.8-27B
+
+# Or directly from TensorFold (auto-pulls if needed, then converts):
+tensorfold tfq3 Qwen/Qwen3.8-27B
+
+# Pick a custom output directory or compact 3.5-bit / 3-bit profile
+tfq3 /path/to/Qwen3.8-27B --profile 3.5b --out ./Qwen3.8-27B-TFQ3-3p5b
+
+# Inspect & validate any TFQ3 checkpoint (or check your GPU toolchain)
+tfq3 inspect -v ./Qwen3.8-27B-TFQ3
+tfq3 doctor
+```
+
+### 3. Serve on Mac (Metal) or NVIDIA GPU (CUDA)
+
+The exact same output folder runs unmodified on both platforms:
+
+```bash
+tensorfold serve ./Qwen3.8-27B-TFQ3 --host 0.0.0.0 --port 18650 --context 32768
+
+# With bit-exact speculative decoding (DFlash2 on Metal or CUDA; DSpine on CUDA)
+tensorfold serve ./Qwen3.8-27B-TFQ3 --drafter /path/to/Qwen3.8-27B-DFlash2 --host 0.0.0.0 --port 18650
+```
+
+---
+
 ## Why TFQ3?
 
 On **Qwen3.8-27B** (exact `fp64` full-vocab KL divergence across all 248,320 logits vs. 8-bit gold, zero calibration data):
@@ -55,11 +97,11 @@ git clone https://github.com/ashhart/TFQ.git
 cd TFQ
 
 # macOS (Apple Silicon Metal):
-make          # builds Metal GPU converters, metallibs, and tfq3-inspect into build/
+make install  # builds Metal GPU converters + metallibs and installs `tfq3` into ~/.local/bin
 make test     # runs Python mathematical reference self-test
 
 # Linux (NVIDIA CUDA — pass CUDA_ARCH=sm_80 / sm_86 / sm_89 / sm_90 / sm_100 / sm_121):
-make cuda CUDA_ARCH=sm_121
+make install CUDA_ARCH=sm_121
 make test-cuda CUDA_ARCH=sm_121   # fp64 GPU parity (dense PTX m16n8k16 + mixed-bit MoE + bit-exact r1==r16==r32) + bench
 ```
 
@@ -74,7 +116,7 @@ Reusable header-only CUDA inference kernels live in [`src/kernels/cuda/tfq3_cuda
 
 ---
 
-## Quick Start: Quantize Once, Run on Mac (Metal) or NVIDIA (CUDA)
+## Per-Family Commands & Advanced Options
 
 ### 1. Qwen3.8-27B (from Official Hugging Face BF16 or MLX 8-bit)
 

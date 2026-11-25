@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TFQ3_VERSION="3.0.0"
+
+usage() {
+    cat <<'EOF'
+tfq3 — TensorFold Native Quantization (TFQ3: 3 / 4 / 5-bit, Metal & CUDA)
+
+Usage:
+  tfq3 <MODEL> [options]              Convert a model directory or HF repo id to TFQ3
+  tfq3 convert <MODEL> [options]      Same as above
+  tfq3 inspect [-v] <TFQ3_DIR>        Validate and inspect a TFQ3 checkpoint
+  tfq3 doctor                         Show detected GPU backend, tools, and install paths
+  tfq3 --version | --help
+
+Options:
+  -o, --out DIR              Output TFQ3 directory (default: <model>-TFQ3)
+  --family NAME              auto | qwen27 | flashnext | glm (default: auto from config.json)
+  --profile PROFILE          Qwen3.8-27B bit profile: 4b | 3.5b | 3b (default: 4b)
+  --residual MODE            Qwen3.8-27B residual precision: auto | bf16 | q8 (default: auto)
+  --head-bits N              Qwen3.8-27B lm_head bits: 0 | 4 | 5 (default: 4)
+  --ple-bits N               Qwen3.8-Flash-Next PLE bits: 3 | 4 (default: 3)
+  --trace FILE               Optional HeatAlloc expert routing trace (Flash-Next / GLM)
+  --nonmoe-model DIR         Optional 8-bit source for GLM nonmoe.tffpw
+  --skip-existing            Resume MoE conversion, skipping finished shards
+  --no-pull, --no-download   Fail instead of pulling an uncached Hugging Face repo id
+  --dry-run                  Print the resolved conversion plan without running it
+
+Examples:
+  tfq3 Qwen/Qwen3.8-27B
+  tfq3 mlx-community/Qwen3.8-27B-MLX-8bit --profile 4b --out ./Qwen3.8-27B-TFQ3
+  tfq3 /path/to/Qwen3.8-27B --profile 3.5b
+  tfq3 inspect -v ./Qwen3.8-27B-TFQ3
+EOF
+}
+
+die() {
+    echo "tfq3: error: $*" >&2
+    exit 1
+}
+
+resolve_self() {
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+find_lib_dir() {
+    if [ -n "${TFQ3_LIB_DIR:-}" ] && [ -d "${TFQ3_LIB_DIR}" ]; then
+        echo "${TFQ3_LIB_DIR}"
+        return
+    fi
+    local self_real bin_dir parent
+    self_real="$(resolve_self "$0")"
+    bin_dir="$(dirname "$self_real")"
+    parent="$(dirname "$bin_dir")"
+    if [ -d "$parent/lib/tfq3" ]; then
+        echo "$parent/lib/tfq3"
+    elif [ -d "$parent/build" ]; then
+        echo "$parent/build"
+    else
+        echo "$bin_dir"
+    fi
+}
+
+find_flashnext_packager() {
+    local lib_dir="$1"
+    local self_real parent
+    self_real="$(resolve_self "$0")"
+    parent="$(dirname "$(dirname "$self_real")")"
+    if [ -f "$lib_dir/flashnext_package.py" ]; then
+        echo "$lib_dir/flashnext_package.py"
+    elif [ -f "$parent/src/converters/flashnext/package.py" ]; then
+        echo "$parent/src/converters/flashnext/package.py"
+    else
+        die "could not locate flashnext packager script (re-run make install)"
+    fi
+}
+
+backend_suffix() {
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo ""
+    else
+        echo "-cuda"
+    fi
+}
+
+require_tool() {
+    local lib_dir="$1"
+    local name="$2"
+    local p="$lib_dir/$name"
+    if [ ! -x "$p" ]; then
+        die "missing binary $p (build with 'make' or re-run install.sh)"
+    fi
+    echo "$p"
+}
+
+is_repo_id() {
+    python3 - "$1" <<'PY'
+import re, sys
+s = sys.argv[1]
+repo = s.split("@", 1)[0]
+ok = bool(re.fullmatch(r"[A-Za-z0-9._-]{1,96}/[A-Za-z0-9._-]{1,96}", repo))
+sys.exit(0 if ok else 1)
+PY
+}
+
+find_hf_cached_snapshot() {
+    python3 - "$1" <<'PY'
+import os, sys
+spec = sys.argv[1]
+repo = spec.split("@", 1)[0]
+if "/" not in repo:
+    sys.exit(1)
+org, name = repo.split("/", 1)
+hub = os.environ.get("HF_HUB_CACHE")
+if not hub:
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        hub = os.path.join(hf_home, "hub")
+    else:
+        hub = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+root = os.path.join(hub, f"models--{org}--{name}")
+ref_path = os.path.join(root, "refs", "main")
+if os.path.isfile(ref_path):
+    rev = open(ref_path, "r", encoding="utf-8").read().strip()
+    if len(rev) == 40 and all(c in "0123456789abcdefABCDEF" for c in rev):
+        snap = os.path.join(root, "snapshots", rev)
+        if os.path.isdir(snap) and os.path.isfile(os.path.join(snap, "config.json")):
+            print(snap)
+            sys.exit(0)
+snaps = os.path.join(root, "snapshots")
+if os.path.isdir(snaps):
+    candidates = []
+    for entry in os.listdir(snaps):
+        p = os.path.join(snaps, entry)
+        if os.path.isdir(p) and os.path.isfile(os.path.join(p, "config.json")):
+            candidates.append((os.path.getmtime(p), p))
+    if candidates:
+        candidates.sort(reverse=True)
+        print(candidates[0][1])
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+pull_repo_model() {
+    local spec="$1"
+    local repo="${spec%%@*}"
+    local rev=""
+    if [[ "$spec" == *@* ]]; then
+        rev="${spec#*@}"
+    fi
+    if command -v tensorfold >/dev/null 2>&1; then
+        echo "==> Pulling ${spec} with tensorfold pull..."
+        tensorfold pull "$spec"
+        return 0
+    fi
+    if command -v hf >/dev/null 2>&1; then
+        echo "==> Pulling ${spec} with hf download..."
+        if [ -n "$rev" ]; then
+            hf download "$repo" --revision "$rev"
+        else
+            hf download "$repo"
+        fi
+        return 0
+    fi
+    if command -v huggingface-cli >/dev/null 2>&1; then
+        echo "==> Pulling ${spec} with huggingface-cli download..."
+        if [ -n "$rev" ]; then
+            huggingface-cli download "$repo" --revision "$rev"
+        else
+            huggingface-cli download "$repo"
+        fi
+        return 0
+    fi
+    die "${spec} is not in the local Hugging Face cache and neither 'tensorfold', 'hf', nor 'huggingface-cli' is installed. Pull the model first or pass a local directory."
+}
+
+inspect_model_config() {
+    python3 - "$1" <<'PY'
+import json, os, sys
+model_dir = sys.argv[1]
+cfg_path = os.path.join(model_dir, "config.json")
+if not os.path.isfile(cfg_path):
+    sys.stderr.write(f"tfq3: error: missing config.json in {model_dir}\n")
+    sys.exit(2)
+cfg = json.load(open(cfg_path, "r", encoding="utf-8"))
+mt = cfg.get("model_type") or ""
+tc = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+if not mt:
+    mt = tc.get("model_type") or ""
+q = cfg.get("quantization") or cfg.get("quantization_config") or tc.get("quantization")
+is_mlx_q8 = False
+is_fp8 = False
+if isinstance(q, dict):
+    if q.get("bits") == 8 and q.get("group_size") in (32, 64, 128):
+        is_mlx_q8 = True
+    qm = str(q.get("quant_method") or "").lower()
+    if "fp8" in qm:
+        is_fp8 = True
+family = "unknown"
+if mt in ("qwen3_5", "qwen3_5_text"):
+    family = "qwen27"
+elif mt == "qwen4_exp":
+    family = "flashnext"
+elif mt == "glm5_next":
+    family = "glm"
+nl = tc.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0
+print(f"{family}|{mt}|{'q8' if is_mlx_q8 else 'bf16'}|{'fp8' if is_fp8 else 'other'}|{nl}")
+PY
+}
+
+default_out_dir() {
+    python3 - "$1" "$2" <<'PY'
+import os, sys
+raw, is_repo = sys.argv[1], sys.argv[2] == "1"
+if is_repo:
+    repo = raw.split("@", 1)[0]
+    base = repo.split("/", 1)[1]
+    print(os.path.join(".", f"{base}-TFQ3"))
+else:
+    p = os.path.normpath(os.path.expanduser(raw))
+    parent = os.path.dirname(p)
+    base = os.path.basename(p)
+    out = os.path.join(parent, f"{base}-TFQ3") if parent else f"{base}-TFQ3"
+    print(out)
+PY
+}
+
+run_doctor() {
+    local lib_dir suffix
+    lib_dir="$(find_lib_dir)"
+    suffix="$(backend_suffix)"
+    echo "tfq3 ${TFQ3_VERSION}"
+    echo "platform: $(uname -s) ($(uname -m))"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "backend:  Apple Silicon Metal"
+    else
+        echo "backend:  NVIDIA CUDA"
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "gpu:      $(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>/dev/null | head -n 1)"
+        fi
+    fi
+    echo "lib_dir:  ${lib_dir}"
+    for b in "tfq3-qwen27-convert${suffix}" "tfq3-qwen27-package" "tfq3-flashnext-convert${suffix}" "tfq3-glm-convert${suffix}" "tfq3-inspect"; do
+        if [ -x "$lib_dir/$b" ]; then
+            echo "  [ok]    $b"
+        else
+            echo "  [miss]  $b"
+        fi
+    done
+    if command -v tensorfold >/dev/null 2>&1; then
+        echo "tensorfold: $(command -v tensorfold)"
+    elif command -v tensorfold-native >/dev/null 2>&1; then
+        echo "tensorfold: $(command -v tensorfold-native)"
+    else
+        echo "tensorfold: not found on PATH (optional; install from https://github.com/ashhart/TensorFold)"
+    fi
+}
+
+run_cmd() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run]'
+        for arg in "$@"; do printf ' %q' "$arg"; done
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+run_convert() {
+    local model_arg=""
+    local out_dir=""
+    local family="auto"
+    local profile="4b"
+    local residual="auto"
+    local head_bits="4"
+    local ple_bits="3"
+    local trace_file=""
+    local nonmoe_model=""
+    local skip_existing=0
+    local no_pull=0
+    DRY_RUN=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            -o|--out) [ $# -ge 2 ] || die "--out requires a directory"; out_dir="$2"; shift 2 ;;
+            --family) [ $# -ge 2 ] || die "--family requires a value"; family="$2"; shift 2 ;;
+            --profile) [ $# -ge 2 ] || die "--profile requires 4b|3.5b|3b"; profile="$2"; shift 2 ;;
+            --residual) [ $# -ge 2 ] || die "--residual requires auto|bf16|q8"; residual="$2"; shift 2 ;;
+            --head-bits) [ $# -ge 2 ] || die "--head-bits requires 0|4|5"; head_bits="$2"; shift 2 ;;
+            --ple-bits) [ $# -ge 2 ] || die "--ple-bits requires 3|4"; ple_bits="$2"; shift 2 ;;
+            --trace) [ $# -ge 2 ] || die "--trace requires a file path"; trace_file="$2"; shift 2 ;;
+            --nonmoe-model) [ $# -ge 2 ] || die "--nonmoe-model requires a directory"; nonmoe_model="$2"; shift 2 ;;
+            --skip-existing) skip_existing=1; shift ;;
+            --no-pull|--no-download) no_pull=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            -*) die "unknown option: $1 (run 'tfq3 --help')" ;;
+            *)
+                if [ -z "$model_arg" ]; then
+                    model_arg="$1"
+                    shift
+                else
+                    die "unexpected argument: $1 (use --out DIR to set the output directory)"
+                fi
+                ;;
+        esac
+    done
+
+    [ -n "$model_arg" ] || { usage >&2; exit 2; }
+
+    local expanded_model="${model_arg/#\~/$HOME}"
+    local src_dir=""
+    local from_repo=0
+    if [ -d "$expanded_model" ]; then
+        src_dir="$expanded_model"
+    elif is_repo_id "$model_arg"; then
+        from_repo=1
+        if src_dir="$(find_hf_cached_snapshot "$model_arg")"; then
+            :
+        else
+            if [ "$no_pull" -eq 1 ]; then
+                die "${model_arg} is not cached locally (re-run without --no-pull or run 'tensorfold pull ${model_arg}')"
+            fi
+            if [ "$DRY_RUN" -eq 1 ]; then
+                echo "[dry-run] would pull ${model_arg} into Hugging Face cache"
+                src_dir="<cached:${model_arg}>"
+            else
+                pull_repo_model "$model_arg"
+                src_dir="$(find_hf_cached_snapshot "$model_arg")" || die "pulled ${model_arg} but could not locate snapshot with config.json"
+            fi
+        fi
+    else
+        die "'${model_arg}' is neither an existing directory nor a Hugging Face repo id (owner/name)"
+    fi
+
+    if [ -z "$out_dir" ]; then
+        out_dir="$(default_out_dir "$model_arg" "$from_repo")"
+    else
+        out_dir="${out_dir/#\~/$HOME}"
+    fi
+
+    local detected_family="unknown" model_type="unknown" auto_res="bf16" fmt_kind="other" num_layers="0"
+    if [ -d "$src_dir" ]; then
+        IFS='|' read -r detected_family model_type auto_res fmt_kind num_layers < <(inspect_model_config "$src_dir")
+    fi
+
+    if [ "$family" = "auto" ]; then
+        family="$detected_family"
+    fi
+    if [ "$family" = "unknown" ]; then
+        die "unsupported model_type '${model_type}' in ${src_dir}. Supported TFQ3 families: qwen3_5 (Qwen3.8-27B), qwen4_exp (Qwen3.8-Flash-Next), glm5_next (GLM-5.3-Flash)."
+    fi
+
+    local lib_dir suffix inspect_bin
+    lib_dir="$(find_lib_dir)"
+    suffix="$(backend_suffix)"
+    inspect_bin="$(require_tool "$lib_dir" "tfq3-inspect")"
+
+    echo "=== TFQ3 Convert ==="
+    echo "  source:   ${src_dir}"
+    echo "  output:   ${out_dir}"
+    echo "  family:   ${family} (model_type=${model_type})"
+    echo "  backend:  $([ "$(uname -s)" = "Darwin" ] && echo "Apple Silicon Metal" || echo "NVIDIA CUDA")"
+
+    case "$family" in
+        qwen27)
+            case "$profile" in 4b|3.5b|3b) ;; *) die "invalid --profile '${profile}' (expected 4b, 3.5b, or 3b)" ;; esac
+            if [ "$residual" = "auto" ]; then residual="$auto_res"; fi
+            case "$residual" in bf16|q8) ;; *) die "invalid --residual '${residual}' (expected auto, bf16, or q8)" ;; esac
+            local conv_bin pkg_bin
+            conv_bin="$(require_tool "$lib_dir" "tfq3-qwen27-convert${suffix}")"
+            pkg_bin="$(require_tool "$lib_dir" "tfq3-qwen27-package")"
+            echo "  profile:  ${profile} (head=${head_bits}b, residual=${residual})"
+            echo ""
+            echo "=== [1/3] Quantizing dense weights (100% data-free) ==="
+            run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --profile "$profile" --head-bits "$head_bits"
+            echo "=== [2/3] Packaging residual tensors, config.json, and tokenizer ==="
+            run_cmd "$pkg_bin" --src "$src_dir" --out "$out_dir" --residual "$residual"
+            echo "=== [3/3] Validating TFQ3 checkpoint ==="
+            run_cmd "$inspect_bin" "$out_dir"
+            ;;
+        flashnext)
+            case "$ple_bits" in 3|4) ;; *) die "invalid --ple-bits '${ple_bits}' (expected 3 or 4)" ;; esac
+            local conv_bin pkg_py
+            conv_bin="$(require_tool "$lib_dir" "tfq3-flashnext-convert${suffix}")"
+            pkg_py="$(find_flashnext_packager "$lib_dir")"
+            local extra_flags=()
+            [ -n "$trace_file" ] && extra_flags+=(--trace "$trace_file")
+            [ "$skip_existing" -eq 1 ] && extra_flags+=(--skip-existing)
+            echo "  ple_bits: ${ple_bits}"
+            [ -n "$trace_file" ] && echo "  trace:    ${trace_file}"
+            echo ""
+            echo "=== [1/5] Quantizing boundary MoE layers (L0-L5: 5b/4b/3b) ==="
+            run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode moe --layers 0 5 --n5 64 --n4 192 ${extra_flags[@]+"${extra_flags[@]}"}
+            echo "=== [2/5] Quantizing deep MoE layers (L6-L46: 4b/3b) ==="
+            run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode moe --layers 6 46 --n5 0 --n4 192 ${extra_flags[@]+"${extra_flags[@]}"}
+            echo "=== [3/5] Quantizing final MoE layer + MTP drafter (L47 + MTP: 5b/4b/3b) ==="
+            run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode moe --layers 47 47 --n5 64 --n4 192 --mtp ${extra_flags[@]+"${extra_flags[@]}"}
+            echo "=== [4/5] Requantizing PLE embeddings (${ple_bits}-bit/32) & packaging standalone checkpoint ==="
+            run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode requant-ple --ple-bits "$ple_bits"
+            run_cmd python3 "$pkg_py" --src "$src_dir" --out "$out_dir" --extract-nonmoe --write-index --ple-bits "$ple_bits" --move-ple
+            echo "=== [5/5] Validating TFQ3 checkpoint ==="
+            run_cmd "$inspect_bin" "$out_dir"
+            ;;
+        glm)
+            local conv_bin
+            conv_bin="$(require_tool "$lib_dir" "tfq3-glm-convert${suffix}")"
+            local extra_flags=()
+            [ -n "$trace_file" ] && extra_flags+=(--trace "$trace_file")
+            [ "$skip_existing" -eq 1 ] && extra_flags+=(--skip-existing)
+            echo ""
+            if [ "$fmt_kind" = "fp8" ] || [ -n "$nonmoe_model" ]; then
+                echo "=== [1/3] Quantizing boundary MoE layers (L3-L6: heat543) ==="
+                run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode heat543 --layers 3 6 ${extra_flags[@]+"${extra_flags[@]}"}
+                echo "=== [2/3] Quantizing deep MoE layers (L7-L44: heat43) ==="
+                run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode heat43 --layers 7 44 ${extra_flags[@]+"${extra_flags[@]}"}
+                if [ -n "$nonmoe_model" ]; then
+                    echo "=== [3/3] Quantizing non-MoE + shared experts + lm_head (fast4b) ==="
+                    run_cmd "$conv_bin" --model "${nonmoe_model/#\~/$HOME}" --out "$out_dir" --mode nonmoe --fast4b
+                else
+                    echo "=== [3/3] MoE layers complete (pass --nonmoe-model <8bit-dir> to also build nonmoe.tffpw) ==="
+                fi
+            elif [ "$auto_res" = "q8" ]; then
+                echo "=== [1/2] Quantizing GLM non-MoE + shared experts + lm_head (fast4b) ==="
+                run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode nonmoe --fast4b
+                echo "=== [2/2] Validating TFQ3 output ==="
+            else
+                echo "=== [1/3] Quantizing boundary MoE layers (L3-L6: heat543) ==="
+                run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode heat543 --layers 3 6 ${extra_flags[@]+"${extra_flags[@]}"}
+                echo "=== [2/3] Quantizing deep MoE layers (L7-L44: heat43) ==="
+                run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode heat43 --layers 7 44 ${extra_flags[@]+"${extra_flags[@]}"}
+                echo "=== [3/3] Quantizing non-MoE + shared experts + lm_head (fast4b) ==="
+                run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --mode nonmoe --fast4b
+            fi
+            run_cmd "$inspect_bin" "$out_dir"
+            ;;
+        *)
+            die "unknown family '${family}' (expected auto, qwen27, flashnext, or glm)"
+            ;;
+    esac
+
+    if [ "$DRY_RUN" -eq 0 ]; then
+        echo ""
+        echo "TFQ3 checkpoint ready: ${out_dir}"
+        echo "Serve on Mac (Metal) or NVIDIA GPU (CUDA) with TensorFold:"
+        echo "  tensorfold serve ${out_dir}"
+    fi
+}
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 0
+fi
+
+case "$1" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    -V|--version|version)
+        echo "tfq3 ${TFQ3_VERSION}"
+        exit 0
+        ;;
+    doctor)
+        run_doctor
+        ;;
+    inspect)
+        shift
+        lib_dir="$(find_lib_dir)"
+        inspect_bin="$(require_tool "$lib_dir" "tfq3-inspect")"
+        exec "$inspect_bin" "$@"
+        ;;
+    convert)
+        shift
+        run_convert "$@"
+        ;;
+    *)
+        run_convert "$@"
+        ;;
+esac

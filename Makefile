@@ -11,8 +11,11 @@ NVCC      ?= $(shell command -v nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvc
 CUDA_ARCH ?= native
 NVCCFLAGS := -O3 -std=c++17 -arch=$(CUDA_ARCH) --use_fast_math
 BUILD     := build
+PREFIX    ?= $(HOME)/.local
+BINDIR    := $(PREFIX)/bin
+LIBDIR    := $(PREFIX)/lib/tfq3
 
-.PHONY: all metal cuda qwen27 flashnext glm tools test test-cuda clean
+.PHONY: all metal cuda qwen27 flashnext glm tools test test-cuda install uninstall clean
 
 ifeq ($(UNAME_S),Darwin)
 all: tools metal
@@ -86,6 +89,23 @@ test: all
 
 test-cuda: cuda
 	@$(BUILD)/tfq3-cuda-test --bench
+
+install: all
+	@mkdir -p "$(BINDIR)" "$(LIBDIR)"
+	@install -m 0755 bin/tfq3 "$(BINDIR)/tfq3"
+	@install -m 0755 $(BUILD)/tfq3-inspect $(BUILD)/tfq3-qwen27-package "$(LIBDIR)/"
+	@install -m 0644 src/converters/flashnext/package.py "$(LIBDIR)/flashnext_package.py"
+ifeq ($(UNAME_S),Darwin)
+	@install -m 0755 $(BUILD)/tfq3-qwen27-convert $(BUILD)/tfq3-flashnext-convert $(BUILD)/tfq3-glm-convert "$(LIBDIR)/"
+	@install -m 0644 $(BUILD)/tfq3-qwen27-convert.metallib $(BUILD)/tfq3-flashnext-convert.metallib $(BUILD)/tfq3-glm-convert.metallib "$(LIBDIR)/"
+else
+	@install -m 0755 $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq3-cuda-test "$(LIBDIR)/"
+endif
+	@echo "Installed tfq3 -> $(BINDIR)/tfq3 (runtime binaries in $(LIBDIR))"
+
+uninstall:
+	rm -f "$(BINDIR)/tfq3"
+	rm -rf "$(LIBDIR)"
 
 clean:
 	rm -rf $(BUILD)
