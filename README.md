@@ -1,11 +1,11 @@
 # TFQ — TensorFold Native Quantization (`TFQ3`)
 
-**TFQ3** is an open, **100% data-free (zero-calibration)** 3-, 4-, and 5-bit weight quantization format and Apple Silicon Metal GPU converter suite built for [TensorFold](https://github.com/ashhart/TensorFold).
+**TFQ3** is an open, **100% data-free (zero-calibration)** 3-, 4-, and 5-bit weight quantization format, **Apple Silicon Metal & NVIDIA CUDA** GPU converter suite, and standalone inference kernel library built for [TensorFold](https://github.com/ashhart/TensorFold).
 
 Instead of uniform affine quantization or calibration-dependent Hessian fitting (GPTQ/AWQ/imatrix), TFQ3 combines:
 1. A deterministic **randomized 2D Fast Walsh–Hadamard Transform (`2D FWHT-128`)** on every `128×128` weight tile to analytically eliminate channel outliers.
 2. A single fixed **16 KiB universal Gaussian `2D-AffineCoset/half4` vector codebook** (`pw_v3_tables.bin`) with state-dependent coset hashing and zero-cost `split-K` resume.
-3. **16 KiB–aligned zero-copy `.tffpw` shards** that `mmap` directly into Metal (`bufferNoCopy`) for sub-second model loads (`0.2s–0.5s` for 27B) and native Apple Silicon SIMD / M5 NAX execution.
+3. **16 KiB–aligned zero-copy `.tffpw` shards** — bit-identical across **Apple Silicon Metal** (`bufferNoCopy` + SIMD/NAX) and **NVIDIA CUDA** (warp-register decode + `wmma` Tensor Core prefill) for sub-second loads (`0.2s–0.5s` for 27B) and cross-platform portability.
 
 ---
 
@@ -35,21 +35,31 @@ On **Qwen3.8-27B** (exact `fp64` full-vocab KL divergence across all 248,320 log
 
 ## Requirements & Build
 
-- **macOS on Apple Silicon** (M1–M5) with Xcode Command Line Tools (`clang++`, `xcrun metal`, `xcrun metallib`).
-- **Zero external C++ dependencies** — builds cleanly in ~3 seconds with standard `make`.
+- **Apple Silicon (macOS, M1–M5):** Xcode Command Line Tools (`clang++`, `xcrun metal`, `xcrun metallib`).
+- **NVIDIA CUDA (Linux, Ampere / Ada / Hopper / Blackwell — SM 8.0+):** CUDA Toolkit (`nvcc` 12+/13+) and `g++`.
+- **Zero external C++ dependencies** — `make` auto-detects macOS Metal vs. Linux CUDA.
 
 ```bash
 git clone https://github.com/ashhart/TFQ.git
 cd TFQ
-make          # builds all GPU converters, metallibs, and tfq3-inspect into build/
-make test     # runs Python mathematical reference self-test & CLI checks
+
+# macOS (Apple Silicon Metal):
+make          # builds Metal GPU converters, metallibs, and tfq3-inspect into build/
+make test     # runs Python mathematical reference self-test
+
+# Linux (NVIDIA CUDA — pass CUDA_ARCH=sm_89 / sm_90 / sm_100 / sm_121 as desired):
+make cuda CUDA_ARCH=sm_121
+make test-cuda CUDA_ARCH=sm_121   # fp64 GPU parity (3b/4b/5b decode + WMMA prefill) + GB10 bench
 ```
 
 Built artifacts in `build/`:
-- `tfq3-qwen27-convert` (+ `.metallib`) & `tfq3-qwen27-package` — Dense `Qwen3.8-27B` converter (BF16 & MLX 8-bit/64)
-- `tfq3-flashnext-convert` (+ `.metallib`) — `Qwen3.8-Flash-Next` 512-expert MoE + PLE converter
-- `tfq3-glm-convert` (+ `.metallib`) — `GLM-5.3-Flash` 288-expert MoE + Non-MoE converter
+- `tfq3-qwen27-convert` / `tfq3-qwen27-convert-cuda` & `tfq3-qwen27-package` — Dense `Qwen3.8-27B` converter (BF16 & MLX 8-bit/64)
+- `tfq3-flashnext-convert` / `tfq3-flashnext-convert-cuda` — `Qwen3.8-Flash-Next` 512-expert MoE + PLE converter
+- `tfq3-glm-convert` / `tfq3-glm-convert-cuda` — `GLM-5.3-Flash` 288-expert MoE + Non-MoE converter
+- `tfq3-cuda-test` — Standalone CUDA `fp64` parity test + throughput benchmark for `src/kernels/cuda/tfq3_cuda.cuh`
 - `tfq3-inspect` — Standalone validator and inspector for `pw_v3_tables.bin`, `TFPN`, and `TFPW` shards
+
+Reusable header-only CUDA inference kernels live in [`src/kernels/cuda/tfq3_cuda.cuh`](src/kernels/cuda/tfq3_cuda.cuh) (2D FWHT-128, 3b/4b/5b fused + 2D split-K decode, `wmma` 16×16×16 Tensor Core prefill, and BF16 residual GEMV/GEMM — verified to ~265 GB/s / 96% peak memory bandwidth on NVIDIA GB10).
 
 ---
 

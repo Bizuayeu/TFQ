@@ -67,3 +67,21 @@ Converting a 4-layer + `lm_head` HF-format BF16 checkpoint (`model.language_mode
 | Decode `B=1` | — | 75.5 tok/s | **69.6 tok/s** |
 | Live Streaming (`MTP + copies`) | — | — | **87.0–104.3 tok/s** |
 | MTP `depth 3 == depth 0` | Bit-exact | Bit-exact | **Bit-exact** |
+
+---
+
+## 4. NVIDIA CUDA Kernel & Converter Verification (NVIDIA GB10, SM 12.1)
+
+Measured directly on **NVIDIA GB10** (48 SMs, ~273 GB/s LPDDR5X peak bandwidth, CUDA 13.0, `nvcc -arch=sm_121`) via `make test-cuda CUDA_ARCH=sm_121`:
+
+- **Numerical parity (`tfq3-cuda-test`):** `PASS` against exact `fp64` reference across all 3b/4b/5b fused decode kernels, 2D split-K (`2dsk8`) decode kernels, `wmma::mma_sync` `16×16×16` Tensor Core prefill kernels, `sr_split` fused `gate+up` / `k+v`, strided outputs, and BF16 `mv1`/`mm` kernels.
+- **CUDA BF16 Converter (`tfq3-qwen27-convert-cuda`):** 4 full `Qwen3.8-27B` layers (`2.83 GiB` BF16 -> `0.708 GiB` TFQ3-4b, `4.001 bpw`) quantized in **21.8 s** (~5.5 s/layer) at **23.35 dB** mean SNR (matching Metal's `23.37 dB`), passing `tfq3-inspect` with zero errors.
+
+### Standalone CUDA Kernel Microbenchmarks (`src/kernels/cuda/tfq3_cuda.cuh`, 4-bit TFQ3)
+
+| Qwen3.8-27B Projection | Shape `[N × K]` | `rows=1` Latency | `rows=1` BW | `rows=4` Latency | `rows=4` BW | `rows=256` WMMA Prefill |
+|---|---|---:|---:|---:|---:|---:|
+| `gate+up` | `[34816 × 5120]` | 0.341 ms | **261.8 GB/s** | 0.411 ms | 217.1 GB/s | **26.82 TFLOP/s** (3.40 ms) |
+| `down` | `[5120 × 17408]` | 0.168 ms | **265.0 GB/s** | 0.178 ms | **250.1 GB/s** | **23.95 TFLOP/s** (1.91 ms) |
+| `qkv` (L2-hot) | `[10240 × 5120]` | 0.063 ms | **413.0 GB/s** | 0.080 ms | 326.7 GB/s | **27.22 TFLOP/s** (0.99 ms) |
+| `lm_head` | `[248320 × 5120]` | 2.792 ms | **227.7 GB/s** | 4.042 ms | 157.3 GB/s | — |

@@ -65,8 +65,9 @@ static bool inspect_tables(const std::string& path) {
     if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
     uint32_t hdr[2];
     float ab[6];
-    fread(hdr, 4, 2, f);
-    fread(ab, 4, 6, f);
+    if (fread(hdr, 4, 2, f) != 2 || fread(ab, 4, 6, f) != 6) {
+        fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false;
+    }
     fclose(f);
     if (hdr[0] != MAGIC_PWV3 || hdr[1] != FORMAT_VER) {
         fprintf(stderr, "FAIL %s: bad magic/version (0x%08x v%u)\n", path.c_str(), hdr[0], hdr[1]);
@@ -86,7 +87,9 @@ static bool inspect_tfpn(const std::string& path, bool verbose) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
     TfpnHeader h{};
-    fread(&h, sizeof(h), 1, f);
+    if (fread(&h, sizeof(h), 1, f) != 1) {
+        fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false;
+    }
     if (h.magic != MAGIC_TFPN || h.version != FORMAT_VER) {
         fclose(f); fprintf(stderr, "FAIL %s: bad magic/version\n", path.c_str()); return false;
     }
@@ -101,7 +104,9 @@ static bool inspect_tfpn(const std::string& path, bool verbose) {
     }
     std::vector<TfpnTensorMeta> metas(h.num_tensors);
     fseek(f, (long)h.off_meta, SEEK_SET);
-    fread(metas.data(), sizeof(TfpnTensorMeta), h.num_tensors, f);
+    if (h.num_tensors > 0 && fread(metas.data(), sizeof(TfpnTensorMeta), h.num_tensors, f) != h.num_tensors) {
+        fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false;
+    }
     fclose(f);
 
     uint64_t params_total = 0;
@@ -140,7 +145,9 @@ static bool inspect_tfpw(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
     TfpwHeader h{};
-    fread(&h, sizeof(h), 1, f);
+    if (fread(&h, sizeof(h), 1, f) != 1) {
+        fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false;
+    }
     if (h.magic != MAGIC_TFPW || h.version != FORMAT_VER) {
         fclose(f); fprintf(stderr, "FAIL %s: bad magic/version\n", path.c_str()); return false;
     }
@@ -155,7 +162,9 @@ static bool inspect_tfpw(const std::string& path) {
     }
     std::vector<TfpwExpertMeta> metas(h.num_experts);
     fseek(f, (long)h.off_meta, SEEK_SET);
-    fread(metas.data(), sizeof(TfpwExpertMeta), h.num_experts, f);
+    if (h.num_experts > 0 && fread(metas.data(), sizeof(TfpwExpertMeta), h.num_experts, f) != h.num_experts) {
+        fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false;
+    }
     fclose(f);
 
     uint64_t cnt[6] = {};
