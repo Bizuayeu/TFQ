@@ -9,8 +9,11 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace tfq4 {
@@ -106,11 +109,7 @@ static inline void build_e8p_tables(PwV4E8Tables& t) {
     t.k_codes = 256u;
     t.dim     = 8u;
 
-    // 1. Collect positive-orthant E8 + 0.25 shells (shifted integer & half-integer lattices).
-    struct Cand { std::array<float, 8> v; float r2; };
-    std::vector<Cand> cands;
-    cands.reserve(2048);
-    // Shifted integer grid: {0.25, 0.75, 1.25, 1.75, 2.25} with even parity proxy
+    // 1. Shifted E8 + 0.25 positive-orthant anchor grid + synthetic |N(0,1)^8| bank.
     const float vals[5] = {0.25f, 0.75f, 1.25f, 1.75f, 2.25f};
     std::mt19937 rng(2026u);
     std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -175,6 +174,59 @@ static inline void build_e8p_tables(PwV4E8Tables& t) {
             t.e8p_lut[k][d] = f32_to_f16_bits(std::max(0.0f, C[k][d]));
         }
     }
+}
+
+static inline uint64_t align_up_16k(uint64_t x) {
+    return (x + (uint64_t)ALIGN_16K - 1ull) & ~((uint64_t)ALIGN_16K - 1ull);
+}
+
+static inline uint64_t tfp4_tensor_bytes(uint32_t pad_R, uint32_t pad_C) {
+    uint64_t words = (uint64_t)pad_R * (pad_C / 16u);
+    uint64_t sc = (uint64_t)(pad_R / 128u) * (pad_C / 128u);
+    return words * 4ull + sc * 2ull;
+}
+
+static inline uint64_t write_tfp4_shard(
+    const std::string& path,
+    const std::vector<Tfp4TensorMeta>& metas,
+    const std::vector<uint16_t>& scales,
+    const std::vector<uint32_t>& words
+) {
+    const uint64_t off_meta = sizeof(Tfp4Header);
+    const uint64_t off_sc   = align_up_16k(off_meta + (uint64_t)metas.size() * sizeof(Tfp4TensorMeta));
+    const uint64_t off_wt   = align_up_16k(off_sc + (uint64_t)scales.size() * 2ull);
+    const uint64_t tot_sz   = align_up_16k(off_wt + (uint64_t)words.size() * 4ull);
+    Tfp4Header hdr{};
+    hdr.magic = MAGIC_TFP4;
+    hdr.version = FORMAT_VER;
+    hdr.num_tensors = (uint32_t)metas.size();
+    hdr.off_meta = off_meta;
+    hdr.off_scales = off_sc;
+    hdr.off_weights = off_wt;
+    hdr.total_scale_halfs = scales.size();
+    hdr.total_weight_words = words.size();
+
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs.good()) {
+        fprintf(stderr, "Cannot write TFP4 shard: %s\n", path.c_str());
+        std::exit(1);
+    }
+    std::vector<char> zeros(ALIGN_16K, 0);
+    ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    if (!metas.empty()) ofs.write(reinterpret_cast<const char*>(metas.data()), (std::streamsize)(metas.size() * sizeof(Tfp4TensorMeta)));
+    uint64_t pos = off_meta + (uint64_t)metas.size() * sizeof(Tfp4TensorMeta);
+    if (off_sc > pos) ofs.write(zeros.data(), (std::streamsize)(off_sc - pos));
+    if (!scales.empty()) ofs.write(reinterpret_cast<const char*>(scales.data()), (std::streamsize)(scales.size() * 2ull));
+    pos = off_sc + (uint64_t)scales.size() * 2ull;
+    if (off_wt > pos) ofs.write(zeros.data(), (std::streamsize)(off_wt - pos));
+    if (!words.empty()) ofs.write(reinterpret_cast<const char*>(words.data()), (std::streamsize)(words.size() * 4ull));
+    pos = off_wt + (uint64_t)words.size() * 4ull;
+    if (tot_sz > pos) ofs.write(zeros.data(), (std::streamsize)(tot_sz - pos));
+    if (!ofs.good()) {
+        fprintf(stderr, "Write error on TFP4 shard: %s\n", path.c_str());
+        std::exit(1);
+    }
+    return tot_sz;
 }
 
 } // namespace tfq4

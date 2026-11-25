@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-tools-and-tests:
+    name: Linux tools, references & E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python NumPy
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-numpy
+
+      - name: Shell script syntax check
+        run: bash -n bin/tfq3 install.sh scripts/quantize_qwen27.sh
+
+      - name: Build CLI tools with -Werror
+        run: make tools CXXFLAGS="-O3 -std=c++17 -Wall -Wextra -Werror -Wno-unused-parameter"
+
+      - name: Run reference self-tests and E2E validator suite
+        run: |
+          python3 reference/tfq3_reference.py --self-test
+          python3 reference/tfq4_lattice.py --self-test
+          python3 tests/e2e_test.py --no-gpu
+
+  macos-metal-build:
+    name: macOS Apple Silicon Metal build & install
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell script syntax check
+        run: bash -n bin/tfq3 install.sh scripts/quantize_qwen27.sh
+
+      - name: Ensure Python NumPy is available
+        run: python3 -c "import numpy" || pip3 install --break-system-packages --quiet numpy
+
+      - name: Build all tools, Metal converters, and metallibs
+        run: |
+          make tools CXXFLAGS="-O3 -std=c++17 -Wall -Wextra -Werror -Wno-unused-parameter"
+          make metal
+
+      - name: Test install layout and tfq3 doctor
+        run: |
+          make install PREFIX=/tmp/tfq3-ci
+          /tmp/tfq3-ci/bin/tfq3 --version
+          /tmp/tfq3-ci/bin/tfq3 doctor
+          rm -rf /tmp/tfq3-ci
+
+      - name: Run reference self-tests and E2E validator suite
+        run: |
+          python3 reference/tfq3_reference.py --self-test
+          python3 reference/tfq4_lattice.py --self-test
+          python3 tests/e2e_test.py --no-gpu

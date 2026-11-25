@@ -319,11 +319,101 @@ def print_moe_projections():
         print(f"  Flash-Next 512E  | {name:<37s} | avg {avg_bpw:.2f} bpw | {tot:6.1f} GiB")
 
 
+MAGIC_PWV4 = 0x34565750
+MAGIC_TFP4 = 0x34504654
+TFQ4_VER = 4
+
+
+def load_pwv4_tables(path: str) -> np.ndarray:
+    """Load and validate a 16 KiB `pw_v4_e8p_tables.bin` codebook (`float32` [256, 8])."""
+    raw = open(path, "rb").read()
+    if len(raw) != 16384:
+        raise ValueError(f"Expected 16384-byte PWV4 file, got {len(raw)}")
+    magic, ver, k_codes, dim = struct.unpack_from("<IIII", raw, 0)
+    if magic != MAGIC_PWV4 or ver != TFQ4_VER or k_codes != 256 or dim != 8:
+        raise ValueError(f"Bad PWV4 header: magic=0x{magic:08x} ver={ver} k={k_codes} dim={dim}")
+    lut = np.frombuffer(raw, dtype=np.float16, count=256 * 8, offset=64).reshape(256, 8).astype(np.float32)
+    if not np.all(np.isfinite(lut)) or np.any(lut < 0.0):
+        raise ValueError("PWV4 e8p_lut contains non-finite or negative entries")
+    return lut
+
+
+def dequantize_tfp4_tensor(
+    shard_path: str, tables_path: str, tensor_name: str, max_blocks: int | None = None
+) -> np.ndarray:
+    """Dequantize a TFP4 v4 (2.001 bpw E8P) tensor (or its top-left tiles) to float32."""
+    lut = load_pwv4_tables(tables_path)
+    with open(shard_path, "rb") as f:
+        hdr = struct.unpack("<IIIIQQQQQQ", f.read(64))
+        magic, ver, nt, _, off_meta, off_scales, off_weights, _, _, _ = hdr
+        if magic != MAGIC_TFP4 or ver != TFQ4_VER:
+            raise ValueError(f"Bad TFP4 header in {shard_path}")
+        f.seek(off_meta)
+        found = None
+        for _ in range(nt):
+            rec = f.read(128)
+            nm = rec[:80].split(b"\x00", 1)[0].decode("utf-8")
+            if nm == tensor_name:
+                found = struct.unpack("<IIIIQQfIII", rec[80:])
+                break
+        if found is None:
+            raise KeyError(f"Tensor {tensor_name} not in {shard_path}")
+        R, C, bits, sc_off, w_off, w_cnt, _, _, _, _ = found
+        if bits != 2:
+            raise ValueError(f"Unexpected TFP4 bits={bits} for {tensor_name}")
+        n_br, n_bc = R // 128, C // 128
+        rb_lim = n_br if max_blocks is None else min(max_blocks, n_br)
+        cb_lim = n_bc if max_blocks is None else min(max_blocks, n_bc)
+        f.seek(off_scales + sc_off * 2)
+        scales = np.frombuffer(f.read(n_br * n_bc * 2), dtype=np.float16).reshape(n_br, n_bc).astype(np.float32)
+        f.seek(off_weights + w_off * 4)
+        words = np.frombuffer(f.read(w_cnt * 4), dtype=np.uint32).reshape(R, C // 16)
+
+    rr, cc = rb_lim * 128, cb_lim * 128
+    sub_w = words[:rr, : cc // 16]
+    codes = np.empty((rr, cc // 8), dtype=np.uint16)
+    codes[:, 0::2] = (sub_w & np.uint32(0xFFFF)).astype(np.uint16)
+    codes[:, 1::2] = (sub_w >> np.uint32(16)).astype(np.uint16)
+
+    k_idx = (codes & np.uint16(0xFF)).astype(np.int32)
+    sm = (codes >> np.uint16(8)).astype(np.uint32)
+    bits_mask = (sm[..., None] >> np.arange(8, dtype=np.uint32)) & np.uint32(1)
+    sgn = np.where(bits_mask != 0, -1.0, 1.0).astype(np.float32)
+    W_rot = (lut[k_idx] * sgn).reshape(rr, cc)
+    sc_tile = np.repeat(np.repeat(scales[:rb_lim, :cb_lim], 128, axis=0), 128, axis=1)
+    return inv_fwht2d_128(W_rot * sc_tile)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--qwen25-dir", default="")
     ap.add_argument("--llama8b-dir", default="")
+    ap.add_argument("--shard", default="", help="Decode a TFP4 .tffp4 shard tensor")
+    ap.add_argument("--tables", default="", help="Path to pw_v4_e8p_tables.bin")
+    ap.add_argument("--tensor", default="", help="Tensor name inside --shard")
+    ap.add_argument("--max-blocks", type=int, default=2)
+    ap.add_argument("--self-test", action="store_true", help="Fast invertibility & E8P roundtrip check")
     args = ap.parse_args()
+
+    if args.shard:
+        if not args.tables or not args.tensor:
+            raise SystemExit("--shard requires --tables and --tensor")
+        W = dequantize_tfp4_tensor(args.shard, args.tables, args.tensor, max_blocks=args.max_blocks)
+        print(f"Decoded {args.tensor} {tuple(W.shape)}: mean={W.mean():.6f} std={W.std():.6f} rms={np.sqrt(np.mean(W**2)):.6f}")
+        return
+
+    if args.self_test:
+        rng = np.random.default_rng(7)
+        W = rng.standard_normal((256, 256)).astype(np.float32) * 0.02
+        W_rot = fwht2d_128(W)
+        err = float(np.max(np.abs(W - inv_fwht2d_128(W_rot))))
+        assert err < 1e-5, f"2D FWHT inverse error: {err}"
+        cb = build_e8p_abs_codebook(256)
+        W_hat = inv_fwht2d_128(quant_tfq4_e8p(W_rot, cb))
+        s = snr_db(W, W_hat)
+        assert s > 9.5, f"Unexpectedly low E8P SNR: {s:.2f} dB"
+        print(f"PASS TFQ4-E8P self-test: FWHT max_err={err:.2e}, 2.001 bpw SNR={s:.2f} dB")
+        return
 
     print("Building data-free D4 (256/512) and E8P (256/1024) universal Gaussian codebooks...")
     d4_256 = build_d4_codebook(256)

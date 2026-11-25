@@ -1,7 +1,8 @@
 // ============================================================================
 // TFQ4-E8P (2.001 bpw) Model-Agnostic Apple Silicon Metal GPU Converter
-//   Converts any Safetensors checkpoint (BF16/F16/F32/FP8/MLX-Q8, padded [R,C])
-//   into 16 KiB-aligned cross-platform TFP4 v4 + PWV4 v4 shards.
+//   - Converts any Safetensors checkpoint (BF16/F16/F32/FP8/MLX-Q8, padded [R,C])
+//   - Row-chunked GPU pipeline (4096 rows/chunk) for bounded VRAM on 70B+ models
+//   - Automatic 3.4 GiB shard splitting (16 KiB-aligned cross-platform TFP4 v4)
 // ============================================================================
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -19,7 +20,7 @@
 
 namespace fs = std::filesystem;
 
-struct Tfq4MatParams { uint32_t R, C; };
+struct Tfq4MatParams { uint32_t R, C, r_off, pad0; };
 
 static std::string default_metallib(const char* name) {
     uint32_t sz = 0; _NSGetExecutablePath(nullptr, &sz);
@@ -31,31 +32,54 @@ static std::string default_metallib(const char* name) {
     return name;
 }
 
-static size_t align_up(size_t x, size_t a) { return (x + a - 1) & ~(a - 1); }
+static std::vector<std::vector<size_t>> partition_tfq4_shards(
+    const std::vector<tfq_generic::QuantJob>& jobs, uint64_t max_shard_bytes
+) {
+    std::vector<std::vector<size_t>> shards;
+    std::vector<size_t> cur;
+    uint64_t cur_bytes = 0;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        uint64_t b = tfq4::tfp4_tensor_bytes(jobs[i].pad_R, jobs[i].pad_C);
+        if (!cur.empty() && cur_bytes + b > max_shard_bytes) {
+            shards.push_back(std::move(cur));
+            cur.clear();
+            cur_bytes = 0;
+        }
+        cur.push_back(i);
+        cur_bytes += b;
+    }
+    if (!cur.empty()) shards.push_back(std::move(cur));
+    return shards;
+}
 
 int main(int argc, char** argv) {
     @autoreleasepool {
         tfq_generic::GenericOptions opt;
         opt.default_bits = 3;
         opt.head_bits = 4;
+        double max_shard_gib = 3.4;
+        std::string metallib = default_metallib("tfq4-convert.metallib");
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             if ((a == "--model" || a == "-m") && i + 1 < argc) opt.model_dir = argv[++i];
             else if ((a == "--out" || a == "-o") && i + 1 < argc) opt.out_dir = argv[++i];
+            else if (a == "--metallib" && i + 1 < argc) metallib = argv[++i];
             else if (a == "--quantize-vision") opt.quantize_vision = true;
             else if (a == "--quantize-drafter") opt.quantize_drafter = true;
             else if (a == "--quantize-embed") opt.quantize_embed = true;
             else if (a == "--head-bits" && i + 1 < argc) opt.head_bits = (uint32_t)std::stoul(argv[++i]);
+            else if (a == "--max-shard-gib" && i + 1 < argc) max_shard_gib = std::stod(argv[++i]);
             else if (a == "--dry-run") opt.dry_run = true;
             else if (a == "-h" || a == "--help") {
-                printf("Usage: tfq4-convert --model DIR --out DIR [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
+                printf("Usage: tfq4-convert --model DIR --out DIR [--head-bits 0|2] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
                 return 0;
             }
         }
         if (opt.model_dir.empty() || opt.out_dir.empty()) {
-            fprintf(stderr, "Usage: tfq4-convert --model DIR --out DIR [--quantize-vision] [--quantize-drafter] [--quantize-embed]\n");
+            fprintf(stderr, "Usage: tfq4-convert --model DIR --out DIR [--head-bits 0|2] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
             return 2;
         }
+        uint64_t max_shard_bytes = (uint64_t)std::max(1.0 * (double)(1ULL << 20), max_shard_gib * (double)(1ULL << 30));
 
         tfq_generic::SafetensorsDir st;
         st.init(opt.model_dir);
@@ -64,10 +88,14 @@ int main(int argc, char** argv) {
 
         uint64_t est_tfq4_bytes = 0;
         for (auto& j : plan.jobs) {
-            est_tfq4_bytes += (uint64_t)j.pad_R * (j.pad_C / 16u) * 4ull + (uint64_t)(j.pad_R / 128u) * (j.pad_C / 128u) * 2ull;
+            j.bits = 2u;
+            est_tfq4_bytes += tfq4::tfp4_tensor_bytes(j.pad_R, j.pad_C);
         }
-        printf("TFQ4-E8P (2.001 bpw) Plan: %zu quantized tensors (%.3f GiB) + %zu residual (%.3f GiB) = %.3f GiB total\n",
-               plan.jobs.size(), est_tfq4_bytes / (double)(1ULL << 30),
+        plan.tfq_bytes = est_tfq4_bytes;
+        auto shards = partition_tfq4_shards(plan.jobs, max_shard_bytes);
+
+        printf("TFQ4-E8P (2.001 bpw) Plan: %zu quantized tensors (%.3f GiB across %zu shard(s)) + %zu residual (%.3f GiB) = %.3f GiB total\n",
+               plan.jobs.size(), est_tfq4_bytes / (double)(1ULL << 30), shards.size(),
                plan.residual_names.size(), plan.residual_bytes / (double)(1ULL << 30),
                (est_tfq4_bytes + plan.residual_bytes) / (double)(1ULL << 30));
         if (opt.dry_run) return 0;
@@ -76,11 +104,14 @@ int main(int argc, char** argv) {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         if (!dev) { fprintf(stderr, "No Apple Metal device\n"); return 1; }
         NSError* err = nil;
-        std::string mpath = default_metallib("tfq4-convert.metallib");
-        id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:mpath.c_str()]] error:&err];
-        if (!lib) { fprintf(stderr, "metallib error (%s): %s\n", mpath.c_str(), [[err localizedDescription] UTF8String]); return 1; }
+        id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:metallib.c_str()]] error:&err];
+        if (!lib) { fprintf(stderr, "metallib error (%s): %s\n", metallib.c_str(), [[err localizedDescription] UTF8String]); return 1; }
         auto mk = [&](const char* nm) {
-            return [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:[NSString stringWithUTF8String:nm]] error:&err];
+            id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:nm]];
+            if (!fn) { fprintf(stderr, "Missing Metal kernel %s\n", nm); std::exit(1); }
+            id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];
+            if (!pso) { fprintf(stderr, "PSO error %s: %s\n", nm, [[err localizedDescription] UTF8String]); std::exit(1); }
+            return pso;
         };
         id<MTLComputePipelineState> p_rfwht = mk("f32_row_fwht");
         id<MTLComputePipelineState> p_cfwht = mk("col_fwht_and_ss");
@@ -98,105 +129,124 @@ int main(int argc, char** argv) {
         id<MTLBuffer> b_lut = [dev newBufferWithBytes:tbl.e8p_lut length:sizeof(tbl.e8p_lut) options:MTLResourceStorageModeShared];
         id<MTLBuffer> b_met = [dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
 
-        std::vector<tfq4::Tfp4TensorMeta> metas;
-        std::vector<uint16_t> all_scales;
-        std::vector<uint32_t> all_words;
+        uint32_t max_pad_C = 128u;
+        for (const auto& j : plan.jobs) max_pad_C = std::max(max_pad_C, j.pad_C);
+        const uint32_t MAX_CHUNK_R = 4096u;
+        const size_t MAX_ELEMS = (size_t)MAX_CHUNK_R * max_pad_C;
+        const size_t MAX_BLK   = (size_t)(MAX_CHUNK_R / 128u) * (max_pad_C / 128u);
+        const size_t MAX_WORDS = (size_t)MAX_CHUNK_R * (max_pad_C / 16u);
+
+        id<MTLBuffer> b_in  = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_tmp = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> b_rot = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> b_ss  = [dev newBufferWithLength:MAX_BLK   * 4ULL options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_sc  = [dev newBufferWithLength:MAX_BLK   * 2ULL options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_out = [dev newBufferWithLength:MAX_WORDS * 4ULL options:MTLResourceStorageModeShared];
+
+        std::vector<float> host_chunk;
+        std::vector<std::string> shard_names;
         double snr_sum = 0.0;
+        uint64_t total_written = 0;
 
-        for (size_t ji = 0; ji < plan.jobs.size(); ++ji) {
-            auto& j = plan.jobs[ji];
-            std::vector<float> w_f32;
-            tfq_generic::decode_chunk_to_f32(st, j, 0u, j.pad_R, w_f32);
-            uint32_t R = j.pad_R, C = j.pad_C;
-            uint32_t n_br = R / 128u, n_bc = C / 128u, n_blk = n_br * n_bc;
-            uint64_t n_words = (uint64_t)R * (C / 16u);
-            Tfq4MatParams mp{R, C};
+        for (size_t si = 0; si < shards.size(); ++si) {
+            const auto& idxs = shards[si];
+            std::vector<tfq4::Tfp4TensorMeta> metas;
+            metas.reserve(idxs.size());
+            std::vector<uint16_t> all_scales;
+            std::vector<uint32_t> all_words;
 
-            id<MTLBuffer> b_in  = [dev newBufferWithBytes:w_f32.data() length:(size_t)R * C * 4 options:MTLResourceStorageModeShared];
-            id<MTLBuffer> b_tmp = [dev newBufferWithLength:(size_t)R * C * 4 options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> b_rot = [dev newBufferWithLength:(size_t)R * C * 4 options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> b_ss  = [dev newBufferWithLength:(size_t)n_blk * 4 options:MTLResourceStorageModeShared];
-            id<MTLBuffer> b_sc  = [dev newBufferWithLength:(size_t)n_blk * 2 options:MTLResourceStorageModeShared];
-            id<MTLBuffer> b_out = [dev newBufferWithLength:(size_t)n_words * 4 options:MTLResourceStorageModeShared];
-            memset([b_ss contents], 0, (size_t)n_blk * 4);
-            memset([b_met contents], 0, 8);
+            for (size_t ji : idxs) {
+                auto& j = plan.jobs[ji];
+                const uint32_t R = j.pad_R, C = j.pad_C;
+                const uint32_t n_bc = C / 128u;
+                const uint32_t n_sc_tot = (R / 128u) * n_bc;
+                const uint64_t n_w_tot  = (uint64_t)R * (C / 16u);
 
-            id<MTLCommandBuffer> cb = [q commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:p_rfwht];
-            [enc setBuffer:b_in offset:0 atIndex:0]; [enc setBuffer:b_tmp offset:0 atIndex:1];
-            [enc setBytes:&mp length:sizeof(mp) atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(n_bc, R, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                tfq4::Tfp4TensorMeta m{};
+                std::strncpy(m.name, j.tfpn_name.c_str(), sizeof(m.name) - 1);
+                m.R = R; m.C = C; m.b_bits = 2u;
+                m.sc_off = (uint32_t)all_scales.size();
+                m.word_off = (uint64_t)all_words.size();
+                m.word_count = n_w_tot;
+                m.pad[0] = j.orig_R; m.pad[1] = j.orig_C; m.pad[2] = j.flags;
 
-            [enc setComputePipelineState:p_cfwht];
-            [enc setBuffer:b_tmp offset:0 atIndex:0]; [enc setBuffer:b_rot offset:0 atIndex:1];
-            [enc setBuffer:b_ss offset:0 atIndex:2];  [enc setBytes:&mp length:sizeof(mp) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(C, n_br, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                all_scales.resize(all_scales.size() + n_sc_tot);
+                all_words.resize(all_words.size() + n_w_tot);
 
-            [enc setComputePipelineState:p_fsc];
-            [enc setBuffer:b_ss offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
-            [enc setBytes:&n_blk length:sizeof(n_blk) atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake((n_blk + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                double tot_sig = 0.0, tot_err = 0.0;
+                uint32_t sc_cur = 0;
+                uint64_t w_cur = 0;
+                for (uint32_t r0 = 0; r0 < R; r0 += MAX_CHUNK_R) {
+                    uint32_t rc = std::min(MAX_CHUNK_R, R - r0);
+                    tfq_generic::decode_chunk_to_f32(st, j, r0, rc, host_chunk);
+                    memcpy([b_in contents], host_chunk.data(), host_chunk.size() * 4ULL);
 
-            [enc setComputePipelineState:p_enc];
-            [enc setBuffer:b_rot offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
-            [enc setBuffer:b_lut offset:0 atIndex:2]; [enc setBuffer:b_out offset:0 atIndex:3];
-            [enc setBuffer:b_met offset:0 atIndex:4]; [enc setBytes:&mp length:sizeof(mp) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake((n_words + 255ull) / 256ull, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                    uint32_t n_br = rc / 128u, n_blk = n_br * n_bc;
+                    uint64_t n_words = (uint64_t)rc * (C / 16u);
+                    memset([b_ss contents], 0, (size_t)n_blk * 4ULL);
+                    memset([b_met contents], 0, 8);
+                    Tfq4MatParams mp{rc, C, r0, 0u};
 
-            float met[2]; memcpy(met, [b_met contents], 8);
-            float snr = (met[0] > 0.0f) ? (10.0f * std::log10(met[0] / std::max(met[1], 1e-18f))) : 0.0f;
-            j.snr_db = snr;
-            j.bits = 2u;
-            snr_sum += snr;
+                    @autoreleasepool {
+                        id<MTLCommandBuffer> cb = [q commandBuffer];
+                        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                        [enc setComputePipelineState:p_rfwht];
+                        [enc setBuffer:b_in offset:0 atIndex:0]; [enc setBuffer:b_tmp offset:0 atIndex:1];
+                        [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+                        [enc dispatchThreadgroups:MTLSizeMake(n_bc, rc, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-            tfq4::Tfp4TensorMeta m{};
-            std::strncpy(m.name, j.tfpn_name.c_str(), sizeof(m.name) - 1);
-            m.R = R; m.C = C; m.b_bits = 2u;
-            m.sc_off = (uint32_t)all_scales.size();
-            m.word_off = (uint64_t)all_words.size();
-            m.word_count = n_words;
-            m.snr_db = snr;
-            m.pad[0] = j.orig_R; m.pad[1] = j.orig_C; m.pad[2] = j.flags;
-            metas.push_back(m);
+                        [enc setComputePipelineState:p_cfwht];
+                        [enc setBuffer:b_tmp offset:0 atIndex:0]; [enc setBuffer:b_rot offset:0 atIndex:1];
+                        [enc setBuffer:b_ss offset:0 atIndex:2];  [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                        [enc dispatchThreadgroups:MTLSizeMake(C, n_br, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-            const uint16_t* sc_p = reinterpret_cast<const uint16_t*>([b_sc contents]);
-            const uint32_t* wd_p = reinterpret_cast<const uint32_t*>([b_out contents]);
-            all_scales.insert(all_scales.end(), sc_p, sc_p + n_blk);
-            all_words.insert(all_words.end(), wd_p, wd_p + n_words);
+                        [enc setComputePipelineState:p_fsc];
+                        [enc setBuffer:b_ss offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
+                        [enc setBytes:&n_blk length:sizeof(n_blk) atIndex:2];
+                        [enc dispatchThreadgroups:MTLSizeMake((n_blk + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+                        [enc setComputePipelineState:p_enc];
+                        [enc setBuffer:b_rot offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
+                        [enc setBuffer:b_lut offset:0 atIndex:2]; [enc setBuffer:b_out offset:0 atIndex:3];
+                        [enc setBuffer:b_met offset:0 atIndex:4]; [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+                        [enc dispatchThreadgroups:MTLSizeMake((n_words + 255ull) / 256ull, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                    }
+
+                    float met[2]; memcpy(met, [b_met contents], 8);
+                    tot_sig += (double)met[0];
+                    tot_err += (double)met[1];
+                    memcpy(all_scales.data() + m.sc_off + sc_cur, [b_sc contents], (size_t)n_blk * 2ULL);
+                    memcpy(all_words.data() + m.word_off + w_cur, [b_out contents], (size_t)n_words * 4ULL);
+                    sc_cur += n_blk;
+                    w_cur += n_words;
+                }
+
+                float snr = (tot_sig > 0.0) ? (float)(10.0 * std::log10(tot_sig / std::max(tot_err, 1e-18))) : 0.0f;
+                j.snr_db = snr;
+                j.bits = 2u;
+                m.snr_db = snr;
+                snr_sum += snr;
+                metas.push_back(m);
+            }
+
+            char fn[96];
+            snprintf(fn, sizeof(fn), "tfq4-%05zu-of-%05zu.tffp4", si + 1, shards.size());
+            shard_names.push_back(fn);
+            uint64_t sz = tfq4::write_tfp4_shard((fs::path(opt.out_dir) / fn).string(), metas, all_scales, all_words);
+            total_written += sz;
+            double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+            printf("  wrote %s (%zu tensors, %.3f GiB) [%.1fs]\n", fn, metas.size(), sz / (double)(1ULL << 30), dt);
+            fflush(stdout);
         }
 
-        size_t off_meta = sizeof(tfq4::Tfp4Header);
-        size_t off_sc   = align_up(off_meta + metas.size() * sizeof(tfq4::Tfp4TensorMeta), tfq4::ALIGN_16K);
-        size_t off_wt   = align_up(off_sc + all_scales.size() * 2, tfq4::ALIGN_16K);
-        size_t tot_sz   = align_up(off_wt + all_words.size() * 4, tfq4::ALIGN_16K);
-        tfq4::Tfp4Header hdr{};
-        hdr.magic = tfq4::MAGIC_TFP4; hdr.version = tfq4::FORMAT_VER;
-        hdr.num_tensors = (uint32_t)metas.size();
-        hdr.off_meta = off_meta; hdr.off_scales = off_sc; hdr.off_weights = off_wt;
-        hdr.total_scale_halfs = all_scales.size();
-        hdr.total_weight_words = all_words.size();
-        const std::string shard_fn = "tfq4-00001-of-00001.tffp4";
-        {
-            std::ofstream ofs(fs::path(opt.out_dir) / shard_fn, std::ios::binary);
-            std::vector<char> zeros(tfq4::ALIGN_16K, 0);
-            ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-            ofs.write(reinterpret_cast<const char*>(metas.data()), metas.size() * sizeof(tfq4::Tfp4TensorMeta));
-            size_t pos = off_meta + metas.size() * sizeof(tfq4::Tfp4TensorMeta);
-            if (off_sc > pos) ofs.write(zeros.data(), off_sc - pos);
-            ofs.write(reinterpret_cast<const char*>(all_scales.data()), all_scales.size() * 2);
-            pos = off_sc + all_scales.size() * 2;
-            if (off_wt > pos) ofs.write(zeros.data(), off_wt - pos);
-            ofs.write(reinterpret_cast<const char*>(all_words.data()), all_words.size() * 4);
-            pos = off_wt + all_words.size() * 4;
-            if (tot_sz > pos) ofs.write(zeros.data(), tot_sz - pos);
-        }
-
-        tfq_generic::package_residuals_and_manifest(st, opt, plan, {shard_fn});
+        plan.tfq_bytes = total_written;
+        tfq_generic::package_residuals_and_manifest(
+            st, opt, plan, shard_names, "TFQ4-E8P", tfq4::FORMAT_VER, "pw_v4_e8p_tables.bin", "tfq4_manifest.json"
+        );
         double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-        printf("TFQ4-E8P Metal DONE: %zu tensors -> %.3f GiB (2.001 bpw) | mean SNR=%.2f dB | %.1fs -> %s\n",
-               metas.size(), tot_sz / (double)(1ULL << 30), snr_sum / metas.size(), secs, opt.out_dir.c_str());
+        printf("TFQ4-E8P Metal DONE: %zu tensors -> %.3f GiB (%zu shard(s), 2.001 bpw) | mean SNR=%.2f dB | %.1fs -> %s\n",
+               plan.jobs.size(), total_written / (double)(1ULL << 30), shards.size(), snr_sum / plan.jobs.size(), secs, opt.out_dir.c_str());
     }
     return 0;
 }

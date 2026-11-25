@@ -628,7 +628,11 @@ static inline void copy_file_if_exists(const std::string& src, const std::string
 // Package all residual tensors into residual.safetensors (sharded if > 3.4 GiB), copy config/tokenizer, write manifest.
 static inline void package_residuals_and_manifest(
     const SafetensorsDir& st, const GenericOptions& opt, const ConversionPlan& plan,
-    const std::vector<std::string>& tfq_shard_names
+    const std::vector<std::string>& tfq_shard_names,
+    const std::string& format_name = "TFQ3",
+    uint32_t format_version = 3u,
+    const std::string& tables_file = "pw_v3_tables.bin",
+    const std::string& manifest_file = "tfq3_manifest.json"
 ) {
     // 1. Write residual safetensors (preserving original dtypes and arbitrary shapes).
     std::vector<std::string> res_files;
@@ -707,12 +711,12 @@ static inline void package_residuals_and_manifest(
         copy_file_if_exists(opt.model_dir + "/" + fn, opt.out_dir + "/" + fn);
     }
 
-    // 3. Write tfq3_manifest.json for cross-platform engines and tooling.
-    std::ofstream mf(opt.out_dir + "/tfq3_manifest.json");
+    // 3. Write manifest JSON for cross-platform engines and tooling.
+    std::ofstream mf(opt.out_dir + "/" + manifest_file);
     mf << "{\n";
-    mf << "  \"format\": \"TFQ3\",\n";
-    mf << "  \"version\": 3,\n";
-    mf << "  \"tables\": \"pw_v3_tables.bin\",\n";
+    mf << "  \"format\": \"" << format_name << "\",\n";
+    mf << "  \"version\": " << format_version << ",\n";
+    mf << "  \"tables\": \"" << tables_file << "\",\n";
     mf << "  \"tfq_shards\": [";
     for (size_t i = 0; i < tfq_shard_names.size(); ++i) {
         if (i) mf << ", ";

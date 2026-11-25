@@ -1,6 +1,8 @@
 // ============================================================================
 // TFQ4-E8P (2.001 bpw) Model-Agnostic NVIDIA CUDA GPU Converter
-//   Byte-identical PWV4 v4 + TFP4 v4 cross-platform output with Apple Metal.
+//   - Byte-identical PWV4 v4 + TFP4 v4 cross-platform output with Apple Metal
+//   - Row-chunked GPU pipeline (4096 rows/chunk) for bounded VRAM on 70B+ models
+//   - Automatic 3.4 GiB shard splitting (16 KiB-aligned cross-platform TFP4 v4)
 // ============================================================================
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -56,13 +58,17 @@ __global__ void f32_row_fwht_k(const float* __restrict__ W_in, float* __restrict
     dst[lane + 0u] = v.x; dst[lane + 32u] = v.y; dst[lane + 64u] = v.z; dst[lane + 96u] = v.w;
 }
 
-__global__ void col_fwht_ss_k(const float* __restrict__ W_tmp, float* __restrict__ W_rot, float* __restrict__ blk_ss, uint32_t R, uint32_t C) {
+__global__ void col_fwht_ss_k(
+    const float* __restrict__ W_tmp, float* __restrict__ W_rot,
+    float* __restrict__ blk_ss, uint32_t R, uint32_t C, uint32_t r_off
+) {
     uint32_t c = blockIdx.x, br = blockIdx.y, r0 = br * 128u, lane = threadIdx.x;
-    if (c >= C) return;
-    float4 v = make_float4(W_tmp[(uint64_t)(r0 + lane + 0u) * C + c] * sgn_bit(0x9E3779B9u, r0 + lane + 0u),
-                           W_tmp[(uint64_t)(r0 + lane + 32u) * C + c] * sgn_bit(0x9E3779B9u, r0 + lane + 32u),
-                           W_tmp[(uint64_t)(r0 + lane + 64u) * C + c] * sgn_bit(0x9E3779B9u, r0 + lane + 64u),
-                           W_tmp[(uint64_t)(r0 + lane + 96u) * C + c] * sgn_bit(0x9E3779B9u, r0 + lane + 96u));
+    if (c >= C || r0 >= R) return;
+    uint32_t gr0 = r_off + r0;
+    float4 v = make_float4(W_tmp[(uint64_t)(r0 + lane + 0u) * C + c] * sgn_bit(0x9E3779B9u, gr0 + lane + 0u),
+                           W_tmp[(uint64_t)(r0 + lane + 32u) * C + c] * sgn_bit(0x9E3779B9u, gr0 + lane + 32u),
+                           W_tmp[(uint64_t)(r0 + lane + 64u) * C + c] * sgn_bit(0x9E3779B9u, gr0 + lane + 64u),
+                           W_tmp[(uint64_t)(r0 + lane + 96u) * C + c] * sgn_bit(0x9E3779B9u, gr0 + lane + 96u));
     fwht128_warp4(v, lane);
     W_rot[(uint64_t)(r0 + lane + 0u) * C + c] = v.x;
     W_rot[(uint64_t)(r0 + lane + 32u) * C + c] = v.y;
@@ -146,12 +152,31 @@ __global__ void tfq4_e8p_encode_k(
     }
 }
 
-static size_t align_up(size_t x, size_t a) { return (x + a - 1) & ~(a - 1); }
+static std::vector<std::vector<size_t>> partition_tfq4_shards(
+    const std::vector<tfq_generic::QuantJob>& jobs, uint64_t max_shard_bytes
+) {
+    std::vector<std::vector<size_t>> shards;
+    std::vector<size_t> cur;
+    uint64_t cur_bytes = 0;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        uint64_t b = tfq4::tfp4_tensor_bytes(jobs[i].pad_R, jobs[i].pad_C);
+        if (!cur.empty() && cur_bytes + b > max_shard_bytes) {
+            shards.push_back(std::move(cur));
+            cur.clear();
+            cur_bytes = 0;
+        }
+        cur.push_back(i);
+        cur_bytes += b;
+    }
+    if (!cur.empty()) shards.push_back(std::move(cur));
+    return shards;
+}
 
 int main(int argc, char** argv) {
     tfq_generic::GenericOptions opt;
     opt.default_bits = 3;
     opt.head_bits = 4;
+    double max_shard_gib = 3.4;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if ((a == "--model" || a == "-m") && i + 1 < argc) opt.model_dir = argv[++i];
@@ -160,17 +185,36 @@ int main(int argc, char** argv) {
         else if (a == "--quantize-drafter") opt.quantize_drafter = true;
         else if (a == "--quantize-embed") opt.quantize_embed = true;
         else if (a == "--head-bits" && i + 1 < argc) opt.head_bits = (uint32_t)std::stoul(argv[++i]);
+        else if (a == "--max-shard-gib" && i + 1 < argc) max_shard_gib = std::stod(argv[++i]);
         else if (a == "--dry-run") opt.dry_run = true;
+        else if (a == "-h" || a == "--help") {
+            printf("Usage: tfq4-convert-cuda --model DIR --out DIR [--head-bits 0|2] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
+            return 0;
+        }
     }
     if (opt.model_dir.empty() || opt.out_dir.empty()) {
-        fprintf(stderr, "Usage: tfq4-convert-cuda --model DIR --out DIR [--quantize-vision] [--quantize-drafter] [--quantize-embed]\n");
+        fprintf(stderr, "Usage: tfq4-convert-cuda --model DIR --out DIR [--head-bits 0|2] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
         return 2;
     }
+    uint64_t max_shard_bytes = (uint64_t)std::max(1.0 * (double)(1ULL << 20), max_shard_gib * (double)(1ULL << 30));
 
     tfq_generic::SafetensorsDir st;
     st.init(opt.model_dir);
     auto plan = tfq_generic::build_plan(st, opt);
     if (plan.jobs.empty()) { fprintf(stderr, "No quantizable 2D float tensors in %s\n", opt.model_dir.c_str()); return 1; }
+
+    uint64_t est_tfq4_bytes = 0;
+    for (auto& j : plan.jobs) {
+        j.bits = 2u;
+        est_tfq4_bytes += tfq4::tfp4_tensor_bytes(j.pad_R, j.pad_C);
+    }
+    plan.tfq_bytes = est_tfq4_bytes;
+    auto shards = partition_tfq4_shards(plan.jobs, max_shard_bytes);
+
+    printf("TFQ4-E8P (2.001 bpw) Plan: %zu quantized tensors (%.3f GiB across %zu shard(s)) + %zu residual (%.3f GiB) = %.3f GiB total\n",
+           plan.jobs.size(), est_tfq4_bytes / (double)(1ULL << 30), shards.size(),
+           plan.residual_names.size(), plan.residual_bytes / (double)(1ULL << 30),
+           (est_tfq4_bytes + plan.residual_bytes) / (double)(1ULL << 30));
     if (opt.dry_run) return 0;
 
     auto t_start = std::chrono::steady_clock::now();
@@ -182,96 +226,114 @@ int main(int argc, char** argv) {
         tf.write(reinterpret_cast<const char*>(&tbl), sizeof(tbl));
     }
 
-    __half* d_lut = nullptr; double* d_met = nullptr;
+    uint32_t max_pad_C = 128u;
+    for (const auto& j : plan.jobs) max_pad_C = std::max(max_pad_C, j.pad_C);
+    const uint32_t MAX_CHUNK_R = 4096u;
+    const size_t MAX_ELEMS = (size_t)MAX_CHUNK_R * max_pad_C;
+    const size_t MAX_BLK   = (size_t)(MAX_CHUNK_R / 128u) * (max_pad_C / 128u);
+    const size_t MAX_WORDS = (size_t)MAX_CHUNK_R * (max_pad_C / 16u);
+
+    __half *d_lut = nullptr, *d_sc = nullptr;
+    float *d_in = nullptr, *d_tmp = nullptr, *d_rot = nullptr, *d_ss = nullptr;
+    uint32_t* d_out = nullptr;
+    double* d_met = nullptr;
     CUDA_CHECK(cudaMalloc((void**)&d_lut, sizeof(tbl.e8p_lut)));
     CUDA_CHECK(cudaMemcpy(d_lut, tbl.e8p_lut, sizeof(tbl.e8p_lut), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc((void**)&d_met, 2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void**)&d_in,  MAX_ELEMS * 4ULL));
+    CUDA_CHECK(cudaMalloc((void**)&d_tmp, MAX_ELEMS * 4ULL));
+    CUDA_CHECK(cudaMalloc((void**)&d_rot, MAX_ELEMS * 4ULL));
+    CUDA_CHECK(cudaMalloc((void**)&d_ss,  MAX_BLK   * 4ULL));
+    CUDA_CHECK(cudaMalloc((void**)&d_sc,  MAX_BLK   * 2ULL));
+    CUDA_CHECK(cudaMalloc((void**)&d_out, MAX_WORDS * 4ULL));
 
-    std::vector<tfq4::Tfp4TensorMeta> metas;
-    std::vector<uint16_t> all_scales;
-    std::vector<uint32_t> all_words;
+    std::vector<float> host_chunk;
+    std::vector<std::string> shard_names;
     double snr_sum = 0.0;
+    uint64_t total_written = 0;
 
-    for (auto& j : plan.jobs) {
-        std::vector<float> w_f32;
-        tfq_generic::decode_chunk_to_f32(st, j, 0u, j.pad_R, w_f32);
-        uint32_t R = j.pad_R, C = j.pad_C;
-        uint32_t n_br = R / 128u, n_bc = C / 128u, n_blk = n_br * n_bc;
-        uint64_t n_words = (uint64_t)R * (C / 16u);
+    for (size_t si = 0; si < shards.size(); ++si) {
+        const auto& idxs = shards[si];
+        std::vector<tfq4::Tfp4TensorMeta> metas;
+        metas.reserve(idxs.size());
+        std::vector<uint16_t> all_scales;
+        std::vector<uint32_t> all_words;
 
-        float *d_in = nullptr, *d_tmp = nullptr, *d_rot = nullptr, *d_ss = nullptr;
-        __half* d_sc = nullptr; uint32_t* d_out = nullptr;
-        CUDA_CHECK(cudaMalloc((void**)&d_in, (size_t)R * C * 4));
-        CUDA_CHECK(cudaMalloc((void**)&d_tmp, (size_t)R * C * 4));
-        CUDA_CHECK(cudaMalloc((void**)&d_rot, (size_t)R * C * 4));
-        CUDA_CHECK(cudaMalloc((void**)&d_ss, (size_t)n_blk * 4));
-        CUDA_CHECK(cudaMalloc((void**)&d_sc, (size_t)n_blk * 2));
-        CUDA_CHECK(cudaMalloc((void**)&d_out, (size_t)n_words * 4));
-        CUDA_CHECK(cudaMemcpy(d_in, w_f32.data(), (size_t)R * C * 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(d_ss, 0, (size_t)n_blk * 4));
-        CUDA_CHECK(cudaMemset(d_met, 0, 2 * sizeof(double)));
+        for (size_t ji : idxs) {
+            auto& j = plan.jobs[ji];
+            const uint32_t R = j.pad_R, C = j.pad_C;
+            const uint32_t n_bc = C / 128u;
+            const uint32_t n_sc_tot = (R / 128u) * n_bc;
+            const uint64_t n_w_tot  = (uint64_t)R * (C / 16u);
 
-        f32_row_fwht_k<<<dim3(n_bc, R), 32>>>(d_in, d_tmp, R, C);
-        col_fwht_ss_k<<<dim3(C, n_br), 32>>>(d_tmp, d_rot, d_ss, R, C);
-        finalize_scales_k<<<(n_blk + 255u) / 256u, 256>>>(d_ss, d_sc, n_blk);
-        tfq4_e8p_encode_k<<<(uint32_t)((n_words + 255ull) / 256ull), 256>>>(d_rot, d_sc, d_lut, d_out, d_met, R, C);
-        CUDA_CHECK(cudaDeviceSynchronize());
+            tfq4::Tfp4TensorMeta m{};
+            std::strncpy(m.name, j.tfpn_name.c_str(), sizeof(m.name) - 1);
+            m.R = R; m.C = C; m.b_bits = 2u;
+            m.sc_off = (uint32_t)all_scales.size();
+            m.word_off = (uint64_t)all_words.size();
+            m.word_count = n_w_tot;
+            m.pad[0] = j.orig_R; m.pad[1] = j.orig_C; m.pad[2] = j.flags;
 
-        double met[2];
-        CUDA_CHECK(cudaMemcpy(met, d_met, 2 * sizeof(double), cudaMemcpyDeviceToHost));
-        float snr = (met[0] > 0.0) ? (float)(10.0 * std::log10(met[0] / std::max(met[1], 1e-18))) : 0.0f;
-        j.snr_db = snr;
-        j.bits = 2u;
-        snr_sum += snr;
+            all_scales.resize(all_scales.size() + n_sc_tot);
+            all_words.resize(all_words.size() + n_w_tot);
 
-        std::vector<uint16_t> h_sc(n_blk);
-        std::vector<uint32_t> h_wd(n_words);
-        CUDA_CHECK(cudaMemcpy(h_sc.data(), d_sc, (size_t)n_blk * 2, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_wd.data(), d_out, (size_t)n_words * 4, cudaMemcpyDeviceToHost));
-        cudaFree(d_in); cudaFree(d_tmp); cudaFree(d_rot); cudaFree(d_ss); cudaFree(d_sc); cudaFree(d_out);
+            double tot_sig = 0.0, tot_err = 0.0;
+            uint32_t sc_cur = 0;
+            uint64_t w_cur = 0;
+            for (uint32_t r0 = 0; r0 < R; r0 += MAX_CHUNK_R) {
+                uint32_t rc = std::min(MAX_CHUNK_R, R - r0);
+                tfq_generic::decode_chunk_to_f32(st, j, r0, rc, host_chunk);
+                uint32_t n_br = rc / 128u, n_blk = n_br * n_bc;
+                uint64_t n_words = (uint64_t)rc * (C / 16u);
 
-        tfq4::Tfp4TensorMeta m{};
-        std::strncpy(m.name, j.tfpn_name.c_str(), sizeof(m.name) - 1);
-        m.R = R; m.C = C; m.b_bits = 2u;
-        m.sc_off = (uint32_t)all_scales.size();
-        m.word_off = (uint64_t)all_words.size();
-        m.word_count = n_words;
-        m.snr_db = snr;
-        m.pad[0] = j.orig_R; m.pad[1] = j.orig_C; m.pad[2] = j.flags;
-        metas.push_back(m);
-        all_scales.insert(all_scales.end(), h_sc.begin(), h_sc.end());
-        all_words.insert(all_words.end(), h_wd.begin(), h_wd.end());
+                CUDA_CHECK(cudaMemcpy(d_in, host_chunk.data(), host_chunk.size() * 4ULL, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemset(d_ss, 0, (size_t)n_blk * 4ULL));
+                CUDA_CHECK(cudaMemset(d_met, 0, 2 * sizeof(double)));
+
+                f32_row_fwht_k<<<dim3(n_bc, rc), 32>>>(d_in, d_tmp, rc, C);
+                col_fwht_ss_k<<<dim3(C, n_br), 32>>>(d_tmp, d_rot, d_ss, rc, C, r0);
+                finalize_scales_k<<<(n_blk + 255u) / 256u, 256>>>(d_ss, d_sc, n_blk);
+                tfq4_e8p_encode_k<<<(uint32_t)((n_words + 255ull) / 256ull), 256>>>(d_rot, d_sc, d_lut, d_out, d_met, rc, C);
+                CUDA_CHECK(cudaDeviceSynchronize());
+
+                double met[2];
+                CUDA_CHECK(cudaMemcpy(met, d_met, 2 * sizeof(double), cudaMemcpyDeviceToHost));
+                tot_sig += met[0];
+                tot_err += met[1];
+
+                CUDA_CHECK(cudaMemcpy(all_scales.data() + m.sc_off + sc_cur, d_sc, (size_t)n_blk * 2ULL, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(all_words.data() + m.word_off + w_cur, d_out, (size_t)n_words * 4ULL, cudaMemcpyDeviceToHost));
+                sc_cur += n_blk;
+                w_cur += n_words;
+            }
+
+            float snr = (tot_sig > 0.0) ? (float)(10.0 * std::log10(tot_sig / std::max(tot_err, 1e-18))) : 0.0f;
+            j.snr_db = snr;
+            j.bits = 2u;
+            m.snr_db = snr;
+            snr_sum += snr;
+            metas.push_back(m);
+        }
+
+        char fn[96];
+        snprintf(fn, sizeof(fn), "tfq4-%05zu-of-%05zu.tffp4", si + 1, shards.size());
+        shard_names.push_back(fn);
+        uint64_t sz = tfq4::write_tfp4_shard((fs::path(opt.out_dir) / fn).string(), metas, all_scales, all_words);
+        total_written += sz;
+        double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+        printf("  wrote %s (%zu tensors, %.3f GiB) [%.1fs]\n", fn, metas.size(), sz / (double)(1ULL << 30), dt);
+        fflush(stdout);
     }
-    cudaFree(d_lut); cudaFree(d_met);
 
-    size_t off_meta = sizeof(tfq4::Tfp4Header);
-    size_t off_sc   = align_up(off_meta + metas.size() * sizeof(tfq4::Tfp4TensorMeta), tfq4::ALIGN_16K);
-    size_t off_wt   = align_up(off_sc + all_scales.size() * 2, tfq4::ALIGN_16K);
-    size_t tot_sz   = align_up(off_wt + all_words.size() * 4, tfq4::ALIGN_16K);
-    tfq4::Tfp4Header hdr{};
-    hdr.magic = tfq4::MAGIC_TFP4; hdr.version = tfq4::FORMAT_VER;
-    hdr.num_tensors = (uint32_t)metas.size();
-    hdr.off_meta = off_meta; hdr.off_scales = off_sc; hdr.off_weights = off_wt;
-    hdr.total_scale_halfs = all_scales.size();
-    hdr.total_weight_words = all_words.size();
-    const std::string shard_fn = "tfq4-00001-of-00001.tffp4";
-    {
-        std::ofstream ofs(fs::path(opt.out_dir) / shard_fn, std::ios::binary);
-        std::vector<char> zeros(tfq4::ALIGN_16K, 0);
-        ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-        ofs.write(reinterpret_cast<const char*>(metas.data()), metas.size() * sizeof(tfq4::Tfp4TensorMeta));
-        size_t pos = off_meta + metas.size() * sizeof(tfq4::Tfp4TensorMeta);
-        if (off_sc > pos) ofs.write(zeros.data(), off_sc - pos);
-        ofs.write(reinterpret_cast<const char*>(all_scales.data()), all_scales.size() * 2);
-        pos = off_sc + all_scales.size() * 2;
-        if (off_wt > pos) ofs.write(zeros.data(), off_wt - pos);
-        ofs.write(reinterpret_cast<const char*>(all_words.data()), all_words.size() * 4);
-        pos = off_wt + all_words.size() * 4;
-        if (tot_sz > pos) ofs.write(zeros.data(), tot_sz - pos);
-    }
-    tfq_generic::package_residuals_and_manifest(st, opt, plan, {shard_fn});
+    cudaFree(d_lut); cudaFree(d_met); cudaFree(d_in); cudaFree(d_tmp);
+    cudaFree(d_rot); cudaFree(d_ss); cudaFree(d_sc); cudaFree(d_out);
+
+    plan.tfq_bytes = total_written;
+    tfq_generic::package_residuals_and_manifest(
+        st, opt, plan, shard_names, "TFQ4-E8P", tfq4::FORMAT_VER, "pw_v4_e8p_tables.bin", "tfq4_manifest.json"
+    );
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-    printf("TFQ4-E8P CUDA DONE: %zu tensors -> %.3f GiB (2.001 bpw) | mean SNR=%.2f dB | %.1fs -> %s\n",
-           metas.size(), tot_sz / (double)(1ULL << 30), snr_sum / metas.size(), secs, opt.out_dir.c_str());
+    printf("TFQ4-E8P CUDA DONE: %zu tensors -> %.3f GiB (%zu shard(s), 2.001 bpw) | mean SNR=%.2f dB | %.1fs -> %s\n",
+           plan.jobs.size(), total_written / (double)(1ULL << 30), shards.size(), snr_sum / plan.jobs.size(), secs, opt.out_dir.c_str());
     return 0;
 }

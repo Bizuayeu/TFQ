@@ -6,6 +6,8 @@ using namespace metal;
 struct Tfq4MatParams {
     uint R;
     uint C;
+    uint r_off;
+    uint pad0;
 };
 
 inline float sgn_bit(uint seed, uint i) {
@@ -52,11 +54,12 @@ kernel void col_fwht_and_ss(
     ushort lane                 [[thread_index_in_simdgroup]]
 ) {
     uint c = gid.x, br = gid.y, r0 = br * 128u;
+    uint gr0 = P.r_off + r0;
     float4 v;
-    v.x = W_tmp[ulong(r0 + lane +  0u) * P.C + c] * sgn_bit(0x9E3779B9u, r0 + lane +  0u);
-    v.y = W_tmp[ulong(r0 + lane + 32u) * P.C + c] * sgn_bit(0x9E3779B9u, r0 + lane + 32u);
-    v.z = W_tmp[ulong(r0 + lane + 64u) * P.C + c] * sgn_bit(0x9E3779B9u, r0 + lane + 64u);
-    v.w = W_tmp[ulong(r0 + lane + 96u) * P.C + c] * sgn_bit(0x9E3779B9u, r0 + lane + 96u);
+    v.x = W_tmp[ulong(r0 + lane +  0u) * P.C + c] * sgn_bit(0x9E3779B9u, gr0 + lane +  0u);
+    v.y = W_tmp[ulong(r0 + lane + 32u) * P.C + c] * sgn_bit(0x9E3779B9u, gr0 + lane + 32u);
+    v.z = W_tmp[ulong(r0 + lane + 64u) * P.C + c] * sgn_bit(0x9E3779B9u, gr0 + lane + 64u);
+    v.w = W_tmp[ulong(r0 + lane + 96u) * P.C + c] * sgn_bit(0x9E3779B9u, gr0 + lane + 96u);
     fwht128_simd4(v, lane);
     W_rot[ulong(r0 + lane +  0u) * P.C + c] = v.x;
     W_rot[ulong(r0 + lane + 32u) * P.C + c] = v.y;

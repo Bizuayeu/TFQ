@@ -76,6 +76,7 @@ make -C "$SRC_DIR" install PREFIX="$PREFIX" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 
 echo ""
 echo "Installed: ${PREFIX}/bin/tfq3"
+"${PREFIX}/bin/tfq3" doctor || true
 case ":${PATH}:" in
     *":${PREFIX}/bin:"*)
         ;;
@@ -87,5 +88,5 @@ case ":${PATH}:" in
 esac
 echo ""
 echo "Get started:"
-echo "  tfq3 doctor"
 echo "  tfq3 Qwen/Qwen3.8-27B"
+echo "  tfq3 Qwen/Qwen2.5-1.5B --bits 2 --quantize-embed"

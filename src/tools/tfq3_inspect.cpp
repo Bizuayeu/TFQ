@@ -1,5 +1,6 @@
-// Zero-dependency TFQ3 binary shard validator and inspector.
-// Supports pw_v3_tables.bin ("PWV3"), dense/non-MoE shards ("TFPN"), and MoE shards ("TFPW").
+// Zero-dependency TFQ3 / TFQ4 binary shard validator and inspector.
+// Supports pw_v3_tables.bin ("PWV3"), pw_v4_e8p_tables.bin ("PWV4"),
+// dense/non-MoE shards ("TFPN"), MoE shards ("TFPW"), and 2-bit E8P shards ("TFP4").
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include <dirent.h>
 #include <string>
 #include <sys/stat.h>
+#include <unordered_set>
 #include <vector>
 
 static constexpr uint32_t MAGIC_PWV3 = 0x33565750u;
@@ -24,6 +26,7 @@ struct TfpnHeader {
     uint32_t magic, version, num_tensors, pad0;
     uint64_t off_meta, off_scales, off_weights, total_scale_halfs, total_weight_words, pad1;
 };
+static_assert(sizeof(TfpnHeader) == 64, "TfpnHeader must be 64 bytes");
 
 struct TfpnTensorMeta {
     char name[80];
@@ -32,6 +35,7 @@ struct TfpnTensorMeta {
     float snr_db;
     uint32_t pad[3];
 };
+static_assert(sizeof(TfpnTensorMeta) == 128, "TfpnTensorMeta must be 128 bytes");
 
 struct TfpwHeader {
     uint32_t magic, version, layer_idx, num_experts, num_tensors, hidden_size, moe_inter, reserved0;
@@ -61,30 +65,72 @@ static bool is_dir(const std::string& path) {
     return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+static bool f16_is_finite(uint16_t h) {
+    return (h & 0x7C00u) != 0x7C00u;
+}
+
+static bool f16_is_nonneg_finite(uint16_t h) {
+    if (!f16_is_finite(h)) return false;
+    return (h & 0x8000u) == 0u || (h & 0x7FFFu) == 0u;
+}
+
+static bool check_range(uint64_t off, uint64_t len, uint64_t total) {
+    return off <= total && len <= total - off;
+}
+
+static bool extract_tensor_name(const char raw[80], std::string& out) {
+    size_t len = 0;
+    while (len < 80 && raw[len] != '\0') ++len;
+    if (len == 0 || len == 80) return false;
+    out.assign(raw, len);
+    return true;
+}
+
 static bool inspect_tables(const std::string& path) {
     uint64_t sz = file_size(path);
-    if (sz < 10816ULL) { fprintf(stderr, "FAIL %s: truncated (%llu bytes)\n", path.c_str(), (unsigned long long)sz); return false; }
+    if (sz < 10816ULL) {
+        fprintf(stderr, "FAIL %s: truncated (%llu bytes)\n", path.c_str(), (unsigned long long)sz);
+        return false;
+    }
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
-    uint32_t hdr[2];
-    float ab[6];
-    if (fread(hdr, 4, 2, f) != 2 || fread(ab, 4, 6, f) != 6) {
-        fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false;
+    uint8_t buf[10816];
+    if (fread(buf, 1, sizeof(buf), f) != sizeof(buf)) {
+        fclose(f);
+        fprintf(stderr, "FAIL %s: short read\n", path.c_str());
+        return false;
     }
     fclose(f);
+
+    uint32_t hdr[2];
+    float ab[6];
+    std::memcpy(hdr, buf, 8);
+    std::memcpy(ab, buf + 8, 24);
     if (hdr[0] != MAGIC_PWV3 || hdr[1] != FORMAT_VER) {
         fprintf(stderr, "FAIL %s: bad magic/version (0x%08x v%u)\n", path.c_str(), hdr[0], hdr[1]);
         return false;
     }
     for (int i = 0; i < 6; ++i) {
-        if (!std::isfinite(ab[i])) { fprintf(stderr, "FAIL %s: non-finite table scale\n", path.c_str()); return false; }
+        if (!std::isfinite(ab[i])) {
+            fprintf(stderr, "FAIL %s: non-finite table scale\n", path.c_str());
+            return false;
+        }
+    }
+    const size_t n_halfs = (10816 - 64) / 2;
+    for (size_t i = 0; i < n_halfs; ++i) {
+        uint16_t h;
+        std::memcpy(&h, buf + 64 + i * 2, 2);
+        if (!f16_is_finite(h)) {
+            fprintf(stderr, "FAIL %s: non-finite fp16 entry in PWV3 LUT/c64 at half[%zu]\n", path.c_str(), i);
+            return false;
+        }
     }
     printf("OK   %-42s PWV3 v%u | %llu bytes | 3b(a=%.3f,b=%.3f) 4b(a=%.3f,b=%.3f) 5b(a=%.3f,b=%.3f)\n",
            path.c_str(), hdr[1], (unsigned long long)sz, ab[0], ab[1], ab[2], ab[3], ab[4], ab[5]);
     return true;
 }
 
-static bool inspect_tfpn(const std::string& path, bool verbose) {
+static bool inspect_tfpn(const std::string& path, bool verbose, std::unordered_set<std::string>* seen_names) {
     uint64_t sz = file_size(path);
     if (sz < sizeof(TfpnHeader)) { fprintf(stderr, "FAIL %s: too small\n", path.c_str()); return false; }
     FILE* f = fopen(path.c_str(), "rb");
@@ -99,31 +145,50 @@ static bool inspect_tfpn(const std::string& path, bool verbose) {
     if ((h.off_scales % ALIGN_16K) != 0 || (h.off_weights % ALIGN_16K) != 0) {
         fclose(f); fprintf(stderr, "FAIL %s: scales/weights not 16 KiB aligned\n", path.c_str()); return false;
     }
-    uint64_t meta_end = h.off_meta + (uint64_t)h.num_tensors * sizeof(TfpnTensorMeta);
-    uint64_t sc_end   = h.off_scales + h.total_scale_halfs * 2ULL;
-    uint64_t w_end    = h.off_weights + h.total_weight_words * 4ULL;
-    if (meta_end > h.off_scales || sc_end > h.off_weights || w_end > sz) {
+    uint64_t meta_bytes = (uint64_t)h.num_tensors * sizeof(TfpnTensorMeta);
+    uint64_t sc_bytes   = h.total_scale_halfs * 2ULL;
+    uint64_t w_bytes    = h.total_weight_words * 4ULL;
+    if (h.off_meta < sizeof(TfpnHeader) ||
+        !check_range(h.off_meta, meta_bytes, h.off_scales) ||
+        !check_range(h.off_scales, sc_bytes, h.off_weights) ||
+        !check_range(h.off_weights, w_bytes, sz)) {
         fclose(f); fprintf(stderr, "FAIL %s: section overlap or truncation\n", path.c_str()); return false;
     }
     std::vector<TfpnTensorMeta> metas(h.num_tensors);
-    fseek(f, (long)h.off_meta, SEEK_SET);
-    if (h.num_tensors > 0 && fread(metas.data(), sizeof(TfpnTensorMeta), h.num_tensors, f) != h.num_tensors) {
+    if (fseek(f, (long)h.off_meta, SEEK_SET) != 0 ||
+        (h.num_tensors > 0 && fread(metas.data(), sizeof(TfpnTensorMeta), h.num_tensors, f) != h.num_tensors)) {
         fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false;
     }
     fclose(f);
 
+    std::unordered_set<std::string> local_seen;
     uint64_t params_total = 0;
     uint64_t cnt[6] = {};
     double snr_sum[6] = {};
     for (const auto& m : metas) {
+        std::string tname;
+        if (!extract_tensor_name(m.name, tname)) {
+            fprintf(stderr, "FAIL %s: empty or unterminated tensor name\n", path.c_str());
+            return false;
+        }
+        if (!local_seen.insert(tname).second || (seen_names && !seen_names->insert(tname).second)) {
+            fprintf(stderr, "FAIL %s: duplicate tensor name '%s'\n", path.c_str(), tname.c_str());
+            return false;
+        }
         if ((m.b_bits != 3u && m.b_bits != 4u && m.b_bits != 5u) || m.R == 0 || m.C == 0 || (m.R % 128u) || (m.C % 128u)) {
-            fprintf(stderr, "FAIL %s: invalid tensor %.80s [%u,%u] %ub\n", path.c_str(), m.name, m.R, m.C, m.b_bits);
+            fprintf(stderr, "FAIL %s: invalid tensor %s [%u,%u] %ub\n", path.c_str(), tname.c_str(), m.R, m.C, m.b_bits);
+            return false;
+        }
+        if (!std::isfinite(m.snr_db)) {
+            fprintf(stderr, "FAIL %s: non-finite SNR for tensor %s\n", path.c_str(), tname.c_str());
             return false;
         }
         uint64_t expect_words = (uint64_t)(m.R / 16u) * (m.C / 128u) * (m.b_bits * 2u) * 32ULL;
         uint64_t expect_sc = (uint64_t)(m.R / 128u) * (m.C / 128u);
-        if (m.word_count != expect_words || m.word_off + m.word_count > h.total_weight_words || (uint64_t)m.sc_off + expect_sc > h.total_scale_halfs) {
-            fprintf(stderr, "FAIL %s: out-of-bounds tensor %.80s\n", path.c_str(), m.name);
+        if (m.word_count != expect_words ||
+            !check_range(m.word_off, m.word_count, h.total_weight_words) ||
+            !check_range((uint64_t)m.sc_off, expect_sc, h.total_scale_halfs)) {
+            fprintf(stderr, "FAIL %s: out-of-bounds tensor %s\n", path.c_str(), tname.c_str());
             return false;
         }
         params_total += (uint64_t)m.R * m.C;
@@ -133,10 +198,10 @@ static bool inspect_tfpn(const std::string& path, bool verbose) {
             uint32_t orig_r = m.pad[0] ? m.pad[0] : m.R;
             uint32_t orig_c = m.pad[1] ? m.pad[1] : m.C;
             if (orig_r != m.R || orig_c != m.C) {
-                printf("  %-52.80s [%6u, %5u] (pad %ux%u) %ub  SNR=%5.2f dB\n",
-                       m.name, orig_r, orig_c, m.R, m.C, m.b_bits, m.snr_db);
+                printf("  %-52s [%6u, %5u] (pad %ux%u) %ub  SNR=%5.2f dB\n",
+                       tname.c_str(), orig_r, orig_c, m.R, m.C, m.b_bits, m.snr_db);
             } else {
-                printf("  %-52.80s [%6u, %5u] %ub  SNR=%5.2f dB\n", m.name, m.R, m.C, m.b_bits, m.snr_db);
+                printf("  %-52s [%6u, %5u] %ub  SNR=%5.2f dB\n", tname.c_str(), m.R, m.C, m.b_bits, m.snr_db);
             }
         }
     }
@@ -164,30 +229,46 @@ static bool inspect_tfpw(const std::string& path) {
     if ((h.off_scales % ALIGN_16K) != 0 || (h.off_weights % ALIGN_16K) != 0) {
         fclose(f); fprintf(stderr, "FAIL %s: scales/weights not 16 KiB aligned\n", path.c_str()); return false;
     }
-    uint64_t meta_end = h.off_meta + (uint64_t)h.num_experts * sizeof(TfpwExpertMeta);
-    uint64_t sc_end   = h.off_scales + h.scale_halfs * 2ULL;
-    uint64_t w_end    = h.off_weights + h.stream_words * 4ULL;
-    if (meta_end > h.off_scales || sc_end > h.off_weights || w_end > sz) {
+    if (h.hidden_size == 0 || h.moe_inter == 0 || (h.hidden_size % 128u) || (h.moe_inter % 128u)) {
+        fclose(f); fprintf(stderr, "FAIL %s: invalid MoE dims H=%u I=%u\n", path.c_str(), h.hidden_size, h.moe_inter); return false;
+    }
+    uint64_t meta_bytes = (uint64_t)h.num_experts * sizeof(TfpwExpertMeta);
+    uint64_t sc_bytes   = h.scale_halfs * 2ULL;
+    uint64_t w_bytes    = h.stream_words * 4ULL;
+    if (h.off_meta < sizeof(TfpwHeader) ||
+        !check_range(h.off_meta, meta_bytes, h.off_scales) ||
+        !check_range(h.off_scales, sc_bytes, h.off_weights) ||
+        !check_range(h.off_weights, w_bytes, sz)) {
         fclose(f); fprintf(stderr, "FAIL %s: section overlap or truncation\n", path.c_str()); return false;
     }
     std::vector<TfpwExpertMeta> metas(h.num_experts);
-    fseek(f, (long)h.off_meta, SEEK_SET);
-    if (h.num_experts > 0 && fread(metas.data(), sizeof(TfpwExpertMeta), h.num_experts, f) != h.num_experts) {
+    if (fseek(f, (long)h.off_meta, SEEK_SET) != 0 ||
+        (h.num_experts > 0 && fread(metas.data(), sizeof(TfpwExpertMeta), h.num_experts, f) != h.num_experts)) {
         fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false;
     }
     fclose(f);
 
     uint64_t cnt[6] = {};
     double snr_sum[6] = {};
+    const uint64_t exp_sc = (uint64_t)(h.moe_inter / 128u) * (h.hidden_size / 128u);
     for (const auto& m : metas) {
         if (m.b_bits != 3u && m.b_bits != 4u && m.b_bits != 5u) {
             fprintf(stderr, "FAIL %s: invalid expert bits (%u)\n", path.c_str(), m.b_bits);
             return false;
         }
+        if (!std::isfinite(m.gate_snr_db) || !std::isfinite(m.up_snr_db) || !std::isfinite(m.down_snr_db)) {
+            fprintf(stderr, "FAIL %s: non-finite expert SNR\n", path.c_str());
+            return false;
+        }
         uint64_t gu_words = (uint64_t)(h.moe_inter / 16u) * (h.hidden_size / 128u) * (m.b_bits * 2u) * 32ULL;
         uint64_t dn_words = (uint64_t)(h.hidden_size / 16u) * (h.moe_inter / 128u) * (m.b_bits * 2u) * 32ULL;
-        if (m.gate_word_off + gu_words > h.stream_words || m.up_word_off + gu_words > h.stream_words || m.down_word_off + dn_words > h.stream_words) {
-            fprintf(stderr, "FAIL %s: expert weight out of bounds\n", path.c_str());
+        if (!check_range(m.gate_word_off, gu_words, h.stream_words) ||
+            !check_range(m.up_word_off, gu_words, h.stream_words) ||
+            !check_range(m.down_word_off, dn_words, h.stream_words) ||
+            !check_range((uint64_t)m.gate_sc_off, exp_sc, h.scale_halfs) ||
+            !check_range((uint64_t)m.up_sc_off, exp_sc, h.scale_halfs) ||
+            !check_range((uint64_t)m.down_sc_off, exp_sc, h.scale_halfs)) {
+            fprintf(stderr, "FAIL %s: expert weight or scale out of bounds\n", path.c_str());
             return false;
         }
         cnt[m.b_bits]++;
@@ -206,49 +287,100 @@ static bool inspect_tfpw(const std::string& path) {
 
 static bool inspect_pwv4(const std::string& path) {
     uint64_t sz = file_size(path);
-    if (sz != 16384ULL) { fprintf(stderr, "FAIL %s: expected 16384 bytes (%llu)\n", path.c_str(), (unsigned long long)sz); return false; }
+    if (sz != 16384ULL) {
+        fprintf(stderr, "FAIL %s: expected 16384 bytes (%llu)\n", path.c_str(), (unsigned long long)sz);
+        return false;
+    }
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
-    uint32_t hdr[4];
-    bool ok = (fread(hdr, 4, 4, f) == 4);
+    uint8_t buf[16384];
+    bool ok = (fread(buf, 1, sizeof(buf), f) == sizeof(buf));
     fclose(f);
-    if (!ok || hdr[0] != MAGIC_PWV4 || hdr[1] != TFQ4_VER || hdr[2] != 256u || hdr[3] != 8u) {
-        fprintf(stderr, "FAIL %s: bad PWV4 header\n", path.c_str()); return false;
+    if (!ok) { fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false; }
+
+    uint32_t hdr[4];
+    std::memcpy(hdr, buf, 16);
+    if (hdr[0] != MAGIC_PWV4 || hdr[1] != TFQ4_VER || hdr[2] != 256u || hdr[3] != 8u) {
+        fprintf(stderr, "FAIL %s: bad PWV4 header\n", path.c_str());
+        return false;
+    }
+    for (size_t i = 0; i < 256u * 8u; ++i) {
+        uint16_t h;
+        std::memcpy(&h, buf + 64 + i * 2, 2);
+        if (!f16_is_nonneg_finite(h)) {
+            fprintf(stderr, "FAIL %s: invalid PWV4 e8p_lut entry [%zu][%zu] (0x%04x)\n", path.c_str(), i / 8, i % 8, h);
+            return false;
+        }
     }
     printf("OK   %-42s PWV4 v%u | 16384 bytes | E8P %ux%uD (4 KiB LUT)\n", path.c_str(), hdr[1], hdr[2], hdr[3]);
     return true;
 }
 
-static bool inspect_tfp4(const std::string& path, bool verbose) {
+static bool inspect_tfp4(const std::string& path, bool verbose, std::unordered_set<std::string>* seen_names) {
     uint64_t sz = file_size(path);
     if (sz < sizeof(TfpnHeader)) { fprintf(stderr, "FAIL %s: too small\n", path.c_str()); return false; }
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
     TfpnHeader h{};
-    if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return false; }
-    if (h.magic != MAGIC_TFP4 || h.version != TFQ4_VER || (h.off_scales % ALIGN_16K) != 0 || (h.off_weights % ALIGN_16K) != 0) {
-        fclose(f); fprintf(stderr, "FAIL %s: bad TFP4 header or alignment\n", path.c_str()); return false;
+    if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); fprintf(stderr, "FAIL %s: short read\n", path.c_str()); return false; }
+    if (h.magic != MAGIC_TFP4 || h.version != TFQ4_VER ||
+        (h.off_scales % ALIGN_16K) != 0 || (h.off_weights % ALIGN_16K) != 0 || (sz % ALIGN_16K) != 0) {
+        fclose(f);
+        fprintf(stderr, "FAIL %s: bad TFP4 header or 16 KiB alignment\n", path.c_str());
+        return false;
+    }
+    uint64_t meta_bytes = (uint64_t)h.num_tensors * sizeof(TfpnTensorMeta);
+    uint64_t sc_bytes   = h.total_scale_halfs * 2ULL;
+    uint64_t w_bytes    = h.total_weight_words * 4ULL;
+    if (h.off_meta < sizeof(TfpnHeader) ||
+        !check_range(h.off_meta, meta_bytes, h.off_scales) ||
+        !check_range(h.off_scales, sc_bytes, h.off_weights) ||
+        !check_range(h.off_weights, w_bytes, sz)) {
+        fclose(f);
+        fprintf(stderr, "FAIL %s: TFP4 section overlap or truncation\n", path.c_str());
+        return false;
     }
     std::vector<TfpnTensorMeta> metas(h.num_tensors);
-    fseek(f, (long)h.off_meta, SEEK_SET);
-    if (h.num_tensors > 0 && fread(metas.data(), sizeof(TfpnTensorMeta), h.num_tensors, f) != h.num_tensors) {
-        fclose(f); return false;
+    if (fseek(f, (long)h.off_meta, SEEK_SET) != 0 ||
+        (h.num_tensors > 0 && fread(metas.data(), sizeof(TfpnTensorMeta), h.num_tensors, f) != h.num_tensors)) {
+        fclose(f);
+        fprintf(stderr, "FAIL %s: short read\n", path.c_str());
+        return false;
     }
     fclose(f);
-    uint64_t params_total = 0; double snr_sum = 0.0;
+
+    std::unordered_set<std::string> local_seen;
+    uint64_t params_total = 0;
+    double snr_sum = 0.0;
     for (const auto& m : metas) {
+        std::string tname;
+        if (!extract_tensor_name(m.name, tname)) {
+            fprintf(stderr, "FAIL %s: empty or unterminated TFP4 tensor name\n", path.c_str());
+            return false;
+        }
+        if (!local_seen.insert(tname).second || (seen_names && !seen_names->insert(tname).second)) {
+            fprintf(stderr, "FAIL %s: duplicate TFP4 tensor name '%s'\n", path.c_str(), tname.c_str());
+            return false;
+        }
+        if (!std::isfinite(m.snr_db)) {
+            fprintf(stderr, "FAIL %s: non-finite SNR for TFP4 tensor %s\n", path.c_str(), tname.c_str());
+            return false;
+        }
         uint64_t exp_w = (uint64_t)m.R * (m.C / 16u), exp_s = (uint64_t)(m.R / 128u) * (m.C / 128u);
         if (m.b_bits != 2u || m.R == 0 || m.C == 0 || (m.R % 128u) || (m.C % 128u) || m.word_count != exp_w ||
-            m.word_off + m.word_count > h.total_weight_words || (uint64_t)m.sc_off + exp_s > h.total_scale_halfs) {
-            fprintf(stderr, "FAIL %s: invalid TFP4 tensor %.80s\n", path.c_str(), m.name); return false;
+            !check_range(m.word_off, m.word_count, h.total_weight_words) ||
+            !check_range((uint64_t)m.sc_off, exp_s, h.total_scale_halfs)) {
+            fprintf(stderr, "FAIL %s: invalid TFP4 tensor %s\n", path.c_str(), tname.c_str());
+            return false;
         }
-        params_total += (uint64_t)m.R * m.C; snr_sum += m.snr_db;
+        params_total += (uint64_t)m.R * m.C;
+        snr_sum += m.snr_db;
         if (verbose) {
             uint32_t orig_r = m.pad[0] ? m.pad[0] : m.R, orig_c = m.pad[1] ? m.pad[1] : m.C;
             if (orig_r != m.R || orig_c != m.C)
-                printf("  %-52.80s [%6u, %5u] (pad %ux%u) 2b-E8P SNR=%5.2f dB\n", m.name, orig_r, orig_c, m.R, m.C, m.snr_db);
+                printf("  %-52s [%6u, %5u] (pad %ux%u) 2b-E8P SNR=%5.2f dB\n", tname.c_str(), orig_r, orig_c, m.R, m.C, m.snr_db);
             else
-                printf("  %-52.80s [%6u, %5u] 2b-E8P SNR=%5.2f dB\n", m.name, m.R, m.C, m.snr_db);
+                printf("  %-52s [%6u, %5u] 2b-E8P SNR=%5.2f dB\n", tname.c_str(), m.R, m.C, m.snr_db);
         }
     }
     double bpw = params_total ? (double)(h.total_weight_words * 32ULL + h.total_scale_halfs * 16ULL) / (double)params_total : 0.0;
@@ -258,7 +390,7 @@ static bool inspect_tfp4(const std::string& path, bool verbose) {
     return true;
 }
 
-static bool inspect_file(const std::string& path, bool verbose) {
+static bool inspect_file(const std::string& path, bool verbose, std::unordered_set<std::string>* seen_names) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
     uint32_t magic = 0;
@@ -267,9 +399,9 @@ static bool inspect_file(const std::string& path, bool verbose) {
     if (n != 1) { fprintf(stderr, "FAIL %s: empty file\n", path.c_str()); return false; }
     if (magic == MAGIC_PWV3) return inspect_tables(path);
     if (magic == MAGIC_PWV4) return inspect_pwv4(path);
-    if (magic == MAGIC_TFPN) return inspect_tfpn(path, verbose);
+    if (magic == MAGIC_TFPN) return inspect_tfpn(path, verbose, seen_names);
     if (magic == MAGIC_TFPW) return inspect_tfpw(path);
-    if (magic == MAGIC_TFP4) return inspect_tfp4(path, verbose);
+    if (magic == MAGIC_TFP4) return inspect_tfp4(path, verbose, seen_names);
     fprintf(stderr, "FAIL %s: unknown magic 0x%08x\n", path.c_str(), magic);
     return false;
 }
@@ -284,7 +416,7 @@ int main(int argc, char** argv) {
         else targets.push_back(a);
     }
     if (targets.empty()) {
-        fprintf(stderr, "Usage: %s [-v|--verbose] <shard.tffpw | pw_v3_tables.bin | checkpoint_dir> [...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-v|--verbose] <shard.tffpw | shard.tffp4 | pw_v3_tables.bin | pw_v4_e8p_tables.bin | checkpoint_dir> [...]\n", argv[0]);
         return 1;
     }
     bool all_ok = true;
@@ -302,10 +434,14 @@ int main(int argc, char** argv) {
             }
             closedir(d);
             std::sort(files.begin(), files.end());
-            if (files.empty()) { fprintf(stderr, "FAIL %s: no pw_v3_tables.bin or .tffpw files found\n", t.c_str()); return 1; }
-            for (const auto& fp : files) all_ok &= inspect_file(fp, verbose);
+            if (files.empty()) {
+                fprintf(stderr, "FAIL %s: no TFQ3/TFQ4 table or shard files found\n", t.c_str());
+                return 1;
+            }
+            std::unordered_set<std::string> dir_seen;
+            for (const auto& fp : files) all_ok &= inspect_file(fp, verbose, &dir_seen);
         } else {
-            all_ok &= inspect_file(t, verbose);
+            all_ok &= inspect_file(t, verbose, nullptr);
         }
     }
     return all_ok ? 0 : 1;

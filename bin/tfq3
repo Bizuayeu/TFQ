@@ -5,28 +5,29 @@ TFQ3_VERSION="3.0.0"
 
 usage() {
     cat <<'EOF'
-tfq3 — TensorFold Native Quantization (TFQ3: 3 / 4 / 5-bit, Metal & CUDA)
+tfq3 — TensorFold Native Quantization (TFQ3 3/4/5-bit & TFQ4 2-bit E8P, Metal & CUDA)
 
 Usage:
-  tfq3 <MODEL> [options]              Convert a model directory or HF repo id to TFQ3
+  tfq3 <MODEL> [options]              Convert a model directory or HF repo id to TFQ3/TFQ4
   tfq3 convert <MODEL> [options]      Same as above
-  tfq3 inspect [-v] <TFQ3_DIR>        Validate and inspect a TFQ3 checkpoint
+  tfq3 inspect [-v] <TFQ_DIR>         Validate and inspect a TFQ3 or TFQ4 checkpoint
   tfq3 doctor                         Show detected GPU backend, tools, and install paths
   tfq3 --version | --help
 
 Options:
-  -o, --out DIR              Output TFQ3 directory (default: <model>-TFQ3)
+  -o, --out DIR              Output directory (default: <model>-TFQ3, or <model>-TFQ4 for --bits 2)
   --family NAME              auto | generic | qwen27 | flashnext | glm (default: auto)
   --profile PROFILE          Bit profile: 4b | 3.5b | 3b | 5b (default: 4b)
   --bits N                   Uniform bit width for generic converter: 2 (TFQ4-E8P) | 3 | 4 | 5
   --target-gib GB            Fit total checkpoint into GB via data-free sensitivity allocation
   --fit auto|GB              Auto-size to local GPU memory budget (or explicit GB)
   --residual MODE            Qwen3.8-27B residual precision: auto | bf16 | q8 (default: auto)
-  --head-bits N              lm_head bits: 0 | 4 | 5 (default: 4)
+  --head-bits N              lm_head bits: 0 | 4 | 5 (default: 4; 0 keeps lm_head in residual)
   --ple-bits N               Qwen3.8-Flash-Next PLE bits: 3 | 4 (default: 3)
   --quantize-vision          Also quantize vision tower linears (generic converter)
   --quantize-drafter         Quantize standalone DFlash2 / DSpine drafter checkpoint
   --quantize-embed           Also quantize embed_tokens table (generic converter)
+  --max-shard-gib GB         Max TFQ4 shard size in GiB (default: 3.4)
   --trace FILE               Optional HeatAlloc expert routing trace (Flash-Next / GLM)
   --nonmoe-model DIR         Optional 8-bit source for GLM nonmoe.tffpw
   --skip-existing            Resume MoE conversion, skipping finished shards
@@ -35,7 +36,8 @@ Options:
 
 Examples:
   tfq3 Qwen/Qwen3.8-27B
-  tfq3 mlx-community/Qwen3.8-27B-MLX-8bit --profile 4b --out ./Qwen3.8-27B-TFQ3
+  tfq3 meta-llama/Llama-3.1-8B-Instruct --target-gib 4.5
+  tfq3 Qwen/Qwen2.5-1.5B --bits 2 --quantize-embed
   tfq3 /path/to/Qwen3.8-27B --profile 3.5b
   tfq3 inspect -v ./Qwen3.8-27B-TFQ3
 EOF
@@ -217,18 +219,18 @@ PY
 }
 
 default_out_dir() {
-    python3 - "$1" "$2" <<'PY'
+    python3 - "$1" "$2" "$3" <<'PY'
 import os, sys
-raw, is_repo = sys.argv[1], sys.argv[2] == "1"
+raw, is_repo, tag = sys.argv[1], sys.argv[2] == "1", sys.argv[3]
 if is_repo:
     repo = raw.split("@", 1)[0]
     base = repo.split("/", 1)[1]
-    print(os.path.join(".", f"{base}-TFQ3"))
+    print(os.path.join(".", f"{base}-{tag}"))
 else:
     p = os.path.normpath(os.path.expanduser(raw))
     parent = os.path.dirname(p)
     base = os.path.basename(p)
-    out = os.path.join(parent, f"{base}-TFQ3") if parent else f"{base}-TFQ3"
+    out = os.path.join(parent, f"{base}-{tag}") if parent else f"{base}-{tag}"
     print(out)
 PY
 }
@@ -248,9 +250,13 @@ run_doctor() {
         fi
     fi
     echo "lib_dir:  ${lib_dir}"
-    for b in "tfq3-generic-convert${suffix}" "tfq3-qwen27-convert${suffix}" "tfq3-qwen27-package" "tfq3-flashnext-convert${suffix}" "tfq3-glm-convert${suffix}" "tfq3-inspect"; do
+    for b in "tfq3-generic-convert${suffix}" "tfq4-convert${suffix}" "tfq3-qwen27-convert${suffix}" "tfq3-qwen27-package" "tfq3-flashnext-convert${suffix}" "tfq3-glm-convert${suffix}" "tfq3-inspect"; do
         if [ -x "$lib_dir/$b" ]; then
-            echo "  [ok]    $b"
+            if [ "$(uname -s)" = "Darwin" ] && [[ "$b" == *-convert ]] && [ ! -f "$lib_dir/${b}.metallib" ]; then
+                echo "  [warn]  $b (missing ${b}.metallib)"
+            else
+                echo "  [ok]    $b"
+            fi
         else
             echo "  [miss]  $b"
         fi
@@ -288,6 +294,7 @@ run_convert() {
     local quantize_vision=0
     local quantize_drafter=0
     local quantize_embed=0
+    local max_shard_gib=""
     local trace_file=""
     local nonmoe_model=""
     local skip_existing=0
@@ -300,7 +307,7 @@ run_convert() {
             -o|--out) [ $# -ge 2 ] || die "--out requires a directory"; out_dir="$2"; shift 2 ;;
             --family) [ $# -ge 2 ] || die "--family requires a value"; family="$2"; shift 2 ;;
             --profile) [ $# -ge 2 ] || die "--profile requires 4b|3.5b|3b|5b"; profile="$2"; shift 2 ;;
-            --bits) [ $# -ge 2 ] || die "--bits requires 3|4|5"; bits_override="$2"; shift 2 ;;
+            --bits) [ $# -ge 2 ] || die "--bits requires 2|3|4|5"; bits_override="$2"; shift 2 ;;
             --target-gib) [ $# -ge 2 ] || die "--target-gib requires GB"; target_gib="$2"; shift 2 ;;
             --fit) [ $# -ge 2 ] || die "--fit requires auto or GB"; fit_mode="$2"; shift 2 ;;
             --residual) [ $# -ge 2 ] || die "--residual requires auto|bf16|q8"; residual="$2"; shift 2 ;;
@@ -309,6 +316,7 @@ run_convert() {
             --quantize-vision) quantize_vision=1; shift ;;
             --quantize-drafter) quantize_drafter=1; shift ;;
             --quantize-embed) quantize_embed=1; shift ;;
+            --max-shard-gib) [ $# -ge 2 ] || die "--max-shard-gib requires GB"; max_shard_gib="$2"; shift 2 ;;
             --trace) [ $# -ge 2 ] || die "--trace requires a file path"; trace_file="$2"; shift 2 ;;
             --nonmoe-model) [ $# -ge 2 ] || die "--nonmoe-model requires a directory"; nonmoe_model="$2"; shift 2 ;;
             --skip-existing) skip_existing=1; shift ;;
@@ -327,6 +335,7 @@ run_convert() {
     done
 
     [ -n "$model_arg" ] || { usage >&2; exit 2; }
+    case "$bits_override" in ""|2|3|4|5) ;; *) die "invalid --bits '${bits_override}' (expected 2, 3, 4, or 5)" ;; esac
 
     local expanded_model="${model_arg/#\~/$HOME}"
     local src_dir=""
@@ -353,8 +362,10 @@ run_convert() {
         die "'${model_arg}' is neither an existing directory nor a Hugging Face repo id (owner/name)"
     fi
 
+    local fmt_tag="TFQ3"
+    [ "$bits_override" = "2" ] && fmt_tag="TFQ4"
     if [ -z "$out_dir" ]; then
-        out_dir="$(default_out_dir "$model_arg" "$from_repo")"
+        out_dir="$(default_out_dir "$model_arg" "$from_repo" "$fmt_tag")"
     else
         out_dir="${out_dir/#\~/$HOME}"
     fi
@@ -391,6 +402,7 @@ run_convert() {
                 local conv_bin
                 conv_bin="$(require_tool "$lib_dir" "tfq4-convert${suffix}")"
                 local g_flags=(--model "$src_dir" --out "$out_dir" --head-bits "$head_bits")
+                [ -n "$max_shard_gib" ] && g_flags+=(--max-shard-gib "$max_shard_gib")
                 [ "$quantize_vision" -eq 1 ] && g_flags+=(--quantize-vision)
                 [ "$quantize_drafter" -eq 1 ] && g_flags+=(--quantize-drafter)
                 [ "$quantize_embed" -eq 1 ] && g_flags+=(--quantize-embed)
@@ -496,13 +508,13 @@ run_convert() {
             run_cmd "$inspect_bin" "$out_dir"
             ;;
         *)
-            die "unknown family '${family}' (expected auto, qwen27, flashnext, or glm)"
+            die "unknown family '${family}' (expected auto, generic, qwen27, flashnext, or glm)"
             ;;
     esac
 
     if [ "$DRY_RUN" -eq 0 ]; then
         echo ""
-        echo "TFQ3 checkpoint ready: ${out_dir}"
+        echo "${fmt_tag} checkpoint ready: ${out_dir}"
         echo "Serve on Mac (Metal) or NVIDIA GPU (CUDA) with TensorFold:"
         echo "  tensorfold serve ${out_dir}"
     fi

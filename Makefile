@@ -141,8 +141,10 @@ test-hip: hip
 
 test: all
 	@python3 reference/tfq3_reference.py --self-test
+	@python3 reference/tfq4_lattice.py --self-test
+	@python3 tests/e2e_test.py
 	@if [ "$(UNAME_S)" != "Darwin" ] && [ -x "$(BUILD)/tfq3-cuda-test" ]; then $(BUILD)/tfq3-cuda-test; fi
-	@echo "All TFQ3 targets built and verified in $(BUILD)/"
+	@echo "All TFQ3 & TFQ4 targets built and verified in $(BUILD)/"
 
 test-metal: $(BUILD)/tfq3-metal-test $(BUILD)/tfq3-metal-test.metallib
 	@$(BUILD)/tfq3-metal-test --bench
