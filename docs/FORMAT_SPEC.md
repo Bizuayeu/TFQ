@@ -1,6 +1,8 @@
 # TFQ3 Binary Format Specification (v3)
 
-All integers and floats are **little-endian**. Every GPU-mapped payload section (`scales` and `weights`) is aligned to **16,384 bytes (16 KiB)** — the Apple Silicon page size — so runtimes can `mmap` files read-only and wrap sections directly with `MTLDevice.newBufferWithBytesNoCopy` (zero copies, zero peak RAM spike).
+TFQ3 is a **single cross-platform binary format**: the exact same `pw_v3_tables.bin` and `.tffpw` files run unmodified on both **Apple Silicon (Metal)** and **NVIDIA GPUs (CUDA `sm_80+`)** with zero re-quantization or repacking.
+
+All integers and floats are **little-endian**. Every GPU-mapped payload section (`scales` and `weights`) is aligned to **16,384 bytes (16 KiB)** so Apple Silicon runtimes can `mmap` files read-only and wrap sections directly with `MTLDevice.newBufferWithBytesNoCopy` (zero copies, zero peak RAM spike), while CUDA runtimes `mmap` and DMA-upload contiguous aligned buffers straight into device memory.
 
 ---
 
@@ -88,7 +90,7 @@ For a tensor of shape `[R, C]` (`n_rb = R / 128`, `n_bc = C / 128`, `wpb = b_bit
   - **5-bit (`wpb = 10`):** Stored as `2` consecutive `uint32[5][32]` SoA planes (`h ∈ {0, 1}`, `blk[(h * 5 + p) * 32 + lane]` for $p \in \{0..4\}$ packing four 40-bit subtile codes across 160 bits).
 
 ### Contiguous Pair Fusion Rule (`canFusePair`)
-Two tensors `A` (`[R0, C]`) and `B` (`[R1, C]`) in the **same shard** can execute in a single fused Metal launch (with `sr_split = R0`) if and only if:
+Two tensors `A` (`[R0, C]`) and `B` (`[R1, C]`) in the **same shard** can execute in a single fused Metal or CUDA launch (with `sr_split = R0`) if and only if:
 1. `A.C == B.C` and `A.b_bits == B.b_bits`
 2. `B.sc_off == A.sc_off + (A.R / 128) * (A.C / 128)`
 3. `B.word_off == A.word_off + A.word_count`

@@ -1,4 +1,4 @@
-// Standalone CUDA GPU parity test and throughput benchmark for TFQ3 (3b/4b/5b) + BF16 kernels.
+// Standalone CUDA GPU parity test (dense + MoE + bit-exact speculative verify) and throughput benchmark for TFQ3.
 #include "../kernels/cuda/tfq3_cuda.cuh"
 #include <cmath>
 #include <cstdio>
@@ -134,6 +134,29 @@ static void h_decode_wrot(
     }
 }
 
+static void h_mv_ref(const std::vector<double>& W_rot, const double* x, uint32_t R, uint32_t C, uint32_t sr_split, double* out) {
+    std::vector<double> xr(C);
+    for (uint32_t bc = 0; bc < C / 128u; ++bc) {
+        double blk[128];
+        for (int j = 0; j < 128; ++j) blk[j] = x[bc * 128u + j] * h_sgn(0x12345678u, bc * 128u + j);
+        h_fwht128(blk);
+        for (int j = 0; j < 128; ++j) xr[bc * 128u + j] = blk[j];
+    }
+    std::vector<double> yr(R, 0.0);
+    for (uint32_t r = 0; r < R; ++r) {
+        double s = 0.0;
+        for (uint32_t c = 0; c < C; ++c) s += W_rot[(size_t)r * C + c] * xr[c];
+        yr[r] = s;
+    }
+    for (uint32_t rb = 0; rb < R / 128u; ++rb) {
+        double blk[128];
+        for (int j = 0; j < 128; ++j) blk[j] = yr[rb * 128u + j];
+        h_fwht128(blk);
+        uint32_t sr0 = (sr_split != 0u && rb * 128u >= sr_split) ? (rb * 128u - sr_split) : (rb * 128u);
+        for (int j = 0; j < 128; ++j) out[rb * 128u + j] = blk[j] * h_sgn(0x9E3779B9u, sr0 + j);
+    }
+}
+
 static void run_parity_suite() {
     tfq3::PwV3Tables h_tbl;
     init_synth_tables(h_tbl);
@@ -142,13 +165,14 @@ static void run_parity_suite() {
     CUDA_CHECK(cudaMemcpy(d_tbl, &h_tbl, sizeof(h_tbl), cudaMemcpyHostToDevice));
 
     __half* d_xrot; float* d_yr;
-    const size_t max_yr = 8ull * 4ull * 34816ull;
-    CUDA_CHECK(cudaMalloc(&d_xrot, 64ull * 2048ull * sizeof(__half)));
+    const size_t max_yr = 64ull * 34816ull * 8ull;
+    CUDA_CHECK(cudaMalloc(&d_xrot, 128ull * 2048ull * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_yr, max_yr * sizeof(float)));
 
     std::mt19937 rng(12345);
     std::normal_distribution<float> nd(0.0f, 0.25f);
 
+    // 1. Dense PTX m16n8k16 parity + bit-exact speculative verify (rows=1 == rows=16 == rows=32)
     for (uint32_t bits : {3u, 4u, 5u}) {
         const uint32_t R = 256u, C = 1024u, ldx = 1024u, ldo = 384u, sr_split = 128u;
         const size_t n_words = (size_t)(R / 16u) * (C / 128u) * (bits * 2u) * 32ull;
@@ -167,43 +191,23 @@ static void run_parity_suite() {
         CUDA_CHECK(cudaMemcpy(d_W, h_W.data(), n_words * 4, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_sc, h_sc.data(), n_sc * 2, cudaMemcpyHostToDevice));
 
-        for (uint32_t rows : {1u, 2u, 4u, 37u}) {
-            std::vector<uint16_t> h_X((size_t)rows * ldx);
-            for (auto& x : h_X) x = h_f32_to_bf16(nd(rng));
+        std::vector<uint16_t> h_X_all(68ull * ldx);
+        for (auto& x : h_X_all) x = h_f32_to_bf16(nd(rng));
+        uint16_t *d_X, *d_Y;
+        CUDA_CHECK(cudaMalloc(&d_X, h_X_all.size() * 2));
+        CUDA_CHECK(cudaMalloc(&d_Y, 68ull * ldo * 2));
+        CUDA_CHECK(cudaMemcpy(d_X, h_X_all.data(), h_X_all.size() * 2, cudaMemcpyHostToDevice));
 
-            // Exact fp64 CPU reference
+        std::vector<uint16_t> row0_r1(R);
+        for (uint32_t rows : {1u, 4u, 16u, 32u, 68u}) {
             std::vector<double> ref((size_t)rows * R, 0.0);
             for (uint32_t m = 0; m < rows; ++m) {
-                std::vector<double> xr(C, 0.0);
-                for (uint32_t bc = 0; bc < C / 128u; ++bc) {
-                    double blk[128];
-                    for (int j = 0; j < 128; ++j) blk[j] = (double)h_bf16_to_f32(h_X[(size_t)m * ldx + bc * 128u + j]) * h_sgn(0x12345678u, bc * 128u + j);
-                    h_fwht128(blk);
-                    for (int j = 0; j < 128; ++j) xr[bc * 128u + j] = blk[j];
-                }
-                std::vector<double> yr(R, 0.0);
-                for (uint32_t r = 0; r < R; ++r) {
-                    double s = 0.0;
-                    for (uint32_t c = 0; c < C; ++c) s += W_rot[(size_t)r * C + c] * xr[c];
-                    yr[r] = s;
-                }
-                for (uint32_t rb = 0; rb < R / 128u; ++rb) {
-                    double blk[128];
-                    for (int j = 0; j < 128; ++j) blk[j] = yr[rb * 128u + j];
-                    h_fwht128(blk);
-                    uint32_t sr0 = (rb * 128u >= sr_split) ? (rb * 128u - sr_split) : (rb * 128u);
-                    for (int j = 0; j < 128; ++j) ref[(size_t)m * R + rb * 128u + j] = blk[j] * h_sgn(0x9E3779B9u, sr0 + j);
-                }
+                std::vector<double> xm(C);
+                for (uint32_t c = 0; c < C; ++c) xm[c] = (double)h_bf16_to_f32(h_X_all[(size_t)m * ldx + c]);
+                h_mv_ref(W_rot, xm.data(), R, C, sr_split, &ref[(size_t)m * R]);
             }
-
-            uint16_t *d_X, *d_Y;
-            CUDA_CHECK(cudaMalloc(&d_X, (size_t)rows * ldx * 2));
-            CUDA_CHECK(cudaMalloc(&d_Y, (size_t)rows * ldo * 2));
-            CUDA_CHECK(cudaMemcpy(d_X, h_X.data(), (size_t)rows * ldx * 2, cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemset(d_Y, 0, (size_t)rows * ldo * 2));
-
-            // Test both 2dsk8 (max_yr > 0) and fused (max_yr = 0) when rows <= 16, plus WMMA prefill when rows > 16
-            for (int mode = 0; mode < (rows <= 16u ? 2 : 1); ++mode) {
+            for (int mode = 0; mode < (rows <= 64u ? 2 : 1); ++mode) {
+                CUDA_CHECK(cudaMemset(d_Y, 0, (size_t)rows * ldo * 2));
                 CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X, d_Y, d_xrot, d_yr, mode == 0 ? max_yr : 0ull, bits, rows, R, C, ldx, ldo, sr_split));
                 CUDA_CHECK(cudaDeviceSynchronize());
                 std::vector<uint16_t> h_Y((size_t)rows * ldo);
@@ -219,16 +223,109 @@ static void run_parity_suite() {
                 }
                 double rel = max_err / (max_ref + 1e-6);
                 if (rel > 0.025) {
-                    fprintf(stderr, "FAIL bits=%u rows=%u mode=%d max_err=%.5f rel=%.5f\n", bits, rows, mode, max_err, rel);
+                    fprintf(stderr, "FAIL dense bits=%u rows=%u mode=%d max_err=%.5f rel=%.5f\n", bits, rows, mode, max_err, rel);
+                    exit(1);
+                }
+                if (mode == 0 && rows == 1u) {
+                    memcpy(row0_r1.data(), h_Y.data(), R * 2);
+                } else if (mode == 0 && rows <= 64u) {
+                    if (memcmp(row0_r1.data(), h_Y.data(), R * 2) != 0) {
+                        fprintf(stderr, "FAIL bit-exact speculative verify bits=%u rows=%u vs rows=1\n", bits, rows);
+                        exit(1);
+                    }
+                }
+            }
+        }
+        cudaFree(d_X); cudaFree(d_Y); cudaFree(d_W); cudaFree(d_sc);
+    }
+
+    // 2. Mixed 3b/4b/5b routed MoE parity + bit-exact rows=1 == rows=16 (act_mode=0 clamped & act_mode=1)
+    {
+        const uint32_t E = 3u, D = 256u, I = 256u, top_k = 3u, R = 16u;
+        const uint32_t ebits[E] = {3u, 4u, 5u};
+        std::vector<uint32_t> h_W;
+        std::vector<__half> h_S;
+        std::vector<tfq3::TfpwExpertMeta> h_M(E);
+        std::vector<double> Wg[E], Wu[E], Wd[E];
+        for (uint32_t e = 0; e < E; ++e) {
+            uint32_t b = ebits[e];
+            size_t gu_w = (size_t)(I / 16u) * (D / 128u) * (b * 2u) * 32ull;
+            size_t dn_w = (size_t)(D / 16u) * (I / 128u) * (b * 2u) * 32ull;
+            size_t gu_s = (size_t)(I / 128u) * (D / 128u);
+            size_t dn_s = (size_t)(D / 128u) * (I / 128u);
+            memset(&h_M[e], 0, sizeof(h_M[e]));
+            h_M[e].b_bits = b;
+            auto append_mat = [&](size_t nw, size_t ns, uint64_t& woff, uint32_t& soff, uint32_t nr, uint32_t nc, std::vector<double>& dec) {
+                woff = h_W.size(); soff = (uint32_t)h_S.size();
+                h_W.resize(woff + nw); h_S.resize(soff + ns);
+                for (size_t i = 0; i < nw; ++i) h_W[woff + i] = rng();
+                for (size_t i = 0; i < ns; ++i) h_S[soff + i] = __float2half(0.05f + 0.02f * std::fabs(nd(rng)));
+                h_decode_wrot(h_W.data() + woff, h_S.data() + soff, h_tbl, b, nr, nc, dec);
+            };
+            append_mat(gu_w, gu_s, h_M[e].gate_word_off, h_M[e].gate_sc_off, I, D, Wg[e]);
+            append_mat(gu_w, gu_s, h_M[e].up_word_off,   h_M[e].up_sc_off,   I, D, Wu[e]);
+            append_mat(dn_w, dn_s, h_M[e].down_word_off, h_M[e].down_sc_off, D, I, Wd[e]);
+        }
+        uint32_t* d_W; __half *d_S, *d_act; tfq3::TfpwExpertMeta* d_M;
+        uint16_t* d_X; int32_t* d_picks; float *d_ey1, *d_ey16;
+        CUDA_CHECK(cudaMalloc(&d_W, h_W.size() * 4)); CUDA_CHECK(cudaMemcpy(d_W, h_W.data(), h_W.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_S, h_S.size() * 2)); CUDA_CHECK(cudaMemcpy(d_S, h_S.data(), h_S.size() * 2, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_M, E * sizeof(tfq3::TfpwExpertMeta))); CUDA_CHECK(cudaMemcpy(d_M, h_M.data(), E * sizeof(tfq3::TfpwExpertMeta), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_act, R * top_k * I * 2));
+        std::vector<uint16_t> h_X(R * D);
+        for (auto& x : h_X) x = h_f32_to_bf16(nd(rng));
+        CUDA_CHECK(cudaMalloc(&d_X, h_X.size() * 2)); CUDA_CHECK(cudaMemcpy(d_X, h_X.data(), h_X.size() * 2, cudaMemcpyHostToDevice));
+        std::vector<int32_t> h_picks(R * top_k);
+        for (uint32_t r = 0; r < R; ++r) for (uint32_t s = 0; s < top_k; ++s) h_picks[r * top_k + s] = (int32_t)((r + s) % E);
+        CUDA_CHECK(cudaMalloc(&d_picks, h_picks.size() * 4)); CUDA_CHECK(cudaMemcpy(d_picks, h_picks.data(), h_picks.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_ey1, top_k * D * 4));
+        CUDA_CHECK(cudaMalloc(&d_ey16, R * top_k * D * 4));
+
+        std::vector<double> x0(D);
+        for (uint32_t c = 0; c < D; ++c) x0[c] = (double)h_bf16_to_f32(h_X[c]);
+        for (uint32_t act_mode : {0u, 1u}) {
+            float lim = (act_mode == 0u) ? 7.0f : 0.0f;
+            CUDA_CHECK(tfq3::launch_moe(d_W, d_S, d_M, d_tbl, d_X, d_picks, d_ey1,  d_xrot, d_act, 1u, D, I, E, top_k, D, top_k, top_k, lim, act_mode, true));
+            CUDA_CHECK(tfq3::launch_moe(d_W, d_S, d_M, d_tbl, d_X, d_picks, d_ey16, d_xrot, d_act, R,  D, I, E, top_k, D, top_k, top_k, lim, act_mode, true));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<float> ey1(top_k * D), ey16(top_k * D);
+            CUDA_CHECK(cudaMemcpy(ey1.data(),  d_ey1,  top_k * D * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(ey16.data(), d_ey16, top_k * D * 4, cudaMemcpyDeviceToHost));
+            if (memcmp(ey1.data(), ey16.data(), top_k * D * 4) != 0) {
+                fprintf(stderr, "FAIL MoE bit-exact r1 vs r16 act_mode=%u\n", act_mode); exit(1);
+            }
+            for (uint32_t s = 0; s < top_k; ++s) {
+                std::vector<double> gr(I), ur(I), z(I), dr(D);
+                h_mv_ref(Wg[s], x0.data(), I, D, 0u, gr.data());
+                h_mv_ref(Wu[s], x0.data(), I, D, 0u, ur.data());
+                for (uint32_t i = 0; i < I; ++i) {
+                    double gv = h_bf16_to_f32(h_f32_to_bf16((float)gr[i]));
+                    double uv = h_bf16_to_f32(h_f32_to_bf16((float)ur[i]));
+                    if (act_mode == 0u && lim > 0.0f) {
+                        double fl = h_bf16_to_f32(h_f32_to_bf16(lim));
+                        gv = std::min(gv, fl); uv = std::min(std::max(uv, -fl), fl);
+                    }
+                    double sg = gv / (1.0 + std::exp(-gv));
+                    if (act_mode != 0u) sg = h_bf16_to_f32(h_f32_to_bf16((float)sg));
+                    z[i] = h_bf16_to_f32(h_f32_to_bf16((float)(sg * uv)));
+                }
+                h_mv_ref(Wd[s], z.data(), D, I, 0u, dr.data());
+                double max_err = 0.0, max_ref = 0.0;
+                for (uint32_t c = 0; c < D; ++c) {
+                    max_err = std::max(max_err, std::fabs((double)ey1[s * D + c] - dr[c]));
+                    max_ref = std::max(max_ref, std::fabs(dr[c]));
+                }
+                if (max_err / (max_ref + 1e-6) > 0.025) {
+                    fprintf(stderr, "FAIL MoE parity act_mode=%u expert=%u rel=%.5f\n", act_mode, s, max_err / (max_ref + 1e-6));
                     exit(1);
                 }
             }
-            cudaFree(d_X); cudaFree(d_Y);
         }
-        cudaFree(d_W); cudaFree(d_sc);
+        cudaFree(d_W); cudaFree(d_S); cudaFree(d_M); cudaFree(d_act);
+        cudaFree(d_X); cudaFree(d_picks); cudaFree(d_ey1); cudaFree(d_ey16);
     }
 
-    // BF16 linear parity check (mv1 + mm)
+    // 3. BF16 linear parity check (mv1 + mm)
     {
         const uint32_t N = 96u, K = 5120u, ldo = 128u;
         std::vector<uint16_t> h_W((size_t)N * K), h_X(4ull * K);
@@ -268,7 +365,7 @@ static void run_parity_suite() {
     }
 
     cudaFree(d_tbl); cudaFree(d_xrot); cudaFree(d_yr);
-    printf("PASS tfq3_cuda_test (3b/4b/5b fused + 2dsk8 + WMMA prefill + sr_split + strided + bf16 mv1/mm)\n");
+    printf("PASS tfq3_cuda_test (3b/4b/5b PTX m16n8k16 sk8+fused + bit-exact r1==r16==r32 + mixed-bit MoE + bf16 mv1/mm)\n");
 }
 
 static void run_bench() {
@@ -288,7 +385,7 @@ static void run_bench() {
         {"lm_head", 248320, 5120},
     };
     __half* d_xrot; float* d_yr; uint16_t *d_X, *d_Y;
-    const size_t max_yr = 8ull * 4ull * 34816ull;
+    const size_t max_yr = 64ull * 34816ull * 8ull;
     CUDA_CHECK(cudaMalloc(&d_xrot, 512ull * 17408ull * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_yr, max_yr * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_X, 512ull * 17408ull * 2ull));
@@ -306,11 +403,11 @@ static void run_bench() {
         CUDA_CHECK(cudaMemset(d_W, 0x5A, nw * 4)); CUDA_CHECK(cudaMemset(d_sc, 0x2E, ns * 2));
         double bytes = (double)(nw * 4 + ns * 2);
 
-        for (uint32_t rows : {1u, 4u, 256u}) {
+        for (uint32_t rows : {1u, 16u, 256u}) {
             if (rows == 256u && s.N == 248320u) continue;
             for (int w = 0; w < 5; ++w) CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X, d_Y, d_xrot, d_yr, max_yr, bits, rows, s.N, s.K, s.K, s.N, 0u));
             CUDA_CHECK(cudaDeviceSynchronize());
-            int iters = (rows <= 4u) ? 50 : 10;
+            int iters = (rows <= 16u) ? 50 : 10;
             CUDA_CHECK(cudaEventRecord(ev0));
             for (int it = 0; it < iters; ++it) CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X, d_Y, d_xrot, d_yr, max_yr, bits, rows, s.N, s.K, s.K, s.N, 0u));
             CUDA_CHECK(cudaEventRecord(ev1)); CUDA_CHECK(cudaEventSynchronize(ev1));

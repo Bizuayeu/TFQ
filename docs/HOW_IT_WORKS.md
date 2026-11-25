@@ -1,6 +1,6 @@
 # How TFQ3 Works
 
-TFQ3 is a **transform-coded, 2D vector quantization** scheme designed for both **maximum information-theoretic fidelity** (beating uniform affine 4-bit by ~2.5 dB weight SNR and −31% to −46% KL divergence) and **maximum Apple Silicon GPU throughput** (L0-resident `half4` lookup tables, native 16×16 NAX/simdgroup tiles, zero-copy `mmap`, and exact random-access `split-K`).
+TFQ3 is a **cross-platform, transform-coded 2D vector quantization** scheme designed for both **maximum information-theoretic fidelity** (beating uniform affine 4-bit by ~2.5 dB weight SNR and −31% to −46% KL divergence) and **maximum GPU throughput on both Apple Silicon (Metal) and NVIDIA GPUs (CUDA `sm_80+`)** — with one binary checkpoint working byte-for-byte on both platforms.
 
 ---
 
@@ -67,8 +67,8 @@ Each GPU thread (`lane ∈ [0..31]`) decodes 8 weights (4 pairs = two `half4` ve
 - Crucially, **`st` is updated directly to the last 32 bits of the packed weight bitstream** (`st = wc` for 4b, `st = (st << 24) | m24` for 3b, `st = lo32` for 5b).
 - **Why this matters for GPU speed:** To start a `split-K` threadgroup at *any* arbitrary 128-column block boundary `bc0 > 0`, the kernel does **not** need to walk from `bc = 0` or store sideband state! It simply loads the single preceding 32-bit weight word at `bc0 - 1` (`q27_pw_init_st`) and immediately has the exact rolling state `st` for `bc0`!
 
-### Encoding (Metal GPU)
-At conversion time, the Metal GPU encoder performs a fast **2-step lookahead search** (using spatial acceleration grids over `lut3`/`lut4`/`lut5`) to jointly choose the 2D code indices that minimize L2 distortion across the state transitions, followed by an exact closed-form optimal RMS scale polish per $128 \times 128$ block:
+### Encoding (Apple Silicon Metal & NVIDIA CUDA)
+At conversion time, both the Metal (`.mm`/`.metal`) and CUDA (`.cu`) GPU encoders perform the exact same fast **2-step lookahead search** (using spatial acceleration grids over `lut3`/`lut4`/`lut5`) to jointly choose the 2D code indices that minimize L2 distortion across the state transitions, followed by an exact closed-form optimal RMS scale polish per $128 \times 128$ block:
 
 $$\sigma^* = \frac{\langle \widetilde{W}, \widehat{W} \rangle}{\|\widehat{W}\|_2^2}$$
 
@@ -83,10 +83,14 @@ Achieved weight SNR on real transformer weights (zero calibration):
 
 Every $128 \times 128$ block is partitioned into **8 horizontal strips of 16 rows** (`strip = rb * 8 + s`, $s \in [0..7]$), and each `16 × 128` strip is subdivided into **8 subtiles of `16 × 16`**.
 
-Inside each `16 × 16` subtile, the 32 lanes of an Apple Silicon SIMD group map directly to the hardware `mma_16x32` fragment layout (`pw_frag_home`):
-- Each lane owns **8 weights**: 4 consecutive columns in row `home.y` (`q0`), and the same 4 columns in row `home.y + 8` (`q1`).
-- During **decode**, each lane reads `half4` of rotated input $x_{\text{rot}}$ once and executes two `half4` FMAs (`fma(q0, xv, acc0)`, `fma(q1, xv, acc1)`).
-- During **prefill**, the decoded `q0, q1` populate `tfp::frag<half>` registers directly in place — feeding Apple M5 NAX `tfp::mma_16x32` with zero shared-memory staging (and falling back cleanly to `simdgroup_matrix` via `TF_SIMD_FRAGS` on M1–M4!).
+Inside each `16 × 16` subtile, 32 lanes (one Apple Silicon SIMD group or one NVIDIA CUDA warp) decode **8 weights per lane** (`q0` = 4 columns in row `home.y`, `q1` = 4 columns in row `home.y + 8`):
+- **Apple Silicon (Metal, M1–M5):**
+  - During **decode**, each lane reads `half4` of rotated input $x_{\text{rot}}$ once and executes two `half4` FMAs (`fma(q0, xv, acc0)`, `fma(q1, xv, acc1)`).
+  - During **prefill**, decoded `q0, q1` populate `tfp::frag<half>` registers directly in place — feeding Apple M5 NAX `tfp::mma_16x32` with zero shared-memory staging (and falling back cleanly to `simdgroup_matrix` via `TF_SIMD_FRAGS` on M1–M4).
+- **NVIDIA GPUs (CUDA, `sm_80+` Ampere / Ada / Hopper / Blackwell):**
+  - Each warp decodes its `16 × 16` strip into a bank-conflict-free `16 × 24` shared-memory tile (`ldm = 24`, activations at `ldm = 136`) and executes direct PTX `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` Tensor Core instructions.
+  - The 3D split-K=8 kernel (`grid = (N/64, 8, ceil(rows/16))`, 4 warps/CTA) uses the exact same accumulation order for every speculative verify batch width `rows = 1..64`, guaranteeing **100% bit-exact** outputs across `--no-drafts`, `DFlash2`, `DSpine`, and `MTP` while saturating memory bandwidth (~265–274 GB/s on NVIDIA GB10).
+  - Wide-N (`lm_head`), small-K, and prompt prefill (`rows > 64`) use the fused 8-warp `m16n8k16` + inverse-FWHT-128 kernel (`tfq3_mma_fused_kernel`), and routed MoE layers run fused mixed-bit `3b/4b/5b` `gate+up+SwiGLU` and `down` kernels (`tfq3_moe_gu_swiglu_kernel`, `tfq3_moe_down_kernel`).
 
 Word packing per `16 × 128` block (8 subtiles × 32 lanes):
 - **4-bit:** `8` uint32 words/lane (`2 × uint4` vectorized AoS loads = `256` uint32 words per strip-block).
