@@ -18,7 +18,7 @@ Options:
   -o, --out DIR              Output TFQ3 directory (default: <model>-TFQ3)
   --family NAME              auto | generic | qwen27 | flashnext | glm (default: auto)
   --profile PROFILE          Bit profile: 4b | 3.5b | 3b | 5b (default: 4b)
-  --bits N                   Uniform bit width for generic converter: 3 | 4 | 5
+  --bits N                   Uniform bit width for generic converter: 2 (TFQ4-E8P) | 3 | 4 | 5
   --target-gib GB            Fit total checkpoint into GB via data-free sensitivity allocation
   --fit auto|GB              Auto-size to local GPU memory budget (or explicit GB)
   --residual MODE            Qwen3.8-27B residual precision: auto | bf16 | q8 (default: auto)
@@ -387,23 +387,41 @@ run_convert() {
 
     case "$family" in
         generic)
-            local conv_bin
-            conv_bin="$(require_tool "$lib_dir" "tfq3-generic-convert${suffix}")"
-            local g_flags=(--model "$src_dir" --out "$out_dir" --profile "$profile" --head-bits "$head_bits")
-            [ -n "$bits_override" ] && g_flags+=(--bits "$bits_override")
-            [ -n "$target_gib" ] && g_flags+=(--target-gib "$target_gib")
-            [ -n "$fit_mode" ] && g_flags+=(--fit "$fit_mode")
-            [ "$quantize_vision" -eq 1 ] && g_flags+=(--quantize-vision)
-            [ "$quantize_drafter" -eq 1 ] && g_flags+=(--quantize-drafter)
-            [ "$quantize_embed" -eq 1 ] && g_flags+=(--quantize-embed)
-            echo ""
-            if [ "$DRY_RUN" -eq 1 ] && [ -d "$src_dir" ]; then
-                "$conv_bin" "${g_flags[@]}" --dry-run
+            if [ "${bits_override}" = "2" ]; then
+                local conv_bin
+                conv_bin="$(require_tool "$lib_dir" "tfq4-convert${suffix}")"
+                local g_flags=(--model "$src_dir" --out "$out_dir" --head-bits "$head_bits")
+                [ "$quantize_vision" -eq 1 ] && g_flags+=(--quantize-vision)
+                [ "$quantize_drafter" -eq 1 ] && g_flags+=(--quantize-drafter)
+                [ "$quantize_embed" -eq 1 ] && g_flags+=(--quantize-embed)
+                echo ""
+                if [ "$DRY_RUN" -eq 1 ] && [ -d "$src_dir" ]; then
+                    "$conv_bin" "${g_flags[@]}" --dry-run
+                else
+                    echo "=== [1/2] Quantizing & packaging model (100% data-free TFQ4-E8P 2.001 bpw) ==="
+                    run_cmd "$conv_bin" "${g_flags[@]}"
+                    echo "=== [2/2] Validating TFQ4 checkpoint ==="
+                    run_cmd "$inspect_bin" "$out_dir"
+                fi
             else
-                echo "=== [1/2] Quantizing & packaging model (100% data-free generic TFQ3) ==="
-                run_cmd "$conv_bin" "${g_flags[@]}"
-                echo "=== [2/2] Validating TFQ3 checkpoint ==="
-                run_cmd "$inspect_bin" "$out_dir"
+                local conv_bin
+                conv_bin="$(require_tool "$lib_dir" "tfq3-generic-convert${suffix}")"
+                local g_flags=(--model "$src_dir" --out "$out_dir" --profile "$profile" --head-bits "$head_bits")
+                [ -n "$bits_override" ] && g_flags+=(--bits "$bits_override")
+                [ -n "$target_gib" ] && g_flags+=(--target-gib "$target_gib")
+                [ -n "$fit_mode" ] && g_flags+=(--fit "$fit_mode")
+                [ "$quantize_vision" -eq 1 ] && g_flags+=(--quantize-vision)
+                [ "$quantize_drafter" -eq 1 ] && g_flags+=(--quantize-drafter)
+                [ "$quantize_embed" -eq 1 ] && g_flags+=(--quantize-embed)
+                echo ""
+                if [ "$DRY_RUN" -eq 1 ] && [ -d "$src_dir" ]; then
+                    "$conv_bin" "${g_flags[@]}" --dry-run
+                else
+                    echo "=== [1/2] Quantizing & packaging model (100% data-free generic TFQ3) ==="
+                    run_cmd "$conv_bin" "${g_flags[@]}"
+                    echo "=== [2/2] Validating TFQ3 checkpoint ==="
+                    run_cmd "$inspect_bin" "$out_dir"
+                fi
             fi
             ;;
         qwen27)

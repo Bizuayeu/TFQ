@@ -20,7 +20,7 @@ struct PwV3Tables {
 };
 
 struct MetalDenseParams {
-    uint32_t rows, n, k, ldx, ldo, row_off, k_sign_off, strip_off, sc_row_off, bc0, bc1, n_bc_total;
+    uint32_t rows, n, k, ldx, ldo, row_off, k_sign_off, strip_off, sc_row_off, bc0, bc1, n_bc_total, ksplit;
 };
 
 static inline uint16_t f32_to_f16(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
@@ -155,10 +155,14 @@ int main(int argc, char** argv) {
             return [dev newComputePipelineStateWithFunction:f error:&err];
         };
         id<MTLComputePipelineState> pso_fx = mk("tfq3_fwht_x");
-        id<MTLComputePipelineState> pso_mm[6] = {};
-        pso_mm[3] = mk("tfq3_prefill_tp_3b");
-        pso_mm[4] = mk("tfq3_prefill_tp_4b");
-        pso_mm[5] = mk("tfq3_prefill_tp_5b");
+        id<MTLComputePipelineState> pso_fy = mk("tfq3_fwht_y");
+        id<MTLComputePipelineState> pso_dec[6] = {}, pso_mm[6] = {};
+        pso_dec[3] = mk("tfq3_sk8_tp_3b");
+        pso_dec[4] = mk("tfq3_sk8_tp_4b");
+        pso_dec[5] = mk("tfq3_sk8_tp_5b");
+        pso_mm[3]  = mk("tfq3_prefill_tp_3b");
+        pso_mm[4]  = mk("tfq3_prefill_tp_4b");
+        pso_mm[5]  = mk("tfq3_prefill_tp_5b");
         id<MTLCommandQueue> q = [dev newCommandQueue];
 
         PwV3Tables h_tbl; init_synth_tables(h_tbl);
@@ -180,43 +184,65 @@ int main(int argc, char** argv) {
             id<MTLBuffer> b_sc = [dev newBufferWithBytes:h_sc.data() length:ns * 2 options:MTLResourceStorageModeShared];
             id<MTLBuffer> b_X = [dev newBufferWithBytes:h_X.data() length:rows * K * 2 options:MTLResourceStorageModeShared];
             id<MTLBuffer> b_xr = [dev newBufferWithLength:rows * K * 2 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> b_yr = [dev newBufferWithLength:8ULL * 32ULL * N * 4 options:MTLResourceStorageModePrivate];
             id<MTLBuffer> b_Y = [dev newBufferWithLength:rows * N * 4 options:MTLResourceStorageModeShared];
 
-            auto run_tp = [&](uint32_t n_off, uint32_t n_loc, uint32_t k_off, uint32_t k_loc, std::vector<float>& out) {
-                MetalDenseParams p{rows, n_loc, k_loc, K, n_loc, n_off, k_off, n_off >> 4, n_off >> 7, k_off >> 7, (k_off + k_loc) >> 7, K >> 7};
+            auto run_tp = [&](bool decode, uint32_t r_cnt, uint32_t n_off, uint32_t n_loc, uint32_t k_off, uint32_t k_loc, std::vector<float>& out) {
+                uint32_t ks = decode ? 8u : 1u;
+                MetalDenseParams p{r_cnt, n_loc, k_loc, K, n_loc, n_off, k_off, n_off >> 4, n_off >> 7, k_off >> 7, (k_off + k_loc) >> 7, K >> 7, ks};
                 id<MTLCommandBuffer> cb = [q commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
                 [enc setComputePipelineState:pso_fx];
                 [enc setBuffer:b_X offset:k_off * 2 atIndex:0]; [enc setBuffer:b_xr offset:0 atIndex:1];
                 [enc setBytes:&p length:sizeof(p) atIndex:2];
-                [enc dispatchThreadgroups:MTLSizeMake(k_loc / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-                [enc setComputePipelineState:pso_mm[bits]];
-                [enc setBuffer:b_W offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
-                [enc setBuffer:b_tbl offset:0 atIndex:2]; [enc setBuffer:b_xr offset:0 atIndex:3];
-                [enc setBuffer:b_Y offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
-                [enc dispatchThreadgroups:MTLSizeMake(n_loc / 128u, (rows + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc dispatchThreadgroups:MTLSizeMake(k_loc / 128u, r_cnt, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                if (decode) {
+                    [enc setComputePipelineState:pso_dec[bits]];
+                    [enc setBuffer:b_W offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
+                    [enc setBuffer:b_tbl offset:0 atIndex:2]; [enc setBuffer:b_xr offset:0 atIndex:3];
+                    [enc setBuffer:b_yr offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
+                    [enc dispatchThreadgroups:MTLSizeMake(n_loc / 64u, ks, (r_cnt + 15u) / 16u) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    [enc setComputePipelineState:pso_fy];
+                    [enc setBuffer:b_yr offset:0 atIndex:0]; [enc setBuffer:b_Y offset:0 atIndex:1];
+                    [enc setBytes:&p length:sizeof(p) atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(n_loc / 128u, r_cnt, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                } else {
+                    [enc setComputePipelineState:pso_mm[bits]];
+                    [enc setBuffer:b_W offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
+                    [enc setBuffer:b_tbl offset:0 atIndex:2]; [enc setBuffer:b_xr offset:0 atIndex:3];
+                    [enc setBuffer:b_Y offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
+                    [enc dispatchThreadgroups:MTLSizeMake(n_loc / 128u, (r_cnt + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                }
                 [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
-                out.resize(rows * n_loc);
-                memcpy(out.data(), [b_Y contents], rows * n_loc * 4);
+                out.resize((size_t)r_cnt * n_loc);
+                memcpy(out.data(), [b_Y contents], (size_t)r_cnt * n_loc * 4);
             };
 
-            std::vector<float> y_full;
-            run_tp(0, N, 0, K, y_full);
-            double dot = 0.0, na = 0.0, nb = 0.0;
+            std::vector<float> y_dec1, y_dec16, y_full;
+            run_tp(true, 1u, 0, N, 0, K, y_dec1);
+            run_tp(true, 16u, 0, N, 0, K, y_dec16);
+            // Bit-exact speculative verification parity: row 0 at rows=1 MUST equal row 0 at rows=16!
+            for (uint32_t r = 0; r < N; ++r) {
+                if (y_dec1[r] != y_dec16[r]) { fprintf(stderr, "FAIL Metal decode bit-exact r1!=r16 %ub @ %u\n", bits, r); return 1; }
+            }
+            run_tp(false, rows, 0, N, 0, K, y_full);
+            double dot = 0.0, na = 0.0, nb = 0.0, dot_d = 0.0, nda = 0.0, ndb = 0.0;
             for (uint32_t m = 0; m < rows; ++m) for (uint32_t r = 0; r < N; ++r) {
                 double ref = 0.0;
                 for (uint32_t c = 0; c < K; ++c) ref += W_ref[(size_t)r * K + c] * (double)f16_to_f32(h_X[(size_t)m * K + c]);
                 double g = y_full[(size_t)m * N + r];
                 dot += g * ref; na += g * g; nb += ref * ref;
+                if (m < 16u) { double gd = y_dec16[(size_t)m * N + r]; dot_d += gd * ref; nda += gd * gd; ndb += ref * ref; }
             }
             double cos_full = dot / (std::sqrt(na * nb) + 1e-30);
-            if (cos_full < 0.99999) { fprintf(stderr, "FAIL Metal prefill %ub cos=%.8f\n", bits, cos_full); return 1; }
+            double cos_dec = dot_d / (std::sqrt(nda * ndb) + 1e-30);
+            if (cos_full < 0.99999 || cos_dec < 0.99999) { fprintf(stderr, "FAIL Metal %ub prefill=%.8f dec=%.8f\n", bits, cos_full, cos_dec); return 1; }
 
             // Verify Col-TP=4 (bit-exact concat) and Row-TP=4 (AllReduce SUM == full)
             uint32_t n_loc = N / 4u;
             for (uint32_t rk = 0; rk < 4u; ++rk) {
                 std::vector<float> part;
-                run_tp(rk * n_loc, n_loc, 0, K, part);
+                run_tp(false, rows, rk * n_loc, n_loc, 0, K, part);
                 for (uint32_t m = 0; m < rows; ++m) for (uint32_t r = 0; r < n_loc; ++r) {
                     if (part[(size_t)m * n_loc + r] != y_full[(size_t)m * N + rk * n_loc + r]) {
                         fprintf(stderr, "FAIL Metal Col-TP=4 %ub mismatch\n", bits); return 1;
@@ -227,7 +253,7 @@ int main(int argc, char** argv) {
             std::vector<float> y_sum(rows * N, 0.0f);
             for (uint32_t rk = 0; rk < 4u; ++rk) {
                 std::vector<float> part;
-                run_tp(0, N, rk * k_loc, k_loc, part);
+                run_tp(false, rows, 0, N, rk * k_loc, k_loc, part);
                 for (size_t i = 0; i < y_sum.size(); ++i) y_sum[i] += part[i];
             }
             double dtp = 0.0, n1 = 0.0, n2 = 0.0;
@@ -235,13 +261,14 @@ int main(int argc, char** argv) {
             double cos_tp = dtp / (std::sqrt(n1 * n2) + 1e-30);
             if (cos_tp < 0.999999) { fprintf(stderr, "FAIL Metal Row-TP=4 %ub cos=%.8f\n", bits, cos_tp); return 1; }
         }
-        printf("PASS tfq3_metal_test (%s: 3b/4b/5b simdgroup_matrix prefill32 vs fp64 + bit-exact Col-TP=4 + Row-TP=4)\n", [[dev name] UTF8String]);
+        printf("PASS tfq3_metal_test (%s: 3b/4b/5b decode r1==r16 bit-exact + simdgroup_matrix prefill32 vs fp64 + Col-TP=4 + Row-TP=4)\n", [[dev name] UTF8String]);
 
         if (do_bench) {
             struct Shape { const char* name; uint32_t N, K; };
             Shape shapes[] = {{"gate+up", 34816, 5120}, {"down", 5120, 17408}, {"qkv", 10240, 5120}};
             id<MTLBuffer> b_X = [dev newBufferWithLength:512ULL * 17408ULL * 2 options:MTLResourceStorageModeShared];
             id<MTLBuffer> b_xr = [dev newBufferWithLength:512ULL * 17408ULL * 2 options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> b_yr = [dev newBufferWithLength:8ULL * 32ULL * 34816ULL * 4 options:MTLResourceStorageModePrivate];
             id<MTLBuffer> b_Y = [dev newBufferWithLength:512ULL * 34816ULL * 4 options:MTLResourceStorageModePrivate];
             for (auto& s : shapes) {
                 size_t nw = (size_t)(s.N / 16u) * (s.K / 128u) * 8ull * 32ull;
@@ -249,28 +276,44 @@ int main(int argc, char** argv) {
                 id<MTLBuffer> b_W = [dev newBufferWithLength:nw * 4 options:MTLResourceStorageModeShared];
                 id<MTLBuffer> b_sc = [dev newBufferWithLength:ns * 2 options:MTLResourceStorageModeShared];
                 double bytes = (double)(nw * 4 + ns * 2);
-                for (uint32_t rows : {32u, 256u, 512u}) {
-                    MetalDenseParams p{rows, s.N, s.K, s.K, s.N, 0, 0, 0, 0, 0, s.K >> 7, s.K >> 7};
-                    auto run_once = [&]() {
+                for (uint32_t rows : {1u, 16u, 32u, 256u, 512u}) {
+                    bool dec = (rows <= 16u);
+                    uint32_t ks = dec ? 8u : 1u;
+                    MetalDenseParams p{rows, s.N, s.K, s.K, s.N, 0, 0, 0, 0, 0, s.K >> 7, s.K >> 7, ks};
+                    auto run_n = [&](int reps) {
                         id<MTLCommandBuffer> cb = [q commandBuffer];
                         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                        [enc setComputePipelineState:pso_fx];
-                        [enc setBuffer:b_X offset:0 atIndex:0]; [enc setBuffer:b_xr offset:0 atIndex:1];
-                        [enc setBytes:&p length:sizeof(p) atIndex:2];
-                        [enc dispatchThreadgroups:MTLSizeMake(s.K / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-                        [enc setComputePipelineState:pso_mm[4]];
-                        [enc setBuffer:b_W offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
-                        [enc setBuffer:b_tbl offset:0 atIndex:2]; [enc setBuffer:b_xr offset:0 atIndex:3];
-                        [enc setBuffer:b_Y offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
-                        [enc dispatchThreadgroups:MTLSizeMake(s.N / 128u, (rows + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        for (int rep = 0; rep < reps; ++rep) {
+                            [enc setComputePipelineState:pso_fx];
+                            [enc setBuffer:b_X offset:0 atIndex:0]; [enc setBuffer:b_xr offset:0 atIndex:1];
+                            [enc setBytes:&p length:sizeof(p) atIndex:2];
+                            [enc dispatchThreadgroups:MTLSizeMake(s.K / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                            if (dec) {
+                                [enc setComputePipelineState:pso_dec[4]];
+                                [enc setBuffer:b_W offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
+                                [enc setBuffer:b_tbl offset:0 atIndex:2]; [enc setBuffer:b_xr offset:0 atIndex:3];
+                                [enc setBuffer:b_yr offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
+                                [enc dispatchThreadgroups:MTLSizeMake(s.N / 64u, ks, (rows + 15u) / 16u) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                                [enc setComputePipelineState:pso_fy];
+                                [enc setBuffer:b_yr offset:0 atIndex:0]; [enc setBuffer:b_Y offset:0 atIndex:1];
+                                [enc setBytes:&p length:sizeof(p) atIndex:2];
+                                [enc dispatchThreadgroups:MTLSizeMake(s.N / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                            } else {
+                                [enc setComputePipelineState:pso_mm[4]];
+                                [enc setBuffer:b_W offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
+                                [enc setBuffer:b_tbl offset:0 atIndex:2]; [enc setBuffer:b_xr offset:0 atIndex:3];
+                                [enc setBuffer:b_Y offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
+                                [enc dispatchThreadgroups:MTLSizeMake(s.N / 128u, (rows + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                            }
+                        }
                         [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
                     };
-                    for (int w = 0; w < 3; ++w) run_once();
+                    run_n(5);
                     auto t0 = std::chrono::steady_clock::now();
-                    for (int it = 0; it < 10; ++it) run_once();
-                    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 10.0;
-                    printf("  Metal %-8s [%6u x %5u] 4b rows=%3u : %7.3f ms | %6.1f GB/s | %5.2f TFLOP/s\n",
-                           s.name, s.N, s.K, rows, ms, (bytes / 1e9) / (ms / 1e3), (2.0 * rows * s.N * s.K / 1e12) / (ms / 1e3));
+                    run_n(20);
+                    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 20.0;
+                    printf("  Metal %-8s [%6u x %5u] 4b rows=%3u (%-3s): %7.3f ms | %6.1f GB/s | %5.2f TFLOP/s\n",
+                           s.name, s.N, s.K, rows, dec ? "sk8" : "mm", ms, (bytes / 1e9) / (ms / 1e3), (2.0 * rows * s.N * s.K / 1e12) / (ms / 1e3));
                 }
             }
         }

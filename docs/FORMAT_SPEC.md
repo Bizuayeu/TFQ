@@ -169,3 +169,16 @@ Any compliant reader (and `build/tfq3-inspect`) enforces:
 4. All arithmetic checked against 64-bit integer overflow.
 5. Every tensor/expert has `bits ∈ {3, 4, 5}`, `R > 0`, `C > 0`, `R % 128 == 0`, `C % 128 == 0`, exact expected `word_count`, and offsets strictly inside `[0, total_scale_halfs]` and `[0, total_weight_words]`.
 6. No duplicate tensor names across multi-shard `TFPN` directories.
+
+---
+
+## 5. Sub-3-Bit Extension: `PWV4` v4 & `TFP4` v4 (`2.001 bpw` 8D `E8P`)
+
+`TFQ4` shares `TFQ3`'s exact `2D FWHT-128` rotation (`SEED_COL = 0x12345678`, `SEED_ROW = 0x9E3779B9`) and `128 × 128` `fp16` tile scale grid (`0.001 bpw` overhead), allowing hybrid `TFQ3` (`3/4/5b`) + `TFQ4` (`2.0b`) checkpoints to share one input rotation and one inverse row-FWHT epilogue:
+
+- **`pw_v4_e8p_tables.bin` (`PWV4`, fixed 16,384 bytes):**
+  - Header (`64` bytes): `magic = 0x34565750` (`"PWV4"`), `version = 4`, `k_codes = 256`, `dim = 8`, `pad0[12]`.
+  - Offset `64..4160`: `e8p_lut[256][8]` (`fp16`, **`4,096` bytes**) — deterministic positive-orthant 8D `E8P` centroids.
+- **`*.tffp4` (`TFP4`, 16 KiB-aligned):**
+  - Identical 64-byte header (`magic = 0x34504654`, `version = 4`) and 128-byte tensor metadata (`b_bits = 2`, `word_count = R * (C / 16)`, `pad = [orig_R, orig_C, flags]`) as `TFPN`.
+  - Row-major packed `uint32_t[R, C / 16]`: each `uint32_t` holds two 16-bit codes `(sign_mask << 8) | abs_idx` (`c0 = w & 0xFFFF`, `c1 = w >> 16`), decoding 16 rotated weights via branchless `half2` sign XOR against `e8p_lut[abs_idx]`.

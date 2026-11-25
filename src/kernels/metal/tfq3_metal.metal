@@ -7,8 +7,10 @@ using namespace metal;
 // Standalone Reusable Apple Silicon Metal TFQ3 Inference, Prefill & TP Kernels
 //   - Byte-identical PWV3 v3 / TFPN v3 format with NVIDIA CUDA & AMD HIP
 //   - 2D FWHT-128 input/output rotation with Row-TP sign offset support
-//   - Decode MV1 (rows=1..16) + High-Throughput Tiled simdgroup_matrix Prefill
-//     (BM=32, BN=128 -> 32x weight reuse, fused inverse FWHT-128)
+//   - Split-K=8 simdgroup_matrix BM=16 Decode & Speculative Verify (rows=1..32,
+//     100% bit-exact rows=1 == rows=16 == rows=32)
+//   - High-Throughput Tiled simdgroup_matrix Prefill (BM=32, BN=128, zero
+//     accumulator register spill, fused inverse FWHT-128)
 //   - Zero-Repack Multi-Mac Tensor Parallel (Row-TP via state-hash resume & Col-TP)
 // ============================================================================
 struct PwV3Tables {
@@ -36,6 +38,7 @@ struct MetalDenseParams {
     uint bc0;
     uint bc1;
     uint n_bc_total;
+    uint ksplit;
 };
 
 inline short2 pw_frag_home(ushort l) {
@@ -59,11 +62,11 @@ inline void pw_fwht128_simd4(thread float4& v, ushort lane) {
 }
 
 kernel void tfq3_fwht_x(
-    const device half* X        [[buffer(0)]],
-    device half* X_rot          [[buffer(1)]],
+    const device half* X         [[buffer(0)]],
+    device half* X_rot           [[buffer(1)]],
     constant MetalDenseParams& P [[buffer(2)]],
-    uint2 gid                   [[threadgroup_position_in_grid]],
-    ushort lane                 [[thread_index_in_simdgroup]]
+    uint2 gid                    [[threadgroup_position_in_grid]],
+    ushort lane                  [[thread_index_in_simdgroup]]
 ) {
     uint row = gid.y, c0 = gid.x * 128u, cs = c0 + P.k_sign_off;
     if (row >= P.rows || c0 >= P.k) return;
@@ -77,6 +80,31 @@ kernel void tfq3_fwht_x(
     device half* dst = X_rot + ulong(row) * P.k + c0;
     dst[lane +  0u] = half(v.x); dst[lane + 32u] = half(v.y);
     dst[lane + 64u] = half(v.z); dst[lane + 96u] = half(v.w);
+}
+
+kernel void tfq3_fwht_y(
+    const device float* YR       [[buffer(0)]],
+    device float* OUT            [[buffer(1)]],
+    constant MetalDenseParams& P [[buffer(2)]],
+    uint2 gid                    [[threadgroup_position_in_grid]],
+    ushort lane                  [[thread_index_in_simdgroup]]
+) {
+    uint r0 = gid.x * 128u, row = gid.y;
+    if (row >= P.rows || r0 >= P.n) return;
+    ulong plane = ulong(P.rows) * P.n, off = ulong(row) * P.n + r0;
+    float4 v = float4(0.0f);
+    for (uint kp = 0u; kp < P.ksplit; ++kp) {
+        const device float* p = YR + ulong(kp) * plane + off;
+        v.x += p[lane +  0u]; v.y += p[lane + 32u];
+        v.z += p[lane + 64u]; v.w += p[lane + 96u];
+    }
+    pw_fwht128_simd4(v, lane);
+    uint sr0 = r0 + P.row_off;
+    ulong base = ulong(row) * P.ldo + r0;
+    OUT[base + lane +  0u] = v.x * pw_sgn(0x9E3779B9u, sr0 + lane +  0u);
+    OUT[base + lane + 32u] = v.y * pw_sgn(0x9E3779B9u, sr0 + lane + 32u);
+    OUT[base + lane + 64u] = v.z * pw_sgn(0x9E3779B9u, sr0 + lane + 64u);
+    OUT[base + lane + 96u] = v.w * pw_sgn(0x9E3779B9u, sr0 + lane + 96u);
 }
 
 inline void pw_v3_q8_4b(thread uint& st, uint wc, constant PwV3Tables* T, thread half4& q0, thread half4& q1) {
@@ -136,21 +164,161 @@ inline uint pw_init_st(const device uint* w_base, uint bc0, ushort lane) {
     }
 }
 
-// High-Throughput Tiled simdgroup_matrix Prefill + Zero-Repack TP Kernel (BM=32, BN=128):
-// 8 simdgroups (256 threads) cooperatively load 32x128 X_rot, each simdgroup decodes 16x16 W once
-// and runs 4x2 simdgroup_multiply_accumulate (32x weight reuse), then runs fused inverse FWHT-128.
+// ============================================================================
+// 1. Split-K simdgroup_matrix BM=16 Decode & Speculative Verify (rows = 1..32)
+//    grid=(N/64, ksplit, ceil(rows/16)), block=128 (4 simdgroups = 64 N-rows).
+//    High GPU occupancy at rows=1..16 AND 100% bit-exact rows=1 == rows=16!
+// ============================================================================
+template <uint BITS>
+kernel void tfq3_sk8_tp_impl(
+    const device uint* W         [[buffer(0)]],
+    const device half* scales    [[buffer(1)]],
+    constant PwV3Tables* T       [[buffer(2)]],
+    const device half* X_rot     [[buffer(3)]],
+    device float* YR             [[buffer(4)]],
+    constant MetalDenseParams& P [[buffer(5)]],
+    uint3 gid                    [[threadgroup_position_in_grid]],
+    ushort tid                   [[thread_index_in_threadgroup]],
+    ushort sg                    [[simdgroup_index_in_threadgroup]],
+    ushort lane                  [[thread_index_in_simdgroup]]
+) {
+    uint blk = gid.x, kp = gid.y, m0 = gid.z * 16u;
+    if (m0 >= P.rows) return;
+    uint nb = min(16u, P.rows - m0);
+    uint tot_bc = P.bc1 - P.bc0;
+    uint chunk = (tot_bc + P.ksplit - 1u) / P.ksplit;
+    uint bc_s = P.bc0 + kp * chunk;
+    uint bc_e = min(P.bc1, bc_s + chunk);
+    uint strip = P.strip_off + blk * 4u + uint(sg);
+    const device uint* w_s = W + ulong(strip) * P.n_bc_total * (BITS * 2u) * 32ul;
+    const device half* sc0 = scales + ulong(P.sc_row_off + (strip >> 3)) * P.n_bc_total;
+    uint st = (bc_s < bc_e) ? pw_init_st<BITS>(w_s, bc_s, lane) : 0u;
+    short2 home = pw_frag_home(lane);
+
+    // 16x128 X_rot (4 KiB) + 4x(16x16 half / 8x16 float) scratch (2 KiB) + 16x64 float acc (4 KiB)
+    threadgroup half sm_a[16 * 128];
+    threadgroup union { half h[16 * 16]; float f[8 * 16]; } sm_b[4];
+    threadgroup float sm_acc[16 * 64];
+
+    for (uint idx = tid; idx < 256u; idx += 128u) {
+        *reinterpret_cast<threadgroup float4*>(sm_acc + idx * 4u) = float4(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint bc = bc_s; bc < bc_e; ++bc) {
+        uint x_col = (bc - P.bc0) * 128u;
+        for (uint idx = tid; idx < 512u; idx += 128u) {
+            uint rl = idx >> 5, cl = (idx & 31u) << 2;
+            half4 v = (rl < nb) ? *reinterpret_cast<const device half4*>(X_rot + ulong(m0 + rl) * P.k + x_col + cl) : half4(0.0h);
+            *reinterpret_cast<threadgroup half4*>(sm_a + rl * 128u + cl) = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 blk_acc[2][2];
+        blk_acc[0][0] = simdgroup_float8x8(0.0f); blk_acc[0][1] = simdgroup_float8x8(0.0f);
+        blk_acc[1][0] = simdgroup_float8x8(0.0f); blk_acc[1][1] = simdgroup_float8x8(0.0f);
+
+        auto mma_16 = [&](uint kt, half4 q0, half4 q1) {
+            threadgroup half* sb = sm_b[sg].h;
+            uint n0 = uint(home.y), n1 = n0 + 8u, k0 = uint(home.x);
+            sb[(k0 + 0u) * 16u + n0] = q0.x; sb[(k0 + 1u) * 16u + n0] = q0.y;
+            sb[(k0 + 2u) * 16u + n0] = q0.z; sb[(k0 + 3u) * 16u + n0] = q0.w;
+            sb[(k0 + 0u) * 16u + n1] = q1.x; sb[(k0 + 1u) * 16u + n1] = q1.y;
+            sb[(k0 + 2u) * 16u + n1] = q1.z; sb[(k0 + 3u) * 16u + n1] = q1.w;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_half8x8 B00, B01, B10, B11;
+            simdgroup_load(B00, sb,                 16u);
+            simdgroup_load(B01, sb + 8u,            16u);
+            simdgroup_load(B10, sb + 8u * 16u,      16u);
+            simdgroup_load(B11, sb + 8u * 16u + 8u, 16u);
+
+            uint kc = kt * 16u;
+            simdgroup_half8x8 A0, A1;
+            simdgroup_load(A0, sm_a + kc,      128u);
+            simdgroup_load(A1, sm_a + kc + 8u, 128u);
+            simdgroup_multiply_accumulate(blk_acc[0][0], A0, B00, blk_acc[0][0]);
+            simdgroup_multiply_accumulate(blk_acc[0][1], A0, B01, blk_acc[0][1]);
+            simdgroup_multiply_accumulate(blk_acc[0][0], A1, B10, blk_acc[0][0]);
+            simdgroup_multiply_accumulate(blk_acc[0][1], A1, B11, blk_acc[0][1]);
+            if (nb > 8u) {
+                simdgroup_load(A0, sm_a + 8u * 128u + kc,      128u);
+                simdgroup_load(A1, sm_a + 8u * 128u + kc + 8u, 128u);
+                simdgroup_multiply_accumulate(blk_acc[1][0], A0, B00, blk_acc[1][0]);
+                simdgroup_multiply_accumulate(blk_acc[1][1], A0, B01, blk_acc[1][1]);
+                simdgroup_multiply_accumulate(blk_acc[1][0], A1, B10, blk_acc[1][0]);
+                simdgroup_multiply_accumulate(blk_acc[1][1], A1, B11, blk_acc[1][1]);
+            }
+        };
+
+        half4 q0, q1;
+        if constexpr (BITS == 4u) {
+            const device uint4* p = reinterpret_cast<const device uint4*>(w_s + ulong(bc) * 8ul * 32ul);
+            for (uint h = 0u; h < 2u; ++h) {
+                uint4 v = p[h * 32u + lane];
+                uint uv[4] = {v.x, v.y, v.z, v.w};
+                TF_UNROLL for (uint j = 0u; j < 4u; ++j) { pw_v3_q8_4b(st, uv[j], T, q0, q1); mma_16(h * 4u + j, q0, q1); }
+            }
+        } else if constexpr (BITS == 3u) {
+            for (uint h = 0u; h < 2u; ++h) {
+                const device uint* p = w_s + (ulong(bc) * 6ul + h * 3ul) * 32ul + lane;
+                uint a0 = p[0], a1 = p[32], a2 = p[64];
+                uint mv[4] = {a0 >> 8, ((a0 << 16) | (a1 >> 16)) & 0xFFFFFFu, ((a1 << 8) | (a2 >> 24)) & 0xFFFFFFu, a2 & 0xFFFFFFu};
+                TF_UNROLL for (uint j = 0u; j < 4u; ++j) { pw_v3_q8_3b(st, mv[j], T, q0, q1); mma_16(h * 4u + j, q0, q1); }
+            }
+        } else {
+            for (uint h = 0u; h < 2u; ++h) {
+                const device uint* p = w_s + (ulong(bc) * 10ul + h * 5ul) * 32ul + lane;
+                uint w0 = p[0], w1 = p[32], w2 = p[64], w3 = p[96], w4 = p[128];
+                uint hv[4] = {w0 >> 24, (w1 >> 16) & 255u, (w2 >> 8) & 255u, w3 & 255u};
+                uint lv[4] = {(w0 << 8) | (w1 >> 24), (w1 << 16) | (w2 >> 16), (w2 << 24) | (w3 >> 8), w4};
+                TF_UNROLL for (uint j = 0u; j < 4u; ++j) { pw_v3_q8_5b(st, hv[j], lv[j], T, q0, q1); mma_16(h * 4u + j, q0, q1); }
+            }
+        }
+
+        float fsv = float(sc0[bc]);
+        uint r_l = lane >> 2, c4 = (lane & 3u) << 2;
+        threadgroup float* sf = sm_b[sg].f;
+        TF_UNROLL for (uint m = 0u; m < 2u; ++m) {
+            if (m * 8u < nb) {
+                simdgroup_store(blk_acc[m][0], sf,      16u);
+                simdgroup_store(blk_acc[m][1], sf + 8u, 16u);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup float4* dst = reinterpret_cast<threadgroup float4*>(sm_acc + (m * 8u + r_l) * 64u + uint(sg) * 16u + c4);
+                float4 add = *reinterpret_cast<const threadgroup float4*>(sf + r_l * 16u + c4);
+                *dst = fma(add, fsv, *dst);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint r_l = lane >> 2, c4 = (lane & 3u) << 2;
+    ulong pbase = ulong(kp) * P.rows * P.n + blk * 64u + uint(sg) * 16u + c4;
+    for (uint m = 0u; m < 2u; ++m) {
+        uint row = m * 8u + r_l;
+        if (row < nb) {
+            *reinterpret_cast<device float4*>(YR + pbase + ulong(m0 + row) * P.n) =
+                *reinterpret_cast<const threadgroup float4*>(sm_acc + row * 64u + uint(sg) * 16u + c4);
+        }
+    }
+}
+
+// ============================================================================
+// 2. High-Throughput Tiled simdgroup_matrix Prefill + Zero-Repack TP (BM=32, BN=128)
+// ============================================================================
 template <uint BITS>
 kernel void tfq3_prefill_tp_impl(
-    const device uint* W        [[buffer(0)]],
-    const device half* scales   [[buffer(1)]],
-    constant PwV3Tables* T      [[buffer(2)]],
-    const device half* X_rot    [[buffer(3)]],
-    device float* OUT           [[buffer(4)]],
+    const device uint* W         [[buffer(0)]],
+    const device half* scales    [[buffer(1)]],
+    constant PwV3Tables* T       [[buffer(2)]],
+    const device half* X_rot     [[buffer(3)]],
+    device float* OUT            [[buffer(4)]],
     constant MetalDenseParams& P [[buffer(5)]],
-    uint2 gid                   [[threadgroup_position_in_grid]],
-    ushort tid                  [[thread_index_in_threadgroup]],
-    ushort sg                   [[simdgroup_index_in_threadgroup]],
-    ushort lane                 [[thread_index_in_simdgroup]]
+    uint2 gid                    [[threadgroup_position_in_grid]],
+    ushort tid                   [[thread_index_in_threadgroup]],
+    ushort sg                    [[simdgroup_index_in_threadgroup]],
+    ushort lane                  [[thread_index_in_simdgroup]]
 ) {
     uint rb = gid.x, r0 = rb * 128u, m0 = gid.y * 32u;
     if (m0 >= P.rows) return;
@@ -161,15 +329,14 @@ kernel void tfq3_prefill_tp_impl(
     uint st = pw_init_st<BITS>(w_s, P.bc0, lane);
     short2 home = pw_frag_home(lane);
 
-    // 32x128 X_rot (8 KiB) + 8x(16x16) decoded W (4 KiB) + 32x128 float epilogue (16 KiB)
     threadgroup half sm_a[32 * 128];
-    threadgroup half sm_b[8][16 * 16];
+    threadgroup union { half h[16 * 16]; float f[8 * 16]; } sm_b[8];
     threadgroup float sm_out[32 * 128];
 
-    simdgroup_float8x8 acc[4][2];
-    TF_UNROLL for (int m = 0; m < 4; ++m)
-        TF_UNROLL for (int n = 0; n < 2; ++n)
-            acc[m][n] = simdgroup_float8x8(0.0f);
+    for (uint idx = tid; idx < 1024u; idx += 256u) {
+        *reinterpret_cast<threadgroup float4*>(sm_out + idx * 4u) = float4(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint bc = P.bc0; bc < P.bc1; ++bc) {
         uint x_col = (bc - P.bc0) * 128u;
@@ -186,8 +353,7 @@ kernel void tfq3_prefill_tp_impl(
                 blk_acc[m][n] = simdgroup_float8x8(0.0f);
 
         auto mma_16x16 = [&](uint kt, half4 q0, half4 q1) {
-            // Stage transposed W [k, n] into sm_b[sg][16][16] so simdgroup_load reads B directly.
-            threadgroup half* sb = sm_b[sg];
+            threadgroup half* sb = sm_b[sg].h;
             uint n0 = uint(home.y), n1 = n0 + 8u, k0 = uint(home.x);
             sb[(k0 + 0u) * 16u + n0] = q0.x; sb[(k0 + 1u) * 16u + n0] = q0.y;
             sb[(k0 + 2u) * 16u + n0] = q0.z; sb[(k0 + 3u) * 16u + n0] = q0.w;
@@ -196,9 +362,9 @@ kernel void tfq3_prefill_tp_impl(
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
             simdgroup_half8x8 B00, B01, B10, B11;
-            simdgroup_load(B00, sb,              16u);
-            simdgroup_load(B01, sb + 8u,         16u);
-            simdgroup_load(B10, sb + 8u * 16u,   16u);
+            simdgroup_load(B00, sb,                 16u);
+            simdgroup_load(B01, sb + 8u,            16u);
+            simdgroup_load(B10, sb + 8u * 16u,      16u);
             simdgroup_load(B11, sb + 8u * 16u + 8u, 16u);
 
             uint kc = kt * 16u;
@@ -221,20 +387,14 @@ kernel void tfq3_prefill_tp_impl(
             for (uint h = 0u; h < 2u; ++h) {
                 uint4 v = p[h * 32u + lane];
                 uint uv[4] = {v.x, v.y, v.z, v.w};
-                TF_UNROLL for (uint j = 0u; j < 4u; ++j) {
-                    pw_v3_q8_4b(st, uv[j], T, q0, q1);
-                    mma_16x16(h * 4u + j, q0, q1);
-                }
+                TF_UNROLL for (uint j = 0u; j < 4u; ++j) { pw_v3_q8_4b(st, uv[j], T, q0, q1); mma_16x16(h * 4u + j, q0, q1); }
             }
         } else if constexpr (BITS == 3u) {
             for (uint h = 0u; h < 2u; ++h) {
                 const device uint* p = w_s + (ulong(bc) * 6ul + h * 3ul) * 32ul + lane;
                 uint a0 = p[0], a1 = p[32], a2 = p[64];
                 uint mv[4] = {a0 >> 8, ((a0 << 16) | (a1 >> 16)) & 0xFFFFFFu, ((a1 << 8) | (a2 >> 24)) & 0xFFFFFFu, a2 & 0xFFFFFFu};
-                TF_UNROLL for (uint j = 0u; j < 4u; ++j) {
-                    pw_v3_q8_3b(st, mv[j], T, q0, q1);
-                    mma_16x16(h * 4u + j, q0, q1);
-                }
+                TF_UNROLL for (uint j = 0u; j < 4u; ++j) { pw_v3_q8_3b(st, mv[j], T, q0, q1); mma_16x16(h * 4u + j, q0, q1); }
             }
         } else {
             for (uint h = 0u; h < 2u; ++h) {
@@ -242,46 +402,26 @@ kernel void tfq3_prefill_tp_impl(
                 uint w0 = p[0], w1 = p[32], w2 = p[64], w3 = p[96], w4 = p[128];
                 uint hv[4] = {w0 >> 24, (w1 >> 16) & 255u, (w2 >> 8) & 255u, w3 & 255u};
                 uint lv[4] = {(w0 << 8) | (w1 >> 24), (w1 << 16) | (w2 >> 16), (w2 << 24) | (w3 >> 8), w4};
-                TF_UNROLL for (uint j = 0u; j < 4u; ++j) {
-                    pw_v3_q8_5b(st, hv[j], lv[j], T, q0, q1);
-                    mma_16x16(h * 4u + j, q0, q1);
-                }
+                TF_UNROLL for (uint j = 0u; j < 4u; ++j) { pw_v3_q8_5b(st, hv[j], lv[j], T, q0, q1); mma_16x16(h * 4u + j, q0, q1); }
             }
         }
 
-        // Accumulate scaled block result via sm_out scratch per-tile (exact float32).
         float fsv = float(sc0[bc]);
-        simdgroup_float8x8 sc_mat = simdgroup_float8x8(fsv);
-        TF_UNROLL for (int m = 0; m < 4; ++m) {
-            TF_UNROLL for (int n = 0; n < 2; ++n) {
-                // Elementwise scale via store/load on 8x8 tile in sm_out.
-                threadgroup float* tile = sm_out + (m * 8u) * 128u + uint(sg) * 16u + n * 8u;
-                simdgroup_store(blk_acc[m][n], tile, 128u);
+        uint r_l = lane >> 2, c4 = (lane & 3u) << 2;
+        threadgroup float* sf = sm_b[sg].f;
+        TF_UNROLL for (uint m = 0u; m < 4u; ++m) {
+            if (m * 8u < nb) {
+                simdgroup_store(blk_acc[m][0], sf,      16u);
+                simdgroup_store(blk_acc[m][1], sf + 8u, 16u);
                 simdgroup_barrier(mem_flags::mem_threadgroup);
-                // First bc writes directly; subsequent bc add into acc via sm_out.
-                if (bc == P.bc0) {
-                    uint r = lane >> 2, c = (lane & 3u) * 2u;
-                    tile[r * 128u + c] *= fsv; tile[r * 128u + c + 1u] *= fsv;
-                } else {
-                    // Store previous acc, accumulate in float32, reload.
-                    uint r = lane >> 2, c = (lane & 3u) * 2u;
-                    float v0 = tile[r * 128u + c] * fsv, v1 = tile[r * 128u + c + 1u] * fsv;
-                    simdgroup_store(acc[m][n], tile, 128u);
-                    simdgroup_barrier(mem_flags::mem_threadgroup);
-                    tile[r * 128u + c] += v0; tile[r * 128u + c + 1u] += v1;
-                }
+                threadgroup float4* dst = reinterpret_cast<threadgroup float4*>(sm_out + (m * 8u + r_l) * 128u + uint(sg) * 16u + c4);
+                float4 add = *reinterpret_cast<const threadgroup float4*>(sf + r_l * 16u + c4);
+                *dst = fma(add, fsv, *dst);
                 simdgroup_barrier(mem_flags::mem_threadgroup);
-                simdgroup_load(acc[m][n], tile, 128u);
-                (void)sc_mat;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-
-    TF_UNROLL for (int m = 0; m < 4; ++m)
-        TF_UNROLL for (int n = 0; n < 2; ++n)
-            simdgroup_store(acc[m][n], sm_out + (m * 8u) * 128u + uint(sg) * 16u + n * 8u, 128u);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint sr0 = r0 + P.row_off;
     for (uint m = uint(sg); m < nb; m += 8u) {
@@ -296,6 +436,9 @@ kernel void tfq3_prefill_tp_impl(
     }
 }
 
+template [[host_name("tfq3_sk8_tp_3b")]]     [[kernel]] decltype(tfq3_sk8_tp_impl<3u>)     tfq3_sk8_tp_impl<3u>;
+template [[host_name("tfq3_sk8_tp_4b")]]     [[kernel]] decltype(tfq3_sk8_tp_impl<4u>)     tfq3_sk8_tp_impl<4u>;
+template [[host_name("tfq3_sk8_tp_5b")]]     [[kernel]] decltype(tfq3_sk8_tp_impl<5u>)     tfq3_sk8_tp_impl<5u>;
 template [[host_name("tfq3_prefill_tp_3b")]] [[kernel]] decltype(tfq3_prefill_tp_impl<3u>) tfq3_prefill_tp_impl<3u>;
 template [[host_name("tfq3_prefill_tp_4b")]] [[kernel]] decltype(tfq3_prefill_tp_impl<4u>) tfq3_prefill_tp_impl<4u>;
 template [[host_name("tfq3_prefill_tp_5b")]] [[kernel]] decltype(tfq3_prefill_tp_impl<5u>) tfq3_prefill_tp_impl<5u>;

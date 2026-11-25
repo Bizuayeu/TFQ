@@ -12,9 +12,12 @@
 #include <vector>
 
 static constexpr uint32_t MAGIC_PWV3 = 0x33565750u;
+static constexpr uint32_t MAGIC_PWV4 = 0x34565750u;
 static constexpr uint32_t MAGIC_TFPN = 0x4E504654u;
 static constexpr uint32_t MAGIC_TFPW = 0x57504654u;
+static constexpr uint32_t MAGIC_TFP4 = 0x34504654u;
 static constexpr uint32_t FORMAT_VER = 3u;
+static constexpr uint32_t TFQ4_VER   = 4u;
 static constexpr uint64_t ALIGN_16K  = 16384ULL;
 
 struct TfpnHeader {
@@ -201,6 +204,60 @@ static bool inspect_tfpw(const std::string& path) {
     return true;
 }
 
+static bool inspect_pwv4(const std::string& path) {
+    uint64_t sz = file_size(path);
+    if (sz != 16384ULL) { fprintf(stderr, "FAIL %s: expected 16384 bytes (%llu)\n", path.c_str(), (unsigned long long)sz); return false; }
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
+    uint32_t hdr[4];
+    bool ok = (fread(hdr, 4, 4, f) == 4);
+    fclose(f);
+    if (!ok || hdr[0] != MAGIC_PWV4 || hdr[1] != TFQ4_VER || hdr[2] != 256u || hdr[3] != 8u) {
+        fprintf(stderr, "FAIL %s: bad PWV4 header\n", path.c_str()); return false;
+    }
+    printf("OK   %-42s PWV4 v%u | 16384 bytes | E8P %ux%uD (4 KiB LUT)\n", path.c_str(), hdr[1], hdr[2], hdr[3]);
+    return true;
+}
+
+static bool inspect_tfp4(const std::string& path, bool verbose) {
+    uint64_t sz = file_size(path);
+    if (sz < sizeof(TfpnHeader)) { fprintf(stderr, "FAIL %s: too small\n", path.c_str()); return false; }
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
+    TfpnHeader h{};
+    if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return false; }
+    if (h.magic != MAGIC_TFP4 || h.version != TFQ4_VER || (h.off_scales % ALIGN_16K) != 0 || (h.off_weights % ALIGN_16K) != 0) {
+        fclose(f); fprintf(stderr, "FAIL %s: bad TFP4 header or alignment\n", path.c_str()); return false;
+    }
+    std::vector<TfpnTensorMeta> metas(h.num_tensors);
+    fseek(f, (long)h.off_meta, SEEK_SET);
+    if (h.num_tensors > 0 && fread(metas.data(), sizeof(TfpnTensorMeta), h.num_tensors, f) != h.num_tensors) {
+        fclose(f); return false;
+    }
+    fclose(f);
+    uint64_t params_total = 0; double snr_sum = 0.0;
+    for (const auto& m : metas) {
+        uint64_t exp_w = (uint64_t)m.R * (m.C / 16u), exp_s = (uint64_t)(m.R / 128u) * (m.C / 128u);
+        if (m.b_bits != 2u || m.R == 0 || m.C == 0 || (m.R % 128u) || (m.C % 128u) || m.word_count != exp_w ||
+            m.word_off + m.word_count > h.total_weight_words || (uint64_t)m.sc_off + exp_s > h.total_scale_halfs) {
+            fprintf(stderr, "FAIL %s: invalid TFP4 tensor %.80s\n", path.c_str(), m.name); return false;
+        }
+        params_total += (uint64_t)m.R * m.C; snr_sum += m.snr_db;
+        if (verbose) {
+            uint32_t orig_r = m.pad[0] ? m.pad[0] : m.R, orig_c = m.pad[1] ? m.pad[1] : m.C;
+            if (orig_r != m.R || orig_c != m.C)
+                printf("  %-52.80s [%6u, %5u] (pad %ux%u) 2b-E8P SNR=%5.2f dB\n", m.name, orig_r, orig_c, m.R, m.C, m.snr_db);
+            else
+                printf("  %-52.80s [%6u, %5u] 2b-E8P SNR=%5.2f dB\n", m.name, m.R, m.C, m.snr_db);
+        }
+    }
+    double bpw = params_total ? (double)(h.total_weight_words * 32ULL + h.total_scale_halfs * 16ULL) / (double)params_total : 0.0;
+    printf("OK   %-42s TFP4 v%u | %3u tensors | %6.3f GiB | %.3f bpw | E8P-2b:%zu(%.2fdB)\n",
+           path.c_str(), h.version, h.num_tensors, (double)sz / (double)(1ULL << 30), bpw,
+           metas.size(), metas.empty() ? 0.0 : snr_sum / metas.size());
+    return true;
+}
+
 static bool inspect_file(const std::string& path, bool verbose) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "FAIL %s: cannot open\n", path.c_str()); return false; }
@@ -209,8 +266,10 @@ static bool inspect_file(const std::string& path, bool verbose) {
     fclose(f);
     if (n != 1) { fprintf(stderr, "FAIL %s: empty file\n", path.c_str()); return false; }
     if (magic == MAGIC_PWV3) return inspect_tables(path);
+    if (magic == MAGIC_PWV4) return inspect_pwv4(path);
     if (magic == MAGIC_TFPN) return inspect_tfpn(path, verbose);
     if (magic == MAGIC_TFPW) return inspect_tfpw(path);
+    if (magic == MAGIC_TFP4) return inspect_tfp4(path, verbose);
     fprintf(stderr, "FAIL %s: unknown magic 0x%08x\n", path.c_str(), magic);
     return false;
 }
@@ -236,7 +295,8 @@ int main(int argc, char** argv) {
             std::vector<std::string> files;
             while (auto* ent = readdir(d)) {
                 std::string nm = ent->d_name;
-                if (nm == "pw_v3_tables.bin" || (nm.size() > 6 && nm.substr(nm.size() - 6) == ".tffpw")) {
+                if (nm == "pw_v3_tables.bin" || nm == "pw_v4_e8p_tables.bin" ||
+                    (nm.size() > 6 && (nm.substr(nm.size() - 6) == ".tffpw" || nm.substr(nm.size() - 6) == ".tffp4"))) {
                     files.push_back(t + "/" + nm);
                 }
             }

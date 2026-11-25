@@ -27,15 +27,33 @@ Reproduce via [`reference/tfq4_lattice.py`](../reference/tfq4_lattice.py) (measu
 
 Notice that `2D FWHT-128` produces virtually identical SNR on synthetic Gaussian (`10.20 dB`), real Qwen2.5 (`10.21 dB`), and real Llama-3.1 (`10.20 dB`), and **TFQ4-E8P at `2.00 bpw` gains `+3.46 dB` SNR over 2-bit affine while being 20% smaller**.
 
-## 3. Measured NVIDIA GB10 (`sm_121`) GPU Decode Throughput
+## 3. Measured GPU Decode Throughput (Apple M5 Max Metal & NVIDIA GB10 CUDA)
 
-Standalone CUDA benchmark [`src/tools/tfq4_e8_bench.cu`](../src/tools/tfq4_e8_bench.cu) (`fp64` parity **`cos = 1.00000000`**):
+- **Apple Silicon Metal** ([`src/kernels/metal/tfq4_metal.metal`](../src/kernels/metal/tfq4_metal.metal), `make test-tfq4-metal`, `fp64` parity **`cos = 0.99999998`**, **bit-exact `rows=1 == rows=16`**):
+
+| Projection Shape | Bit Rate | Footprint | `rows=1` Latency | `rows=1` BW | `rows=16` Latency |
+|---|---:|---:|---:|---:|---:|
+| `Qwen27 gate+up [34816 × 5120]` | 2.001 bpw | 42.5 MiB | **0.124 ms** | **359.9 GB/s** | 1.068 ms |
+| `Qwen27 down [5120 × 17408]` | 2.001 bpw | 21.3 MiB | **0.112 ms** | **198.5 GB/s** | 1.392 ms |
+| `MoE-8E gate+up [32768 × 4096]` | 2.001 bpw | 32.0 MiB | **0.086 ms** | **390.2 GB/s** | 0.757 ms |
+
+- **NVIDIA GB10 (`sm_121`) CUDA** ([`src/tools/tfq4_e8_bench.cu`](../src/tools/tfq4_e8_bench.cu), `fp64` parity **`cos = 1.00000000`**):
 
 | Projection Shape | Bit Rate | Footprint | Latency (`rows=1`) | Achieved Bandwidth |
 |---|---:|---:|---:|---:|
 | `MoE-8E gate+up [32768 × 4096]` | 2.00 bpw | 32.0 MiB | **0.119 ms** | **281.9 GB/s** |
 | `Qwen27 gate+up [34816 × 5120]` | 2.00 bpw | 42.5 MiB | **0.173 ms** | **258.0 GB/s** |
 | `Qwen27 down [5120 × 17408]` | 2.00 bpw | 21.3 MiB | **0.070 ms** | **318.9 GB/s** |
+
+## 3.5 Live Cross-Platform `TFP4` v4 Conversion (`tfq4-convert` / `tfq4-convert-cuda` / `tfq3 MODEL --bits 2`)
+
+Deterministic 16 KiB-aligned `pw_v4_e8p_tables.bin` (`PWV4 v4`) + `*.tffp4` (`TFP4 v4`) shards validated via `tfq3-inspect`:
+
+| Model | Flags | Backend | Tensors | TFQ4 Size | Rate | Mean SNR | Time |
+|---|---|---|---:|---:|---:|---:|---:|
+| **Qwen2.5-1.5B** (BF16) | `--bits 2 --quantize-embed` | Metal (M5 Max) | 197 | **0.360 GiB** | 2.001 bpw | **10.09 dB** | **2.4 s** |
+| **Qwen3.8-27B-DFlash2** | `--bits 2 --quantize-drafter` | Metal (M5 Max) | 47 | **0.419 GiB** | 2.001 bpw | **10.07 dB** | **2.8 s** |
+| **Qwen3.8-27B-DFlash2** | `--bits 2 --quantize-drafter` | CUDA (GB10) | 47 | **0.419 GiB** | 2.001 bpw | **10.07 dB** *(exact parity)* | **6.2 s** |
 
 ## 4. Projected MoE Memory Footprints (Hot TFQ3 4b/3b + Cold TFQ4-E8P 2.0b)
 

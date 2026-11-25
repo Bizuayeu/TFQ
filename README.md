@@ -40,9 +40,10 @@ tfq3 meta-llama/Llama-3.1-8B-Instruct --target-gib 5.0
 # Auto-fit to this machine's available GPU memory (mixed 3b/4b/5b sensitivity planner)
 tfq3 /path/to/any-safetensors-model --fit auto
 
-# Quantize vision encoders, speculative drafters, or token embeddings to pure TFQ3
+# Quantize vision encoders, speculative drafters, or token embeddings (3/4/5-bit TFQ3 or 2.0 bpw TFQ4-E8P)
 tfq3 /path/to/Qwen3.8-27B-DFlash2 --quantize-drafter --bits 4
 tfq3 /path/to/Qwen2.5-1.5B --target-gib 0.65 --quantize-embed
+tfq3 /path/to/Qwen2.5-1.5B --bits 2 --quantize-embed   # 2.001 bpw TFQ4-E8P -> 0.360 GiB in 2.4 s!
 
 # Or directly from TensorFold (auto-pulls if needed; falls back to built-in zero-install Zig encoder if tfq3 isn't installed):
 tensorfold tfq3 Qwen/Qwen3.8-27B
@@ -103,9 +104,10 @@ git clone https://github.com/ashhart/TFQ.git
 cd TFQ
 
 # macOS (Apple Silicon Metal):
-make install      # builds Metal GPU converters + metallibs and installs `tfq3` into ~/.local/bin
-make test         # runs Python mathematical reference self-test
-make test-metal   # fp64 Metal parity (3b/4b/5b BM=32 simdgroup_matrix prefill + Col-TP/Row-TP=4) + bench
+make install           # builds Metal GPU converters (TFQ3 + TFQ4) + metallibs and installs `tfq3` into ~/.local/bin
+make test              # runs Python mathematical reference self-test
+make test-metal        # fp64 Metal parity (3b/4b/5b bit-exact sk8 r1==r16 + BM=32 prefill + Col-TP/Row-TP=4) + bench
+make test-tfq4-metal   # fp64 Metal parity (2.001 bpw 8D E8P, bit-exact r1==r16, 359.9 GB/s on M5 Max) + bench
 
 # Linux (NVIDIA CUDA — pass CUDA_ARCH=sm_80 / sm_86 / sm_89 / sm_90 / sm_100 / sm_121):
 make install CUDA_ARCH=sm_121
@@ -117,15 +119,16 @@ make hip && make test-hip         # requires hipcc + ROCm GPU (syntax-verified o
 
 Built artifacts in `build/`:
 - `tfq3-generic-convert` (Metal) / `tfq3-generic-convert-cuda` (CUDA) — Model-agnostic Safetensors converter (BF16/F16/F32/FP8/MLX-Q8, arbitrary padded `[R, C]`, `--target-gib`, `--fit auto`, `--quantize-vision`/`--quantize-drafter`/`--quantize-embed`)
+- `tfq4-convert` (Metal) / `tfq4-convert-cuda` (CUDA) — Cross-platform `2.001 bpw` 8D `E8P` converter (`PWV4`/`TFP4` v4, invoked via `tfq3 MODEL --bits 2`)
 - `tfq3-qwen27-convert` (Metal) / `tfq3-qwen27-convert-cuda` (CUDA) & `tfq3-qwen27-package` — Dedicated `Qwen3.8-27B` converter
 - `tfq3-flashnext-convert` (Metal) / `tfq3-flashnext-convert-cuda` (CUDA) — `Qwen3.8-Flash-Next` 512-expert MoE + PLE converter
 - `tfq3-glm-convert` (Metal) / `tfq3-glm-convert-cuda` (CUDA) — `GLM-5.3-Flash` 288-expert MoE + Non-MoE converter
-- `tfq3-metal-test` / `tfq3-cuda-test` / `tfq3-hip-test` — Standalone `fp64` parity tests & prefill/TP throughput benchmarks
-- `tfq3-inspect` — Cross-platform validator and inspector for `pw_v3_tables.bin`, `TFPN` (including padded dimensions), and `TFPW` shards
+- `tfq3-metal-test` / `tfq4-metal-test` / `tfq3-cuda-test` / `tfq3-hip-test` — Standalone `fp64` parity tests & decode/prefill/TP throughput benchmarks
+- `tfq3-inspect` — Cross-platform validator and inspector for `PWV3`/`PWV4` tables and `TFPN`, `TFPW`, and `TFP4` shards
 
 Reusable standalone inference kernel libraries:
-- **NVIDIA CUDA** ([`src/kernels/cuda/tfq3_cuda.cuh`](src/kernels/cuda/tfq3_cuda.cuh)): 2D FWHT-128, direct PTX `m16n8k16` split-K=8 & fused dense kernels bit-exact across `rows = 1..64`, `BM=64, BN=128` Tensor Core long-context prefill (`24.7–29.0 TFLOP/s` on GB10), zero-repack `Col-TP` & `Row-TP`, fused mixed-bit 3b/4b/5b MoE, and BF16 residual kernels.
-- **Apple Silicon Metal** ([`src/kernels/metal/tfq3_metal.metal`](src/kernels/metal/tfq3_metal.metal)): standalone `simdgroup_matrix` `BM=32, BN=128` prefill (`12.01 TFLOP/s` on M5 Max) and zero-repack `Col-TP` / `Row-TP`.
+- **NVIDIA CUDA** ([`src/kernels/cuda/tfq3_cuda.cuh`](src/kernels/cuda/tfq3_cuda.cuh)): 2D FWHT-128, direct PTX `m16n8k16` split-K=8 & fused dense kernels bit-exact across `rows = 1..32`, `BM=64, BN=128` Tensor Core long-context prefill (`24.7–29.0 TFLOP/s` microbench; `1.73×` live `p3989` prefill speedup on GB10), zero-repack `Col-TP` & `Row-TP`, fused mixed-bit 3b/4b/5b MoE, and BF16 residual kernels.
+- **Apple Silicon Metal** ([`src/kernels/metal/tfq3_metal.metal`](src/kernels/metal/tfq3_metal.metal) & [`src/kernels/metal/tfq4_metal.metal`](src/kernels/metal/tfq4_metal.metal)): standalone bit-exact split-K=8 `simdgroup_matrix` decode/verify (`r1==r16`, up to `246.9 GB/s`), `BM=32, BN=128` prefill (`13.77 TFLOP/s` on M5 Max), zero-repack `Col-TP`/`Row-TP`, and `2.001 bpw` `TFQ4-E8P` (`359.9 GB/s` on M5 Max).
 - **AMD ROCm / HIP** ([`src/kernels/hip/tfq3_hip.h`](src/kernels/hip/tfq3_hip.h)): portable wave32/wave64 (`width=32` shuffles) dense, zero-repack `Col-TP`/`Row-TP`, and fused mixed-bit MoE kernels.
 
 ---

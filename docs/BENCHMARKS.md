@@ -103,12 +103,16 @@ All speculative decoding measurements below were verified **100% bit-exact** (`-
 
 ### NVIDIA CUDA (NVIDIA GB10, SM 12.1, Direct PTX `m16n8k16` Split-K=8)
 
-- **Live `Qwen3.8-27B-TFQ3` (`tensorfold-native serve`, greedy `temp=0`, 256 completion tokens):**
+- **Live `Qwen3.8-27B-TFQ3` (`tensorfold-native serve`, greedy `temp=0`, `BM=16` vs. `BM=64` prefill on GB10):**
 
-| Prompt Mode | `--no-drafts` | **+ DFlash2** | **+ DSpine** | Bit-Exact (`nodraft == DFlash2 == DSpine`) |
-|---|---:|---:|---:|---|
-| Coding (`thinking=False`) | 15.1 tok/s | **52.5 tok/s** (**3.48×**, 4.65 tok/round) | **56.6 tok/s** (**3.75×**, 5.12 tok/round) | **100% bit-exact** (`sha=738f62e12436`) |
-| Reasoning (`thinking=True`) | 15.1 tok/s | **43.8 tok/s** (**2.90×**, 3.94 tok/round) | **45.6 tok/s** (**3.02×**, 4.34 tok/round) | **100% bit-exact** (`sha=1454fc526024`) |
+| Kernel / Drafter | Cold `p3989` Prefill | Decode (`128 tok`) | Greedy Parity (`BM16 == BM64 == DFlash2 == DSpine`) |
+|---|---:|---:|---|
+| `BM=16` baseline (`--no-drafts`) | 341.8 tok/s (`11.67 s`) | 14.9 tok/s | `sha=d4942ce0f4b2` |
+| **`BM=64` Tensor Core (`--no-drafts`)** | **590.8 tok/s (`6.75 s`, 1.73×)** | **15.0 tok/s** | **100% bit-exact** (`sha=d4942ce0f4b2`) |
+| **`BM=64` + `DFlash2`** | — | **52.5 tok/s (`3.50×`)** | **100% bit-exact** (`sha=d4942ce0f4b2`) |
+| **`BM=64` + `DSpine`** | — | **59.6 tok/s (`3.97×`)** | **100% bit-exact** (`sha=d4942ce0f4b2`) |
+
+*(256-token reasoning/coding prompt suite also verified bit-exact: `coding`: `15.1 → 52.5 / 56.6 tok/s`; `reasoning`: `15.1 → 43.8 / 45.6 tok/s`.)*
 
 - **Real-Shard CUDA Parity & Drafter Verification (`GLM-5.3-Flash` & `Qwen3.8-Flash-Next`):**
   - **GLM-5.3-Flash** (`nonmoe.tffpw` 4b/5b `sk8` + `fused`, `layer_03.tffpw` 288-expert 3b/4b/5b MoE `top_k=8`): `cos = 0.999997–1.000000` vs `fp64`, bit-exact `rows=1 == rows=16` (`0` diffs), `215–244 GB/s` dense; live `GLM-5.3-Flash-DFlash2` (`bits=4` and BF16) verified end-to-end with shared TFQ3 `DraftHead`.
@@ -143,21 +147,24 @@ Verified via `make test-cuda CUDA_ARCH=sm_121`: `PASS` across 3b/4b/5b `prefill6
 | `gate+up` | `[34816 × 5120]` | 256 | 3.426 ms | **26.64 TFLOP/s** |
 | `down` | `[5120 × 17408]` | 1024 | 7.388 ms | **24.71 TFLOP/s** |
 
-### Apple M5 Max (`BM=32, BN=128` Standalone Metal `simdgroup_matrix` Prefill + Zero-Repack TP)
-Verified via `make test-metal` (`src/kernels/metal/tfq3_metal.metal`): `PASS` across 3b/4b/5b `prefill32` vs `fp64` and bit-exact `Col-TP = 4` & `Row-TP = 4`:
+### Apple M5 Max (`sk8` Decode/Verify + `BM=32` `simdgroup_matrix` Prefill + Zero-Repack TP)
+Verified via `make test-metal` (`src/kernels/metal/tfq3_metal.metal`): `PASS` across 3b/4b/5b bit-exact `rows=1 == rows=16` `sk8` decode/verify + `prefill32` vs `fp64` + bit-exact `Col-TP = 4` & `Row-TP = 4`:
 
-| Projection | Shape `[N × K]` | `rows` | Throughput |
-|---|---|---:|---:|
-| `gate+up` | `[34816 × 5120]` | 512 | **12.01 TFLOP/s** |
-| `qkv` | `[10240 × 5120]` | 512 | **11.43 TFLOP/s** |
-| `down` | `[5120 × 17408]` | 512 | **11.32 TFLOP/s** |
+| Projection | Shape `[N × K]` | `rows=1` (`sk8`) | `rows=16` (`sk8`, bit-exact) | `rows=512` (`BM=32` prefill) |
+|---|---|---:|---:|---:|
+| `gate+up` | `[34816 × 5120]` | 0.526 ms (`169.6 GB/s`) | **0.518 ms (`172.1 GB/s`, 11.01 TFLOP/s)** | **13.77 TFLOP/s** (13.25 ms) |
+| `down` | `[5120 × 17408]` | **0.181 ms (`246.9 GB/s`)** | **0.273 ms (`163.2 GB/s`, 10.44 TFLOP/s)** | **13.18 TFLOP/s** (6.93 ms) |
+| `qkv` | `[10240 × 5120]` | **0.110 ms (`239.0 GB/s`)** | **0.162 ms (`161.4 GB/s`, 10.33 TFLOP/s)** | **13.67 TFLOP/s** (3.93 ms) |
 
 *(AMD ROCm/HIP portable kernels live in `src/kernels/hip/tfq3_hip.h` with explicit `width=32` wave32/wave64 shuffles and pass strict `clang++ -Wall -Wextra` syntax/type checks; hardware benchmarks on AMD GPUs are pending.)*
 
 ---
 
-## 8. Sub-3-Bit Research Prototype (`TFQ4-E8P`, `2.0–2.25 bpw`)
+## 8. Cross-Platform Sub-3-Bit (`TFQ4-E8P`, `2.001 bpw`, `PWV4`/`TFP4` v4)
 
-See [`docs/TFQ4_SUB3BIT.md`](TFQ4_SUB3BIT.md) for full details (`reference/tfq4_lattice.py` & `src/tools/tfq4_e8_bench.cu`):
-- **Quality on real BF16 LLM weights (`Qwen2.5-1.5B`, `Llama-3.1-8B`):** `TFQ4-E8P (2.00 bpw, 4 KiB LUT)` achieves **`10.20–10.21 dB` SNR** (`+3.46 dB` above uniform 2-bit affine at 20% smaller size); `2.25 bpw (16 KiB LUT)` achieves **`11.64–11.65 dB`**.
+See [`docs/TFQ4_SUB3BIT.md`](TFQ4_SUB3BIT.md) for full details (`tfq4-convert`, `tfq4-convert-cuda`, `tfq4-metal-test`, `tfq4_e8_bench.cu`, `reference/tfq4_lattice.py`):
+- **Real GPU conversions (`tfq3 MODEL --bits 2`, validated with `tfq3-inspect`):**
+  - `Qwen2.5-1.5B` (197 tensors incl. `embed_tokens`, Metal M5 Max): **`0.360 GiB`** (`2.001 bpw`, **`10.09 dB`** mean SNR) in **`2.4 s`**.
+  - `Qwen3.8-27B-DFlash2` (47 tensors): **`0.419 GiB`** (`2.001 bpw`, **`10.07 dB`**) in **`2.8 s`** (Metal M5 Max) and **`6.2 s`** (CUDA GB10 — exact cross-platform parity).
+- **Apple M5 Max Metal decode (`make test-tfq4-metal`, `cos = 0.99999998`, bit-exact `r1==r16`):** **`359.9 GB/s`** (`0.124 ms`, `Qwen27 gate+up`), **`198.5 GB/s`** (`0.112 ms`, `Qwen27 down`).
 - **NVIDIA GB10 CUDA decode (`fp64` parity `cos = 1.00000000`):** **`281.9 GB/s`** (`0.119 ms`, `MoE-8E gate+up`), **`258.0 GB/s`** (`0.173 ms`, `Qwen27 gate+up`), **`318.9 GB/s`** (`0.070 ms`, `Qwen27 down`).
