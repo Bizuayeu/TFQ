@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/tfq3-header.png" alt="TensorFold TFQ3 — 3 · 4 · 5-Bit Vector Quantization for Metal and CUDA" width="100%">
+</p>
+
 # TFQ — TensorFold Native Quantization (`TFQ3`)
 
 **Cross-Platform: Apple Silicon (Metal) & NVIDIA GPUs (CUDA `sm_80+`)**
