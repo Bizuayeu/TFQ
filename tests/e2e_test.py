@@ -328,6 +328,56 @@ def test_gpu_roundtrips(tfq3_cli: str, inspect_bin: str, model_dir: str, refs: d
     )
 
 
+def test_moe_datafree_ranking(tmp: str) -> None:
+    """Compile & run a C++17 unit test for src/converters/moe_heat_rank.hpp proving non-iota sensitivity ranking."""
+    cxx = "clang++" if platform.system() == "Darwin" else "g++"
+    src = os.path.join(tmp, "test_moe_rank.cpp")
+    exe = os.path.join(tmp, "test_moe_rank")
+    hdr = os.path.join(REPO_ROOT, "src", "converters", "moe_heat_rank.hpp")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(
+            f'#include "{hdr}"\n'
+            '#include <cassert>\n'
+            '#include <cstdio>\n'
+            '#include <map>\n'
+            'struct FakeCache {\n'
+            '    std::map<std::string, std::vector<uint8_t>> m;\n'
+            '    bool has_tensor(const std::string& k) const { return m.count(k) > 0; }\n'
+            '    const uint8_t* get_tensor(const std::string& k, size_t* n = nullptr) {\n'
+            '        const auto& v = m.at(k); if (n) *n = v.size(); return v.data();\n'
+            '    }\n'
+            '};\n'
+            'int main() {\n'
+            '    FakeCache c;\n'
+            '    const int E = 8, H = 4;\n'
+            '    std::vector<float> router(E * H, 0.1f);\n'
+            '    // Make expert 6 have largest router norm, expert 3 second largest\n'
+            '    for (int j = 0; j < H; ++j) { router[6 * H + j] = 5.0f; router[3 * H + j] = 2.5f; }\n'
+            '    auto& rv = c.m["model.language_model.layers.3.mlp.gate.weight"];\n'
+            '    rv.resize(router.size() * 4); std::memcpy(rv.data(), router.data(), rv.size());\n'
+            '    const char* projs[3] = {"gate_proj", "up_proj", "down_proj"};\n'
+            '    for (int e = 0; e < E; ++e) {\n'
+            '        float s = (e == 6) ? 4.0f : (e == 3 ? 2.0f : 0.2f);\n'
+            '        for (int p = 0; p < 3; ++p) {\n'
+            '            char nm[256];\n'
+            '            std::snprintf(nm, sizeof(nm), "model.language_model.layers.3.mlp.experts.%d.%s.weight_scale_inv", e, projs[p]);\n'
+            '            std::vector<float> sv(16, s);\n'
+            '            auto& dst = c.m[nm]; dst.resize(sv.size() * 4); std::memcpy(dst.data(), sv.data(), dst.size());\n'
+            '        }\n'
+            '    }\n'
+            '    bool used_router = false;\n'
+            '    auto ranks = tfq_moe::rank_glm_experts_datafree(c, 3, E, H, &used_router);\n'
+            '    assert(used_router);\n'
+            '    assert(ranks[6] == 0 && ranks[3] == 1);\n'
+            '    std::printf("PASS data-free MoE router+weight ranker (ranks[6]=%d, ranks[3]=%d)\\n", ranks[6], ranks[3]);\n'
+            '    return 0;\n'
+            '}\n'
+        )
+    run([cxx, "-O2", "-std=c++17", "-Wall", "-Wextra", "-Werror", src, "-o", exe])
+    out = run([exe])
+    print(out.stdout.strip())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-gpu", action="store_true", help="Skip GPU converter round-trips (for headless CI runners)")
@@ -344,6 +394,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="tfq_e2e_") as tmp:
         model_dir = os.path.join(tmp, "synth_model")
         refs = write_synthetic_model(model_dir)
+        test_moe_datafree_ranking(tmp)
         test_inspector_negative_controls(inspect_bin, tmp)
         test_cli_basics(tfq3_cli, model_dir)
         if not args.no_gpu:

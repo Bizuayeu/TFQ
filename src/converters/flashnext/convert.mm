@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include "../moe_heat_rank.hpp"
 
 // ============================================================================
 // TensorFold TFQ3 (2D-AffineCoset/half4) FlashNext GPU Converter (Apple M5)
@@ -570,29 +571,6 @@ int main(int argc, char** argv) {
                 }
             }
             auto t_lyr = std::chrono::high_resolution_clock::now();
-            std::vector<int> ranks(N_EXP);
-            if (heat_ranks.count(lyr)) ranks = heat_ranks[lyr];
-            else std::iota(ranks.begin(), ranks.end(), 0);
-
-            std::vector<PrismExpertMeta> metas(N_EXP);
-            memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
-            uint64_t cur_word = 0; uint32_t cur_sc = 0;
-            for (int e = 0; e < N_EXP; ++e) {
-                int r = ranks[e];
-                uint32_t b = (r < n5) ? 5u : ((r < n5 + n4) ? 4u : 3u);
-                metas[e].b_bits = b; metas[e].heat_rank = (uint32_t)r;
-                uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;
-                metas[e].gate_word_off = cur_word; cur_word += wpm;
-                metas[e].up_word_off   = cur_word; cur_word += wpm;
-                metas[e].down_word_off = cur_word; cur_word += wpm;
-                metas[e].gate_sc_off = cur_sc; cur_sc += SC_PER_MAT;
-                metas[e].up_sc_off   = cur_sc; cur_sc += SC_PER_MAT;
-                metas[e].down_sc_off = cur_sc; cur_sc += SC_PER_MAT;
-            }
-            std::vector<uint16_t> all_scales(cur_sc);
-            std::vector<uint32_t> all_weights(cur_word);
-            double snr_sum[6] = {}; int snr_cnt[6] = {};
-
             // Lookup the 3 stacked tensors for this layer once
             const uint8_t* stacked_w[3] = {};
             const uint8_t* stacked_s[3] = {};
@@ -613,6 +591,40 @@ int main(int argc, char** argv) {
 
             const size_t exp_w_stride = MAX_ELEMS;
             const size_t exp_sb_stride = (MAX_ELEMS / 32) * 2;
+            std::vector<int> ranks(N_EXP);
+            bool used_trace = false, used_router = false;
+            if (heat_ranks.count(lyr)) {
+                ranks = heat_ranks[lyr];
+                used_trace = true;
+            } else {
+                ranks = tfq_moe::rank_flashnext_experts_datafree(cache, lyr, is_mtp, N_EXP, H, stacked_s, exp_sb_stride, &used_router);
+            }
+            if (lyr == layer_list.front()) {
+                printf("HeatAlloc: %s\n", used_trace
+                    ? ("TRACE-GUIDED (uses calibration routing counts from " + trace_path + ")").c_str()
+                    : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
+                                   : "DATA-FREE expert weight-scale sensitivity (no calibration data)"));
+                fflush(stdout);
+            }
+
+            std::vector<PrismExpertMeta> metas(N_EXP);
+            memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
+            uint64_t cur_word = 0; uint32_t cur_sc = 0;
+            for (int e = 0; e < N_EXP; ++e) {
+                int r = ranks[e];
+                uint32_t b = (r < n5) ? 5u : ((r < n5 + n4) ? 4u : 3u);
+                metas[e].b_bits = b; metas[e].heat_rank = (uint32_t)r;
+                uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;
+                metas[e].gate_word_off = cur_word; cur_word += wpm;
+                metas[e].up_word_off   = cur_word; cur_word += wpm;
+                metas[e].down_word_off = cur_word; cur_word += wpm;
+                metas[e].gate_sc_off = cur_sc; cur_sc += SC_PER_MAT;
+                metas[e].up_sc_off   = cur_sc; cur_sc += SC_PER_MAT;
+                metas[e].down_sc_off = cur_sc; cur_sc += SC_PER_MAT;
+            }
+            std::vector<uint16_t> all_scales(cur_sc);
+            std::vector<uint32_t> all_weights(cur_word);
+            double snr_sum[6] = {}; int snr_cnt[6] = {};
             for (int e = 0; e < N_EXP; ++e) {
                 uint32_t b = metas[e].b_bits;
                 uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;

@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include "../moe_heat_rank.hpp"
 
 // ============================================================================
 // TFF-PrismWave v3 (2D-AffineCoset/half4) Production GPU Converter (Apple M5)
@@ -694,8 +695,20 @@ int main(int argc, char** argv) {
             }
             auto t_lyr = std::chrono::high_resolution_clock::now();
             std::vector<int> ranks(N_EXP);
-            if (heat_ranks.count(lyr)) ranks = heat_ranks[lyr];
-            else std::iota(ranks.begin(), ranks.end(), 0);
+            bool used_trace = false, used_router = false;
+            if (heat_ranks.count(lyr)) {
+                ranks = heat_ranks[lyr];
+                used_trace = true;
+            } else {
+                ranks = tfq_moe::rank_glm_experts_datafree(cache, lyr, N_EXP, H, &used_router);
+            }
+            if (lyr == l_start) {
+                printf("HeatAlloc: %s\n", used_trace
+                    ? ("TRACE-GUIDED (uses calibration routing counts from " + trace_path + ")").c_str()
+                    : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
+                                   : "DATA-FREE expert weight-scale sensitivity (no calibration data)"));
+                fflush(stdout);
+            }
 
             std::vector<PrismExpertMeta> metas(N_EXP);
             memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));

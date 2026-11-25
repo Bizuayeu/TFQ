@@ -4,6 +4,7 @@
 //   - --mode nonmoe : 8-bit/64 non-MoE + shared + lm_head -> nonmoe.tffpw ("TFPN" v3)
 // ============================================================================
 #include "../cuda_encode_common.cuh"
+#include "../moe_heat_rank.hpp"
 
 static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_path) {
     std::map<int, std::vector<int>> counts;
@@ -234,16 +235,30 @@ int main(int argc, char** argv) {
         if (skip_existing) { struct stat cst{}; if (stat(out_path, &cst) == 0 && cst.st_size > 1000000000LL) continue; }
         auto t_lyr = std::chrono::steady_clock::now();
         std::vector<int> ranks(N_EXP);
-        if (heat_ranks.count(lyr)) ranks = heat_ranks[lyr]; else std::iota(ranks.begin(), ranks.end(), 0);
+        bool used_trace = false, used_router = false;
+        if (heat_ranks.count(lyr)) {
+            ranks = heat_ranks[lyr];
+            used_trace = true;
+        } else {
+            ranks = tfq_moe::rank_glm_experts_datafree(cache, lyr, N_EXP, H, &used_router);
+        }
+        if (lyr == l_start) {
+            printf("HeatAlloc: %s\n", used_trace
+                ? ("TRACE-GUIDED (uses calibration routing counts from " + trace_path + ")").c_str()
+                : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
+                               : "DATA-FREE expert weight-scale sensitivity (no calibration data)"));
+            fflush(stdout);
+        }
         std::vector<PrismExpertMeta> metas(N_EXP);
         memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
         uint64_t cur_word = 0; uint32_t cur_sc = 0;
         for (int e = 0; e < N_EXP; ++e) {
             int r = ranks[e];
             uint32_t b = 4u;
-            if (mode == "heat543") b = (r < 64) ? 5u : (r < 160 ? 4u : 3u);
-            else if (mode == "heat443") b = (r < 160) ? 4u : 3u;
-            else if (mode == "heat43")  b = (r < 96) ? 4u : 3u;
+            if (mode == "heat543")       b = (r < 64) ? 5u : (r < 160 ? 4u : 3u);
+            else if (mode == "heat443")  b = (r < 160) ? 4u : 3u;
+            else if (mode == "heat43")   b = (r < 96) ? 4u : 3u;
+            else if (mode == "uniform4") b = 4u;
             else if (mode == "uniform3") b = 3u;
             metas[e].b_bits = b; metas[e].heat_rank = (uint32_t)r;
             uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;

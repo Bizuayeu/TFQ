@@ -12,9 +12,11 @@ After TFQ3's exact `2D FWHT-128` tile rotation and single `fp16` tile scale (`12
 - **2.25 bpw tier (`16 KiB` LUT):** `1024 × 8` `fp16` magnitude codebook × `256` signs (`262,144` effective 8D codewords).
 - **100% data-free:** codebooks are trained once from synthetic $|\mathcal{N}(0, 1)^8|$ initialized on exact spherical $E_8 + \frac{1}{4}\mathbf{1}$ shells.
 
-## 2. Measured Quality on Real BF16 Transformer Weights
+## 2. Measured Quality on Real BF16 Transformer Weights `[MEASURED]`
 
-Reproduce via [`reference/tfq4_lattice.py`](../reference/tfq4_lattice.py) (measured on `1024 × 1024` tiles of real BF16 checkpoints vs. uniform affine baselines):
+Reproduce single-layer weight SNR via [`reference/tfq4_lattice.py`](../reference/tfq4_lattice.py) (measured on `1024 × 1024` tiles of real BF16 checkpoints vs. uniform affine baselines), and full-model 16,352-token WikiText-2 perplexity + activation output SNR via [`tools/bench_quantizers.py`](../tools/bench_quantizers.py) (see [`docs/BENCHMARKS.md`](BENCHMARKS.md)):
+
+> **Dense 2-bit caveat (`[MEASURED]`):** On a small dense 1.5B model (`Qwen/Qwen2.5-1.5B`, all 196 linear layers quantized to `2.001 bpw`), TFQ4-E8P stays coherent (`PPL 250.17` data-free / `210.09` with Hessian-LDLQ `+2.00 dB` Output SNR) where 2-bit RTN (`36,113`) and 2-bit GPTQ (`695,363`) collapse — but `2.0 bpw` is still severe for a dense 1.5B model and is designed for **cold MoE experts**, not tiny dense models.
 
 | Quantizer | Effective Rate | Synthetic Gaussian SNR | Qwen2.5-1.5B `L0.mlp.down` SNR | Llama-3.1-8B `L15.mlp.down` SNR | Output Cosine (`Y-cos`) |
 |---|---:|---:|---:|---:|---:|
@@ -27,7 +29,7 @@ Reproduce via [`reference/tfq4_lattice.py`](../reference/tfq4_lattice.py) (measu
 
 Notice that `2D FWHT-128` produces virtually identical SNR on synthetic Gaussian (`10.20 dB`), real Qwen2.5 (`10.21 dB`), and real Llama-3.1 (`10.20 dB`), and **TFQ4-E8P at `2.00 bpw` gains `+3.46 dB` SNR over 2-bit affine while being 20% smaller**.
 
-## 3. Measured GPU Decode Throughput (Apple M5 Max Metal & NVIDIA GB10 CUDA)
+## 3. Measured GPU Decode Throughput `[MEASURED]` (Apple M5 Max Metal & NVIDIA GB10 CUDA)
 
 - **Apple Silicon Metal** ([`src/kernels/metal/tfq4_metal.metal`](../src/kernels/metal/tfq4_metal.metal), `make test-tfq4-metal`, `fp64` parity **`cos = 0.99999998`**, **bit-exact `rows=1 == rows=16`**):
 
@@ -45,7 +47,7 @@ Notice that `2D FWHT-128` produces virtually identical SNR on synthetic Gaussian
 | `Qwen27 gate+up [34816 × 5120]` | 2.00 bpw | 42.5 MiB | **0.173 ms** | **258.0 GB/s** |
 | `Qwen27 down [5120 × 17408]` | 2.00 bpw | 21.3 MiB | **0.070 ms** | **318.9 GB/s** |
 
-## 3.5 Live Cross-Platform `TFP4` v4 Conversion (`tfq4-convert` / `tfq4-convert-cuda` / `tfq3 MODEL --bits 2`)
+## 3.5 Live Cross-Platform `TFP4` v4 Conversion `[MEASURED]` (`tfq4-convert` / `tfq4-convert-cuda` / `tfq3 MODEL --bits 2`)
 
 Deterministic 16 KiB-aligned `pw_v4_e8p_tables.bin` (`PWV4 v4`) + `*.tffp4` (`TFP4 v4`) shards validated via `tfq3-inspect`:
 
@@ -55,7 +57,9 @@ Deterministic 16 KiB-aligned `pw_v4_e8p_tables.bin` (`PWV4 v4`) + `*.tffp4` (`TF
 | **Qwen3.8-27B-DFlash2** | `--bits 2 --quantize-drafter` | Metal (M5 Max) | 47 | **0.419 GiB** | 2.001 bpw | **10.07 dB** | **2.8 s** |
 | **Qwen3.8-27B-DFlash2** | `--bits 2 --quantize-drafter` | CUDA (GB10) | 47 | **0.419 GiB** | 2.001 bpw | **10.07 dB** *(exact parity)* | **6.2 s** |
 
-## 4. Projected MoE Memory Footprints (Hot TFQ3 4b/3b + Cold TFQ4-E8P 2.0b)
+## 4. Projected MoE Memory Footprints `[PROJECTED / NOT VERIFIED]` (Hot TFQ3 4b/3b + Cold TFQ4-E8P 2.0b)
+
+> All rows in §4 are arithmetic footprint projections only; hybrid 2b/3b/4b MoE perplexity has not been measured yet.
 
 | Model | Schedule | Avg Expert Rate | Projected Total Size | Target Hardware Class |
 |---|---|---:|---:|---|

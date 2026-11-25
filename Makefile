@@ -68,7 +68,7 @@ $(BUILD)/tfq3-qwen27-convert.metallib: src/converters/qwen27/convert.metal | $(B
 	$(METALLIB) $(BUILD)/qwen27.air -o $@
 	@rm -f $(BUILD)/qwen27.air
 
-$(BUILD)/tfq3-flashnext-convert: src/converters/flashnext/convert.mm | $(BUILD)
+$(BUILD)/tfq3-flashnext-convert: src/converters/flashnext/convert.mm src/converters/moe_heat_rank.hpp | $(BUILD)
 	$(OBJCXX) $< -o $@
 
 $(BUILD)/tfq3-flashnext-convert.metallib: src/converters/flashnext/convert.metal | $(BUILD)
@@ -76,7 +76,7 @@ $(BUILD)/tfq3-flashnext-convert.metallib: src/converters/flashnext/convert.metal
 	$(METALLIB) $(BUILD)/flashnext.air -o $@
 	@rm -f $(BUILD)/flashnext.air
 
-$(BUILD)/tfq3-glm-convert: src/converters/glm/convert.mm | $(BUILD)
+$(BUILD)/tfq3-glm-convert: src/converters/glm/convert.mm src/converters/moe_heat_rank.hpp | $(BUILD)
 	$(OBJCXX) $< -o $@
 
 $(BUILD)/tfq3-glm-convert.metallib: src/converters/glm/convert.metal | $(BUILD)
@@ -118,10 +118,10 @@ $(BUILD)/tfq4-convert-cuda: src/converters/tfq4/convert.cu src/converters/tfq4/t
 $(BUILD)/tfq3-qwen27-convert-cuda: src/converters/qwen27/convert.cu src/converters/cuda_encode_common.cuh | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
-$(BUILD)/tfq3-flashnext-convert-cuda: src/converters/flashnext/convert.cu src/converters/cuda_encode_common.cuh | $(BUILD)
+$(BUILD)/tfq3-flashnext-convert-cuda: src/converters/flashnext/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
-$(BUILD)/tfq3-glm-convert-cuda: src/converters/glm/convert.cu src/converters/cuda_encode_common.cuh | $(BUILD)
+$(BUILD)/tfq3-glm-convert-cuda: src/converters/glm/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
 $(BUILD)/tfq3-cuda-test: src/tools/tfq3_cuda_bench.cu src/kernels/cuda/tfq3_cuda.cuh | $(BUILD)

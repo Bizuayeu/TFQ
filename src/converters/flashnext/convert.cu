@@ -5,6 +5,7 @@
 //   - --mode requant-ple : Fast CUDA GPU 8-bit/32 -> B-bit/32 PLE shard builder
 // ============================================================================
 #include "../cuda_encode_common.cuh"
+#include "../moe_heat_rank.hpp"
 
 static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_path, int n_exp) {
     std::map<int, std::vector<int>> counts;
@@ -204,9 +205,31 @@ int main(int argc, char** argv) {
             if (stat(out_path, &cst) == 0 && cst.st_size > 500000000LL) continue;
         }
         auto t_lyr = std::chrono::steady_clock::now();
+        const uint8_t *stacked_w[3], *stacked_s[3], *stacked_b[3];
+        for (int p = 0; p < 3; ++p) {
+            char base[256];
+            if (is_mtp) snprintf(base, sizeof(base), "language_model.mtp.layers.0.mlp.switch_mlp.%s", proj_names[p]);
+            else        snprintf(base, sizeof(base), "language_model.model.layers.%d.mlp.switch_mlp.%s", lyr, proj_names[p]);
+            stacked_w[p] = cache.get_tensor(std::string(base) + ".weight");
+            stacked_s[p] = cache.get_tensor(std::string(base) + ".scales");
+            stacked_b[p] = cache.get_tensor(std::string(base) + ".biases");
+        }
+        const size_t exp_sb = (MAX_ELEMS / 32) * 2;
         std::vector<int> ranks(N_EXP);
-        if (heat_ranks.count(lyr)) ranks = heat_ranks[lyr];
-        else std::iota(ranks.begin(), ranks.end(), 0);
+        bool used_trace = false, used_router = false;
+        if (heat_ranks.count(lyr)) {
+            ranks = heat_ranks[lyr];
+            used_trace = true;
+        } else {
+            ranks = tfq_moe::rank_flashnext_experts_datafree(cache, lyr, is_mtp, N_EXP, H, stacked_s, exp_sb, &used_router);
+        }
+        if (lyr == layer_list.front()) {
+            printf("HeatAlloc: %s\n", used_trace
+                ? ("TRACE-GUIDED (uses calibration routing counts from " + trace_path + ")").c_str()
+                : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
+                               : "DATA-FREE expert weight-scale sensitivity (no calibration data)"));
+            fflush(stdout);
+        }
 
         std::vector<PrismExpertMeta> metas(N_EXP);
         memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
@@ -225,16 +248,6 @@ int main(int argc, char** argv) {
         }
         std::vector<uint16_t> all_scales(cur_sc);
         std::vector<uint32_t> all_weights(cur_word);
-        const uint8_t *stacked_w[3], *stacked_s[3], *stacked_b[3];
-        for (int p = 0; p < 3; ++p) {
-            char base[256];
-            if (is_mtp) snprintf(base, sizeof(base), "language_model.mtp.layers.0.mlp.switch_mlp.%s", proj_names[p]);
-            else        snprintf(base, sizeof(base), "language_model.model.layers.%d.mlp.switch_mlp.%s", lyr, proj_names[p]);
-            stacked_w[p] = cache.get_tensor(std::string(base) + ".weight");
-            stacked_s[p] = cache.get_tensor(std::string(base) + ".scales");
-            stacked_b[p] = cache.get_tensor(std::string(base) + ".biases");
-        }
-        const size_t exp_sb = (MAX_ELEMS / 32) * 2;
         double snr_sum[6] = {}; int snr_cnt[6] = {};
         for (int e = 0; e < N_EXP; ++e) {
             uint32_t b = metas[e].b_bits;
