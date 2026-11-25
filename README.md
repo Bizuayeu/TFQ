@@ -2,7 +2,7 @@
 
 **Cross-Platform: Apple Silicon (Metal) & NVIDIA GPUs (CUDA `sm_80+`)**
 
-**TFQ3** is an open, **100% data-free (zero-calibration)** 3-, 4-, and 5-bit weight quantization format, **Apple Silicon Metal & NVIDIA CUDA** GPU converter suite, and standalone inference kernel library built for [TensorFold](https://github.com/ashhart/TensorFold).
+**TFQ3** (*TensorFold Quantization v3 — supports **3-, 4-, and 5-bit**, including mixed-bit per layer or per expert; the `3` is the format version, not 3-bit only*) is an open, **100% data-free (zero-calibration)** weight quantization format, **Apple Silicon Metal & NVIDIA CUDA** GPU converter suite, and standalone inference kernel library built for [TensorFold](https://github.com/ashhart/TensorFold).
 
 > **One Checkpoint, Both Platforms (Zero Re-Conversion):**
 > A TFQ3 checkpoint quantized on a Mac runs **byte-for-byte unmodified** on an NVIDIA CUDA GPU — and a checkpoint quantized on an NVIDIA GPU runs **byte-for-byte unmodified** on Apple Silicon Metal. Same `pw_v3_tables.bin`, same `.tffpw` shards, same residual `.safetensors`, and the same `DFlash2` / `DSpine` / `MTP` speculative drafters.
@@ -171,6 +171,7 @@ python3 reference/tfq3_reference.py --shard /path/to/qwen27_tfq3-00001-of-00004.
 
 ## FAQ
 
+- **Does `TFQ3` mean 3-bit only?** **No.** The `3` is **format version 3** (like `EXL3`). TFQ3 supports **3-bit, 4-bit, and 5-bit** — including mixed bit widths per layer or per expert in the same checkpoint (e.g., `TFQ3-4b` for `Qwen3.8-27B`, and mixed 3/4/5-bit `HeatAlloc` for `Qwen3.8-Flash-Next` and `GLM-5.3-Flash`).
 - **Does the exact same checkpoint work on both Mac (Metal) and NVIDIA (CUDA)?** **Yes.** TFQ3 uses one canonical little-endian binary format (`pw_v3_tables.bin` + `.tffpw` + `.safetensors`). You can quantize once on either platform and copy the directory directly to the other with zero conversion or repacking.
 - **Is calibration data used to quantize weights?** **No.** Every dense and MoE weight matrix is quantized 100% data-free (no WikiText/C4/RedPajama pass, no Hessians, no imatrix). The 2D FWHT-128 rotation Gaussianizes arbitrary weight matrices analytically, and the 16 KiB codebook (`pw_v3_tables.bin`) is generated once from a synthetic unit Gaussian prior.
 - **What about `HeatAlloc` on MoE models?** Optional. For MoE models with hundreds of experts (288–512), you can optionally pass `--trace` containing per-layer expert routing counts so hot experts receive 4- or 5-bit budgets while cold experts use 3-bit. Even with `HeatAlloc`, the weights themselves are still quantized 100% data-free. Dense models (`Qwen3.8-27B`) use zero data anywhere.
