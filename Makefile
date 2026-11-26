@@ -10,6 +10,8 @@ METALLIB  := xcrun -sdk macosx metallib
 NVCC      ?= $(shell command -v nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc)
 CUDA_ARCH ?= native
 NVCCFLAGS := -O3 -std=c++17 -arch=$(CUDA_ARCH) --use_fast_math
+NVCC_ENC_FLAGS := -O3 -std=c++17 -arch=$(CUDA_ARCH) --fmad=false --prec-div=true --prec-sqrt=true
+METAL_ENC_FLAGS := -fno-fast-math -fmetal-math-mode=safe -fmetal-math-fp32-functions=precise -ffp-contract=off -I src/converters
 HIPCC     ?= hipcc
 HIP_ARCH  ?= gfx1100
 HIPFLAGS  := -O3 -std=c++17 --offload-arch=$(HIP_ARCH)
@@ -29,7 +31,7 @@ endif
 $(BUILD):
 	@mkdir -p $(BUILD)
 
-tools: $(BUILD)/tfq3-inspect $(BUILD)/tfq3-qwen27-package
+tools: $(BUILD)/tfq3-inspect $(BUILD)/tfq3-qwen27-package $(BUILD)/tfq3-train-tables
 
 metal: generic qwen27 flashnext glm tfq4 $(BUILD)/tfq3-metal-test $(BUILD)/tfq3-metal-test.metallib $(BUILD)/tfq4-metal-test $(BUILD)/tfq4-metal-test.metallib
 
@@ -51,36 +53,41 @@ $(BUILD)/tfq3-inspect: src/tools/tfq3_inspect.cpp | $(BUILD)
 $(BUILD)/tfq3-qwen27-package: src/converters/qwen27/package.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
-# --- Apple Silicon Metal Targets ---
-$(BUILD)/tfq3-generic-convert: src/converters/generic/convert.mm src/converters/generic/planner.hpp | $(BUILD)
+$(BUILD)/tfq3-train-tables: src/tools/tfq3_train_tables.cpp src/converters/tfq_constants.hpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+# --- Apple Silicon Metal Targets (encoders use -fno-fast-math for cross-platform bit identity) ---
+METAL_ENC_HDRS := src/converters/tfq_constants.hpp src/converters/canonical_tables.hpp src/converters/tfq_tables_io.hpp
+
+$(BUILD)/tfq3-generic-convert: src/converters/generic/convert.mm src/converters/generic/planner.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(OBJCXX) $< -o $@
 
-$(BUILD)/tfq3-generic-convert.metallib: src/converters/generic/convert.metal | $(BUILD)
-	$(METAL) -c $< -o $(BUILD)/generic.air
+$(BUILD)/tfq3-generic-convert.metallib: src/converters/generic/convert.metal src/converters/metal_encode_common.metal | $(BUILD)
+	$(METAL) $(METAL_ENC_FLAGS) -c $< -o $(BUILD)/generic.air
 	$(METALLIB) $(BUILD)/generic.air -o $@
 	@rm -f $(BUILD)/generic.air
 
-$(BUILD)/tfq3-qwen27-convert: src/converters/qwen27/convert.mm | $(BUILD)
+$(BUILD)/tfq3-qwen27-convert: src/converters/qwen27/convert.mm $(METAL_ENC_HDRS) | $(BUILD)
 	$(OBJCXX) $< -o $@
 
-$(BUILD)/tfq3-qwen27-convert.metallib: src/converters/qwen27/convert.metal | $(BUILD)
-	$(METAL) -c $< -o $(BUILD)/qwen27.air
+$(BUILD)/tfq3-qwen27-convert.metallib: src/converters/qwen27/convert.metal src/converters/metal_encode_common.metal | $(BUILD)
+	$(METAL) $(METAL_ENC_FLAGS) -c $< -o $(BUILD)/qwen27.air
 	$(METALLIB) $(BUILD)/qwen27.air -o $@
 	@rm -f $(BUILD)/qwen27.air
 
-$(BUILD)/tfq3-flashnext-convert: src/converters/flashnext/convert.mm src/converters/moe_heat_rank.hpp | $(BUILD)
+$(BUILD)/tfq3-flashnext-convert: src/converters/flashnext/convert.mm src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(OBJCXX) $< -o $@
 
-$(BUILD)/tfq3-flashnext-convert.metallib: src/converters/flashnext/convert.metal | $(BUILD)
-	$(METAL) -c $< -o $(BUILD)/flashnext.air
+$(BUILD)/tfq3-flashnext-convert.metallib: src/converters/flashnext/convert.metal src/converters/metal_encode_common.metal | $(BUILD)
+	$(METAL) $(METAL_ENC_FLAGS) -c $< -o $(BUILD)/flashnext.air
 	$(METALLIB) $(BUILD)/flashnext.air -o $@
 	@rm -f $(BUILD)/flashnext.air
 
-$(BUILD)/tfq3-glm-convert: src/converters/glm/convert.mm src/converters/moe_heat_rank.hpp | $(BUILD)
+$(BUILD)/tfq3-glm-convert: src/converters/glm/convert.mm src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(OBJCXX) $< -o $@
 
-$(BUILD)/tfq3-glm-convert.metallib: src/converters/glm/convert.metal | $(BUILD)
-	$(METAL) -c $< -o $(BUILD)/glm.air
+$(BUILD)/tfq3-glm-convert.metallib: src/converters/glm/convert.metal src/converters/metal_encode_common.metal | $(BUILD)
+	$(METAL) $(METAL_ENC_FLAGS) -c $< -o $(BUILD)/glm.air
 	$(METALLIB) $(BUILD)/glm.air -o $@
 	@rm -f $(BUILD)/glm.air
 
@@ -92,11 +99,11 @@ $(BUILD)/tfq3-metal-test.metallib: src/kernels/metal/tfq3_metal.metal | $(BUILD)
 	$(METALLIB) $(BUILD)/tfq3_metal.air -o $@
 	@rm -f $(BUILD)/tfq3_metal.air
 
-$(BUILD)/tfq4-convert: src/converters/tfq4/convert.mm src/converters/tfq4/tfq4_format.hpp src/converters/generic/planner.hpp | $(BUILD)
+$(BUILD)/tfq4-convert: src/converters/tfq4/convert.mm src/converters/tfq4/tfq4_format.hpp src/converters/generic/planner.hpp $(METAL_ENC_HDRS) | $(BUILD)
 	$(OBJCXX) $< -o $@
 
 $(BUILD)/tfq4-convert.metallib: src/converters/tfq4/convert.metal | $(BUILD)
-	$(METAL) -c $< -o $(BUILD)/tfq4_convert.air
+	$(METAL) $(METAL_ENC_FLAGS) -c $< -o $(BUILD)/tfq4_convert.air
 	$(METALLIB) $(BUILD)/tfq4_convert.air -o $@
 	@rm -f $(BUILD)/tfq4_convert.air
 
@@ -109,23 +116,24 @@ $(BUILD)/tfq4-metal-test.metallib: src/kernels/metal/tfq4_metal.metal | $(BUILD)
 	@rm -f $(BUILD)/tfq4_metal.air
 
 # --- NVIDIA CUDA Targets (sm_80+: Ampere, Ada, Hopper, Blackwell / GB10) ---
-$(BUILD)/tfq3-generic-convert-cuda: src/converters/generic/convert.cu src/converters/generic/planner.hpp src/converters/cuda_encode_common.cuh | $(BUILD)
-	$(NVCC) $(NVCCFLAGS) $< -o $@
+# Encoders compile with --fmad=false (no --use_fast_math) for cross-platform bit identity with Metal.
+$(BUILD)/tfq3-generic-convert-cuda: src/converters/generic/convert.cu src/converters/generic/planner.hpp src/converters/cuda_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
+	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
-$(BUILD)/tfq4-convert-cuda: src/converters/tfq4/convert.cu src/converters/tfq4/tfq4_format.hpp src/converters/generic/planner.hpp | $(BUILD)
-	$(NVCC) $(NVCCFLAGS) $< -o $@
+$(BUILD)/tfq4-convert-cuda: src/converters/tfq4/convert.cu src/converters/tfq4/tfq4_format.hpp src/converters/generic/planner.hpp $(METAL_ENC_HDRS) | $(BUILD)
+	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
-$(BUILD)/tfq3-qwen27-convert-cuda: src/converters/qwen27/convert.cu src/converters/cuda_encode_common.cuh | $(BUILD)
-	$(NVCC) $(NVCCFLAGS) $< -o $@
+$(BUILD)/tfq3-qwen27-convert-cuda: src/converters/qwen27/convert.cu src/converters/cuda_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
+	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
-$(BUILD)/tfq3-flashnext-convert-cuda: src/converters/flashnext/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp | $(BUILD)
-	$(NVCC) $(NVCCFLAGS) $< -o $@
+$(BUILD)/tfq3-flashnext-convert-cuda: src/converters/flashnext/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
+	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
-$(BUILD)/tfq3-glm-convert-cuda: src/converters/glm/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp | $(BUILD)
-	$(NVCC) $(NVCCFLAGS) $< -o $@
+$(BUILD)/tfq3-glm-convert-cuda: src/converters/glm/convert.cu src/converters/cuda_encode_common.cuh src/converters/moe_heat_rank.hpp $(METAL_ENC_HDRS) | $(BUILD)
+	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
-$(BUILD)/tfq3-ernie-convert-cuda: src/converters/ernie/convert.cu src/converters/cuda_encode_common.cuh | $(BUILD)
-	$(NVCC) $(NVCCFLAGS) $< -o $@
+$(BUILD)/tfq3-ernie-convert-cuda: src/converters/ernie/convert.cu src/converters/cuda_encode_common.cuh $(METAL_ENC_HDRS) | $(BUILD)
+	$(NVCC) $(NVCC_ENC_FLAGS) $< -o $@
 
 $(BUILD)/tfq3-cuda-test: src/tools/tfq3_cuda_bench.cu src/kernels/cuda/tfq3_cuda.cuh | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) $< -o $@
@@ -145,7 +153,10 @@ test-hip: hip
 test: all
 	@python3 reference/tfq3_reference.py --self-test
 	@python3 reference/tfq4_lattice.py --self-test
+	@python3 tests/vectors_test.py
 	@python3 tests/e2e_test.py
+	@if [ "$(UNAME_S)" = "Darwin" ] && [ -x "$(BUILD)/tfq3-metal-test" ]; then $(BUILD)/tfq3-metal-test; fi
+	@if [ "$(UNAME_S)" = "Darwin" ] && [ -x "$(BUILD)/tfq4-metal-test" ]; then $(BUILD)/tfq4-metal-test; fi
 	@if [ "$(UNAME_S)" != "Darwin" ] && [ -x "$(BUILD)/tfq3-cuda-test" ]; then $(BUILD)/tfq3-cuda-test; fi
 	@echo "All TFQ3 & TFQ4 targets built and verified in $(BUILD)/"
 

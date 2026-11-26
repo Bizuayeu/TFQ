@@ -42,6 +42,7 @@ def test_vllm_plugin_contract() -> None:
     assert dummy.tfq3_scales.numel() == 4
     assert dummy.tfq3_tables.numel() == 16384
     print("PASS vLLM Tfq3Config & Tfq3LinearMethod interface contract")
+    subprocess.run([sys.executable, os.path.join(REPO_ROOT, "tests", "vllm_plugin_test.py")], check=True)
 
 
 def test_hf_end_to_end(model_dir: str) -> None:

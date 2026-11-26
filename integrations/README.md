@@ -24,8 +24,14 @@ Build the extension binding [`src/kernels/cuda/tfq3_cuda.cuh`](../src/kernels/cu
 pip install --no-build-isolation -e integrations/pytorch
 ```
 
-Once installed, `Tfq3Linear.forward()` on CUDA automatically dispatches to `tfq3_cuda_ext.tfq3_linear` (split-K=8 bit-exact decode/verify for `rows <= 64`, `BM=64, BN=128` Tensor Core prefill for long contexts).
+Once installed, `Tfq3Linear.forward()` on CUDA automatically dispatches to `tfq3_cuda_ext.tfq3_linear` (single-weight-read multi-row decode bit-exact for `rows = 1..64`, fused `BM=64, BN=128` Tensor Core prefill for long contexts, plus optional `row_off`, `k_sign_off`, `bc0_buf`, and `n_bc_buf` parameters for zero-repack Col-TP and Row-TP).
 
-## 3. vLLM Quantization Plugin (`[SOURCE-INSPECTED / INTERFACE-TESTED]`)
+## 3. vLLM Quantization Plugin (`[UNIT-TESTED / LIVE SERVING PENDING]`)
 
-[`integrations/vllm/tfq3_quant.py`](vllm/tfq3_quant.py) implements vLLM's `QuantizationConfig` (`Tfq3Config`) and `LinearMethodBase` (`Tfq3LinearMethod`) against `tfq3_cuda_ext.tfq3_linear`. *(Note: end-to-end vLLM serving requires installing `vllm` + `tfq3_cuda_ext` on a CUDA host; this repo's CI verifies the plugin interface against unit stubs.)*
+[`integrations/vllm/tfq3_quant.py`](vllm/tfq3_quant.py) implements vLLM's `QuantizationConfig` (`Tfq3Config`) and `LinearMethodBase` (`Tfq3LinearMethod`), automatically registering `--quantization tfq3` via `register_quantization_config("tfq3")` when vLLM is installed:
+- **Per-tensor bit widths:** `Tfq3Config.from_config()` reads `tensors` from `tfq3_manifest.json` (supporting uniform 3b/4b/5b and mixed-bit checkpoints, skipping unquantized residual layers like `lm_head`).
+- **Real `.tffpw` + `pw_v3_tables.bin` loader:** `Tfq3CheckpointReader` and `load_tfq3_checkpoint_weights()` load packed shards directly into layer parameters (with per-parameter `weight_loader` hooks).
+- **Merged projections:** `qkv_proj` (3-way), `gate_up_proj` (2-way), and arbitrary N-way fused layers track independent per-partition 128-row padding, bit widths, and absolute row signs (`row_off`).
+- **Tensor Parallelism (`TP > 1`):** Column-Parallel (`row_off`) and Row-Parallel (`k_sign_off` + 1-block trellis state resume `bc0_buf`) dispatch directly to `tfq3_cuda_ext.tfq3_linear` on CUDA with an exact portable fallback on CPU/MPS.
+
+Verified end-to-end against `tfq3_reference` in [`tests/vllm_plugin_test.py`](../tests/vllm_plugin_test.py). *(Note: live multi-GPU vLLM server benchmarks require installing `vllm` + `tfq3_cuda_ext` on a CUDA host.)*

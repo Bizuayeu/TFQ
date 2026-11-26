@@ -199,7 +199,7 @@ static void run_parity_suite() {
         CUDA_CHECK(cudaMemcpy(d_X, h_X_all.data(), h_X_all.size() * 2, cudaMemcpyHostToDevice));
 
         std::vector<uint16_t> row0_r1(R);
-        for (uint32_t rows : {1u, 4u, 16u, 32u, 68u}) {
+        for (uint32_t rows : {1u, 2u, 4u, 8u, 16u, 17u, 32u, 33u, 48u, 64u, 68u}) {
             std::vector<double> ref((size_t)rows * R, 0.0);
             for (uint32_t m = 0; m < rows; ++m) {
                 std::vector<double> xm(C);
@@ -236,7 +236,65 @@ static void run_parity_suite() {
                 }
             }
         }
+        // Issue #11: Verify large BF16 activations (> 65504 after FWHT) saturate cleanly without Inf/NaN
+        if (bits == 4u) {
+            std::vector<uint16_t> h_big(ldx, h_f32_to_bf16(800000.0f));
+            CUDA_CHECK(cudaMemcpy(d_X, h_big.data(), ldx * 2, cudaMemcpyHostToDevice));
+            CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X, d_Y, d_xrot, d_yr, max_yr, bits, 1u, R, C, ldx, ldo, sr_split));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<uint16_t> h_Yb(ldo);
+            CUDA_CHECK(cudaMemcpy(h_Yb.data(), d_Y, ldo * 2, cudaMemcpyDeviceToHost));
+            for (uint32_t r = 0; r < R; ++r) {
+                float v = h_bf16_to_f32(h_Yb[r]);
+                if (!std::isfinite(v)) { fprintf(stderr, "FAIL CUDA fp16 activation overflow produced non-finite output @ %u\n", r); exit(1); }
+            }
+        }
         cudaFree(d_X); cudaFree(d_Y); cudaFree(d_W); cudaFree(d_sc);
+    }
+
+    // 1b. Issue #23: Bit-exact rows=1 == rows=k (k in 1..64) across all 4 Qwen3.8-27B shapes + N > 34816
+    {
+        struct ShapeCheck { const char* name; uint32_t N, K; };
+        ShapeCheck checks[] = {
+            {"qkv",     10240,  5120},
+            {"o_proj",   5120,  6144},
+            {"gate+up", 34816,  5120},
+            {"down",     5120, 17408},
+            {"wide40k", 40960,  5120},
+        };
+        __half* d_xr_big; uint16_t *d_X_big, *d_Y_big; float* d_yr_big;
+        size_t yr_big_elems = 0;
+        for (auto& s : checks) yr_big_elems = std::max(yr_big_elems, tfq3::required_yr_elems(64u, s.N, s.K));
+        CUDA_CHECK(cudaMalloc(&d_xr_big, 64ull * 17408ull * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_X_big,  64ull * 17408ull * 2ull));
+        CUDA_CHECK(cudaMalloc(&d_Y_big,  64ull * 40960ull * 2ull));
+        CUDA_CHECK(cudaMalloc(&d_yr_big, std::max<size_t>(1ull, yr_big_elems) * sizeof(float)));
+        std::vector<uint16_t> h_X_big(64ull * 17408ull);
+        for (auto& x : h_X_big) x = h_f32_to_bf16(nd(rng));
+        CUDA_CHECK(cudaMemcpy(d_X_big, h_X_big.data(), h_X_big.size() * 2, cudaMemcpyHostToDevice));
+        for (auto& s : checks) {
+            const uint32_t bits = 4u;
+            size_t nw = (size_t)(s.N / 16u) * (s.K / 128u) * (bits * 2u) * 32ull;
+            size_t ns = (size_t)(s.N / 128u) * (s.K / 128u);
+            uint32_t* d_W; __half* d_sc;
+            CUDA_CHECK(cudaMalloc(&d_W, nw * 4)); CUDA_CHECK(cudaMalloc(&d_sc, ns * 2));
+            CUDA_CHECK(cudaMemset(d_W, 0x5A, nw * 4)); CUDA_CHECK(cudaMemset(d_sc, 0x2E, ns * 2));
+            std::vector<uint16_t> ref_r1(s.N), got_rk(s.N);
+            CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X_big, d_Y_big, d_xr_big, d_yr_big, yr_big_elems, bits, 1u, s.N, s.K, s.K, s.N, 0u));
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(ref_r1.data(), d_Y_big, s.N * 2, cudaMemcpyDeviceToHost));
+            for (uint32_t rk : {2u, 4u, 8u, 16u, 17u, 32u, 33u, 48u, 64u}) {
+                CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X_big, d_Y_big, d_xr_big, d_yr_big, yr_big_elems, bits, rk, s.N, s.K, s.K, s.N, 0u));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaMemcpy(got_rk.data(), d_Y_big, s.N * 2, cudaMemcpyDeviceToHost));
+                if (memcmp(ref_r1.data(), got_rk.data(), s.N * 2) != 0) {
+                    fprintf(stderr, "FAIL bit-exact r1!=r%u on shape %s [%u x %u] (ks=%u)\n", rk, s.name, s.N, s.K, tfq3::choose_ksplit(s.N, s.K));
+                    exit(1);
+                }
+            }
+            cudaFree(d_W); cudaFree(d_sc);
+        }
+        cudaFree(d_xr_big); cudaFree(d_X_big); cudaFree(d_Y_big); cudaFree(d_yr_big);
     }
 
     // 2. Mixed 3b/4b/5b routed MoE parity + bit-exact rows=1 == rows=16 (act_mode=0 clamped & act_mode=1)
@@ -440,17 +498,135 @@ static void run_parity_suite() {
             double cos_tp = dtp / (std::sqrt(n1 * n2) + 1e-30);
             if (cos_tp < 0.999999) { fprintf(stderr, "FAIL Row-TP=%u %ub cos=%.8f\n", tp, bits, cos_tp); exit(1); }
         }
+        // 4d. Compact-VRAM Row-TP sliced launch (1 leading resume block, matching vLLM TP>1 layout)
+        {
+            const uint32_t tp = 4u, k_loc = K / tp, wpb = bits * 2u, n_bc_full = K / 128u;
+            std::vector<float> h_sum_sl(rows * N, 0.0f);
+            for (uint32_t rank = 0; rank < tp; ++rank) {
+                uint32_t bc0_abs = (rank * k_loc) >> 7;
+                uint32_t bc_store = (bc0_abs > 0u) ? (bc0_abs - 1u) : 0u;
+                uint32_t bc0_buf = bc0_abs - bc_store;
+                uint32_t n_bc_buf = bc0_buf + (k_loc >> 7);
+                std::vector<uint32_t> w_loc((size_t)(N / 16u) * n_bc_buf * wpb * 32ull);
+                std::vector<__half> sc_loc((size_t)(N / 128u) * n_bc_buf);
+                for (uint32_t s = 0; s < N / 16u; ++s) {
+                    memcpy(&w_loc[(size_t)s * n_bc_buf * wpb * 32ull],
+                           &h_W[((size_t)s * n_bc_full + bc_store) * wpb * 32ull],
+                           (size_t)n_bc_buf * wpb * 32ull * 4ull);
+                }
+                for (uint32_t rb = 0; rb < N / 128u; ++rb) {
+                    memcpy(&sc_loc[(size_t)rb * n_bc_buf], &h_sc[(size_t)rb * n_bc_full + bc_store], n_bc_buf * 2ull);
+                }
+                uint32_t* d_Wl; __half* d_Sl;
+                CUDA_CHECK(cudaMalloc(&d_Wl, w_loc.size() * 4)); CUDA_CHECK(cudaMemcpy(d_Wl, w_loc.data(), w_loc.size() * 4, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMalloc(&d_Sl, sc_loc.size() * 2)); CUDA_CHECK(cudaMemcpy(d_Sl, sc_loc.data(), sc_loc.size() * 2, cudaMemcpyHostToDevice));
+                CUDA_CHECK(tfq3::launch_dense_tp_sliced(d_Wl, d_Sl, d_tbl, d_X + rank * k_loc, d_Y, d_xrot, bits, rows,
+                                                        N, k_loc, 0u, rank * k_loc, bc0_buf, n_bc_buf, K, N, true));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<float> h_part(rows * N);
+                CUDA_CHECK(cudaMemcpy(h_part.data(), d_Y, rows * N * 4, cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < h_sum_sl.size(); ++i) h_sum_sl[i] += h_part[i];
+                cudaFree(d_Wl); cudaFree(d_Sl);
+            }
+            double dtp = 0.0, n1 = 0.0, n2 = 0.0;
+            for (size_t i = 0; i < h_sum_sl.size(); ++i) {
+                dtp += (double)h_sum_sl[i] * h_Y_full[i]; n1 += (double)h_sum_sl[i] * h_sum_sl[i]; n2 += (double)h_Y_full[i] * h_Y_full[i];
+            }
+            if (dtp / (std::sqrt(n1 * n2) + 1e-30) < 0.999999) {
+                fprintf(stderr, "FAIL launch_dense_tp_sliced Row-TP=4 %ub\n", bits); exit(1);
+            }
+        }
         cudaFree(d_W); cudaFree(d_sc); cudaFree(d_X); cudaFree(d_Y);
     }
 
     cudaFree(d_tbl); cudaFree(d_xrot); cudaFree(d_yr);
-    printf("PASS tfq3_cuda_test (3b/4b/5b PTX sk8+fused+prefill64 + bit-exact r1==r16==r32 + Col-TP/Row-TP 2,4 + mixed-bit MoE + bf16)\n");
+    printf("PASS tfq3_cuda_test (3b/4b/5b single-read sk+fused+prefill64 + bit-exact r1..r64 on all Qwen27 & N>34816 shapes + Col-TP/Row-TP 2,4 + mixed-bit MoE + fp16 sat + bf16)\n");
+}
+
+static void run_verify_vectors(const char* vec_path) {
+    FILE* vf = fopen(vec_path, "rb");
+    if (!vf) { fprintf(stderr, "Cannot open VEC3 vector bundle: %s\n", vec_path); exit(1); }
+    uint32_t hdr[2] = {};
+    if (fread(hdr, 4, 2, vf) != 2 || hdr[0] != 0x56454333u) {
+        fprintf(stderr, "Bad VEC3 header in %s\n", vec_path); fclose(vf); exit(1);
+    }
+    uint8_t raw_tbl[16384];
+    if (fread(raw_tbl, 1, 16384, vf) != 16384) { fprintf(stderr, "Truncated VEC3 tables\n"); fclose(vf); exit(1); }
+    tfq3::PwV3Tables h_tbl{};
+    memcpy(&h_tbl, raw_tbl, sizeof(h_tbl));
+    tfq3::PwV3Tables* d_tbl;
+    CUDA_CHECK(cudaMalloc(&d_tbl, sizeof(h_tbl)));
+    CUDA_CHECK(cudaMemcpy(d_tbl, &h_tbl, sizeof(h_tbl), cudaMemcpyHostToDevice));
+
+    for (uint32_t ci = 0; ci < hdr[1]; ++ci) {
+        uint32_t ch[10] = {};
+        if (fread(ch, 4, 10, vf) != 10) { fprintf(stderr, "Truncated VEC3 case %u\n", ci); fclose(vf); exit(1); }
+        uint32_t bits = ch[0], R = ch[1], C = ch[2], rows = ch[3], r_off = ch[4], c_off = ch[5], n_loc = ch[6], k_loc = ch[7];
+        uint32_t n_words = ch[8], n_scales = ch[9];
+        std::vector<uint32_t> W(n_words);
+        std::vector<uint16_t> sc(n_scales), X_f16((size_t)rows * k_loc);
+        std::vector<float> Y_ref((size_t)rows * n_loc);
+        if (fread(W.data(), 4, n_words, vf) != n_words ||
+            fread(sc.data(), 2, n_scales, vf) != n_scales ||
+            fread(X_f16.data(), 2, X_f16.size(), vf) != X_f16.size() ||
+            fread(Y_ref.data(), 4, Y_ref.size(), vf) != Y_ref.size()) {
+            fprintf(stderr, "Truncated VEC3 payload case %u\n", ci); fclose(vf); exit(1);
+        }
+        // Convert probe X from fp16 -> bf16 for CUDA kernel input
+        std::vector<uint16_t> X_bf16(X_f16.size());
+        for (size_t i = 0; i < X_f16.size(); ++i) {
+            __half h; memcpy(&h, &X_f16[i], 2);
+            X_bf16[i] = h_f32_to_bf16(__half2float(h));
+        }
+        uint32_t* d_W; __half *d_sc, *d_xr; uint16_t* d_X; float *d_Y, *d_yr;
+        size_t yr_el = std::max<size_t>(1ull, tfq3::required_yr_elems(rows, n_loc, k_loc));
+        CUDA_CHECK(cudaMalloc(&d_W, W.size() * 4)); CUDA_CHECK(cudaMemcpy(d_W, W.data(), W.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_sc, sc.size() * 2)); CUDA_CHECK(cudaMemcpy(d_sc, sc.data(), sc.size() * 2, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_X, X_bf16.size() * 2)); CUDA_CHECK(cudaMemcpy(d_X, X_bf16.data(), X_bf16.size() * 2, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_xr, X_bf16.size() * 2));
+        CUDA_CHECK(cudaMalloc(&d_Y, Y_ref.size() * 4));
+        CUDA_CHECK(cudaMalloc(&d_yr, yr_el * 4));
+
+        // Verify via launch_dense_tp (supports both full and r_off/bc0>0 slice) AND via launch_dense when full
+        int modes = (r_off == 0u && c_off == 0u && n_loc == R && k_loc == C) ? 2 : 1;
+        for (int m = 0; m < modes; ++m) {
+            if (m == 0) {
+                CUDA_CHECK(tfq3::launch_dense_tp(d_W, d_sc, d_tbl, d_X, d_Y, d_xr, bits, rows, R, C,
+                                                 r_off, n_loc, c_off, k_loc, k_loc, n_loc, true));
+            } else {
+                CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X, d_Y, d_xr, d_yr, yr_el, bits, rows, R, C, C, R, 0u, true));
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<float> got(Y_ref.size());
+            CUDA_CHECK(cudaMemcpy(got.data(), d_Y, Y_ref.size() * 4, cudaMemcpyDeviceToHost));
+            double dot = 0.0, na = 0.0, nb = 0.0;
+            for (size_t i = 0; i < Y_ref.size(); ++i) {
+                dot += (double)got[i] * Y_ref[i]; na += (double)got[i] * got[i]; nb += (double)Y_ref[i] * Y_ref[i];
+            }
+            double cos_v = dot / (std::sqrt(na * nb) + 1e-30);
+            if (cos_v < 0.9999) {
+                fprintf(stderr, "FAIL CUDA VEC3 case=%u bits=%u mode=%d r_off=%u c_off=%u cos=%.8f\n",
+                        ci, bits, m, r_off, c_off, cos_v);
+                fclose(vf); exit(1);
+            }
+        }
+        cudaFree(d_W); cudaFree(d_sc); cudaFree(d_X); cudaFree(d_xr); cudaFree(d_Y); cudaFree(d_yr);
+    }
+    fclose(vf);
+    cudaFree(d_tbl);
+    printf("PASS CUDA TFQ3 golden vectors (%u cases across 3b/4b/5b launch_dense + launch_dense_tp r_off & bc>0 resume)\n", hdr[1]);
+}
+
+__global__ void l2_flush_kernel(uint32_t* buf, size_t n, uint32_t val) {
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (size_t i = idx; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x) buf[i] = val + static_cast<uint32_t>(i);
 }
 
 static void run_bench() {
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    printf("Device: %s (SM %d.%d, %d SMs)\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount);
+    printf("Device: %s (SM %d.%d, %d SMs, L2 %.1f MiB)\n",
+           prop.name, prop.major, prop.minor, prop.multiProcessorCount, prop.l2CacheSize / (1024.0 * 1024.0));
 
     tfq3::PwV3Tables h_tbl; init_synth_tables(h_tbl);
     tfq3::PwV3Tables* d_tbl; CUDA_CHECK(cudaMalloc(&d_tbl, sizeof(h_tbl)));
@@ -458,23 +634,29 @@ static void run_bench() {
 
     struct Shape { const char* name; uint32_t N, K; };
     Shape shapes[] = {
-        {"gate+up", 34816, 5120},
+        {"gate+up", 34816,  5120},
         {"down",     5120, 17408},
-        {"qkv",     10240, 5120},
+        {"qkv",     10240,  5120},
+        {"o_proj",   5120,  6144},
         {"lm_head", 248320, 5120},
     };
-    __half* d_xrot; float* d_yr; uint16_t *d_X, *d_Y;
-    const size_t max_yr = 64ull * 34816ull * 8ull;
+    __half* d_xrot; float* d_yr; uint16_t *d_X, *d_Y; uint32_t* d_flush;
+    size_t max_yr = 0;
+    for (auto& s : shapes) max_yr = std::max(max_yr, tfq3::required_yr_elems(64u, s.N, s.K));
+    const size_t flush_words = (64ull << 20) / 4ull; // 64 MiB L2 flush buffer (> 24 MiB GB10 L2)
     CUDA_CHECK(cudaMalloc(&d_xrot, 1024ull * 17408ull * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&d_yr, max_yr * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_yr, std::max<size_t>(1ull, max_yr) * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_X, 1024ull * 17408ull * 2ull));
     CUDA_CHECK(cudaMalloc(&d_Y, 1024ull * 248320ull * 2ull));
+    CUDA_CHECK(cudaMalloc(&d_flush, flush_words * 4ull));
     CUDA_CHECK(cudaMemset(d_X, 0x3C, 1024ull * 17408ull * 2ull));
+    printf("Peak partial buffer (yr): %.1f MiB (down from 71.3 MiB)\n", (max_yr * 4.0) / (1024.0 * 1024.0));
 
     cudaEvent_t ev0, ev1;
     CUDA_CHECK(cudaEventCreate(&ev0)); CUDA_CHECK(cudaEventCreate(&ev1));
     for (auto& s : shapes) {
         const uint32_t bits = 4u;
+        const uint32_t ks = tfq3::choose_ksplit(s.N, s.K);
         size_t nw = (size_t)(s.N / 16u) * (s.K / 128u) * (bits * 2u) * 32ull;
         size_t ns = (size_t)(s.N / 128u) * (s.K / 128u);
         uint32_t* d_W; __half* d_sc;
@@ -482,30 +664,55 @@ static void run_bench() {
         CUDA_CHECK(cudaMemset(d_W, 0x5A, nw * 4)); CUDA_CHECK(cudaMemset(d_sc, 0x2E, ns * 2));
         double bytes = (double)(nw * 4 + ns * 2);
 
-        for (uint32_t rows : {1u, 16u, 64u, 256u, 1024u}) {
+        for (uint32_t rows : {1u, 4u, 16u, 32u, 64u, 256u, 1024u}) {
             if (rows >= 256u && s.N == 248320u) continue;
             for (int w = 0; w < 5; ++w) CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X, d_Y, d_xrot, d_yr, max_yr, bits, rows, s.N, s.K, s.K, s.N, 0u));
             CUDA_CHECK(cudaDeviceSynchronize());
-            int iters = (rows <= 16u) ? 50 : 10;
+            int iters = (rows <= 64u) ? 20 : 10;
+            // Warm-L2 timing
             CUDA_CHECK(cudaEventRecord(ev0));
             for (int it = 0; it < iters; ++it) CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X, d_Y, d_xrot, d_yr, max_yr, bits, rows, s.N, s.K, s.K, s.N, 0u));
             CUDA_CHECK(cudaEventRecord(ev1)); CUDA_CHECK(cudaEventSynchronize(ev1));
-            float ms = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
-            double avg_ms = ms / iters;
-            double gbps = (bytes / 1e9) / (avg_ms / 1e3);
-            double tflops = (2.0 * rows * s.N * s.K / 1e12) / (avg_ms / 1e3);
-            printf("  %-8s [%6u x %5u] 4b rows=%4u : %7.3f ms | %6.1f GB/s | %5.2f TFLOP/s\n", s.name, s.N, s.K, rows, avg_ms, gbps, tflops);
+            float warm_ms = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&warm_ms, ev0, ev1));
+            double avg_warm = warm_ms / iters;
+
+            // Cold-L2 timing (flush 64 MiB before each timed launch)
+            double cold_sum = 0.0;
+            int cold_iters = (s.N == 248320u) ? 5 : 15;
+            for (int it = 0; it < cold_iters; ++it) {
+                l2_flush_kernel<<<256, 256>>>(d_flush, flush_words, static_cast<uint32_t>(it));
+                CUDA_CHECK(cudaEventRecord(ev0));
+                CUDA_CHECK(tfq3::launch_dense(d_W, d_sc, d_tbl, d_X, d_Y, d_xrot, d_yr, max_yr, bits, rows, s.N, s.K, s.K, s.N, 0u));
+                CUDA_CHECK(cudaEventRecord(ev1)); CUDA_CHECK(cudaEventSynchronize(ev1));
+                float dt = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&dt, ev0, ev1));
+                cold_sum += dt;
+            }
+            double avg_cold = cold_sum / cold_iters;
+            double gbps_cold = (bytes / 1e9) / (avg_cold / 1e3);
+            double gbps_warm = (bytes / 1e9) / (avg_warm / 1e3);
+            double tflops_cold = (2.0 * rows * s.N * s.K / 1e12) / (avg_cold / 1e3);
+            double yr_mb = (rows <= 64u && ks > 1u) ? (rows * (double)s.N * ks * 4.0 / (1024.0 * 1024.0)) : 0.0;
+            printf("  %-8s [%6u x %5u] 4b ks=%u rows=%4u | cold %7.3f ms (%5.1f GB/s, %5.2f TF/s) | warm %7.3f ms (%5.1f GB/s) | yr=%4.1f MiB\n",
+                   s.name, s.N, s.K, (rows <= 64u ? ks : 1u), rows, avg_cold, gbps_cold, tflops_cold, avg_warm, gbps_warm, yr_mb);
         }
         cudaFree(d_W); cudaFree(d_sc);
     }
     cudaEventDestroy(ev0); cudaEventDestroy(ev1);
-    cudaFree(d_tbl); cudaFree(d_xrot); cudaFree(d_yr); cudaFree(d_X); cudaFree(d_Y);
+    cudaFree(d_tbl); cudaFree(d_xrot); cudaFree(d_yr); cudaFree(d_X); cudaFree(d_Y); cudaFree(d_flush);
 }
 
 int main(int argc, char** argv) {
-    run_parity_suite();
     bool do_bench = false;
-    for (int i = 1; i < argc; ++i) if (strcmp(argv[i], "--bench") == 0) do_bench = true;
+    const char* vec_path = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--bench") == 0) do_bench = true;
+        else if (strcmp(argv[i], "--verify-vectors") == 0 && i + 1 < argc) vec_path = argv[++i];
+    }
+    if (vec_path) {
+        run_verify_vectors(vec_path);
+        return 0;
+    }
+    run_parity_suite();
     if (do_bench) run_bench();
     return 0;
 }

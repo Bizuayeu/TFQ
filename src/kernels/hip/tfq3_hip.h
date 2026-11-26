@@ -72,6 +72,10 @@ __device__ __forceinline__ uint16_t f32_to_bf16_u16(float f) {
     return u;
 }
 
+__device__ __forceinline__ __half tfq3_float2half_sat(float v) {
+    return __float2half(fminf(fmaxf(v, -65504.0f), 65504.0f));
+}
+
 __device__ __forceinline__ void pw_store(void* out, uint64_t idx, float v, uint32_t out_f32) {
     if (out_f32) reinterpret_cast<float*>(out)[idx] = v;
     else reinterpret_cast<uint16_t*>(out)[idx] = f32_to_bf16_u16(v);
@@ -138,10 +142,10 @@ __global__ void tfq3_fwht_x_kernel(const uint16_t* __restrict__ X, __half* __res
     v.w = bf16_to_f32(src[lane + 96u]) * pw_sgn(0x12345678u, cs + lane + 96u);
     pw_fwht128_simd4(v, lane);
     __half* dst = X_rot + static_cast<uint64_t>(row) * d.k + c0;
-    dst[lane +  0u] = __float2half(v.x);
-    dst[lane + 32u] = __float2half(v.y);
-    dst[lane + 64u] = __float2half(v.z);
-    dst[lane + 96u] = __float2half(v.w);
+    dst[lane +  0u] = tfq3_float2half_sat(v.x);
+    dst[lane + 32u] = tfq3_float2half_sat(v.y);
+    dst[lane + 64u] = tfq3_float2half_sat(v.z);
+    dst[lane + 96u] = tfq3_float2half_sat(v.w);
 }
 
 __device__ __forceinline__ void pw_v3_q8_4b(
@@ -369,8 +373,8 @@ __global__ void tfq3_moe_gu_swiglu_kernel(
         act.w = pw_glu(vg.w * pw_sgn(0x9E3779B9u, r0 + lane + 96u), vu.w * pw_sgn(0x9E3779B9u, r0 + lane + 96u), lim, act_mode) * pw_sgn(0x12345678u, r0 + lane + 96u);
         pw_fwht128_simd4(act, lane);
         __half* dst = act_rot + static_cast<uint64_t>(slot_flat) * inter + r0;
-        dst[lane +  0u] = __float2half(act.x); dst[lane + 32u] = __float2half(act.y);
-        dst[lane + 64u] = __float2half(act.z); dst[lane + 96u] = __float2half(act.w);
+        dst[lane +  0u] = tfq3_float2half_sat(act.x); dst[lane + 32u] = tfq3_float2half_sat(act.y);
+        dst[lane + 64u] = tfq3_float2half_sat(act.z); dst[lane + 96u] = tfq3_float2half_sat(act.w);
     }
 }
 
@@ -404,7 +408,8 @@ __global__ void tfq3_moe_down_kernel(
     if (sg == 0u) {
         float4 vd = make_float4(tg_d[lane], tg_d[lane + 32u], tg_d[lane + 64u], tg_d[lane + 96u]);
         pw_fwht128_simd4(vd, lane);
-        uint64_t base = static_cast<uint64_t>(slot_flat) * out_slot_stride + r0;
+        // out_slot_stride counts slots per row (matching tfq3_cuda.cuh).
+        const uint64_t base = (static_cast<uint64_t>(row) * out_slot_stride + s) * dims + r0;
         pw_store(ey, base + lane +  0u, vd.x * pw_sgn(0x9E3779B9u, r0 + lane +  0u), out_f32);
         pw_store(ey, base + lane + 32u, vd.y * pw_sgn(0x9E3779B9u, r0 + lane + 32u), out_f32);
         pw_store(ey, base + lane + 64u, vd.z * pw_sgn(0x9E3779B9u, r0 + lane + 64u), out_f32);

@@ -5,6 +5,8 @@
 //   - Shares exact 2D FWHT-128 rotation & 128x128 fp16 tile scales with TFQ3
 //   - Deterministic data-free 256-entry positive-orthant 8D E8P codebook (4 KiB)
 // ============================================================================
+#include "../canonical_tables.hpp"
+#include "../tfq_constants.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -12,7 +14,6 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -99,81 +100,11 @@ static inline float f16_bits_to_f32(uint16_t h) {
     return f;
 }
 
-// Deterministic 100% data-free 256-code positive-orthant 8D E8P Gaussian codebook.
-// Initialized on spherical E8 + 1/4 shells, then polished with 20 Lloyd-Max steps
-// over synthetic |N(0, 1)^8| samples (reproducible bit-for-bit on Metal and CUDA).
+// Canonical 100% data-free 256-code positive-orthant 8D E8-initialized Voronoi
+// Gaussian codebook (reproducible bit-for-bit on Apple Silicon Metal & NVIDIA CUDA).
+// Regenerate via src/tools/tfq3_train_tables.cpp (Box-Muller over std::mt19937).
 static inline void build_e8p_tables(PwV4E8Tables& t) {
-    std::memset(&t, 0, sizeof(t));
-    t.magic   = MAGIC_PWV4;
-    t.version = FORMAT_VER;
-    t.k_codes = 256u;
-    t.dim     = 8u;
-
-    // 1. Shifted E8 + 0.25 positive-orthant anchor grid + synthetic |N(0,1)^8| bank.
-    const float vals[5] = {0.25f, 0.75f, 1.25f, 1.75f, 2.25f};
-    std::mt19937 rng(2026u);
-    std::normal_distribution<float> nd(0.0f, 1.0f);
-
-    // Deterministic synthetic |N(0,1)^8| training bank (32,768 samples).
-    const int N_SAMP = 32768;
-    std::vector<float> S((size_t)N_SAMP * 8);
-    for (int i = 0; i < N_SAMP * 8; ++i) S[i] = std::fabs(nd(rng));
-
-    // Seed 256 centroids via stratified radial shells from the synthetic Gaussian bank
-    // plus E8 shifted-orthant lattice anchors for clean Voronoi coverage.
-    float C[256][8];
-    // Deterministic farthest/quantile seed across 256 radial buckets of |N(0,1)^8|
-    std::vector<std::pair<float, int>> norms(N_SAMP);
-    for (int i = 0; i < N_SAMP; ++i) {
-        float r2 = 0.0f;
-        for (int d = 0; d < 8; ++d) r2 += S[i * 8 + d] * S[i * 8 + d];
-        norms[i] = {r2, i};
-    }
-    std::sort(norms.begin(), norms.end());
-    for (int k = 0; k < 256; ++k) {
-        int pick = norms[((k * 2 + 1) * N_SAMP) / 512].second;
-        for (int d = 0; d < 8; ++d) {
-            // Snap slightly toward E8 + 0.25 shell grid on init
-            float v = S[pick * 8 + d];
-            float snapped = vals[std::min(4, std::max(0, (int)std::floor(v * 2.0f)))];
-            C[k][d] = 0.5f * v + 0.5f * snapped;
-        }
-    }
-
-    // 20 iterations of exact Lloyd-Max k-means in 8D positive orthant.
-    double sum[256][8];
-    int    cnt[256];
-    for (int it = 0; it < 20; ++it) {
-        std::memset(sum, 0, sizeof(sum));
-        std::memset(cnt, 0, sizeof(cnt));
-        for (int i = 0; i < N_SAMP; ++i) {
-            const float* x = &S[i * 8];
-            int best = 0;
-            float bd = 1e30f;
-            for (int k = 0; k < 256; ++k) {
-                const float* ck = C[k];
-                float d0 = x[0] - ck[0], d1 = x[1] - ck[1], d2 = x[2] - ck[2], d3 = x[3] - ck[3];
-                float d4 = x[4] - ck[4], d5 = x[5] - ck[5], d6 = x[6] - ck[6], d7 = x[7] - ck[7];
-                float dist = d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 + d7*d7;
-                if (dist < bd) { bd = dist; best = k; }
-            }
-            cnt[best]++;
-            for (int d = 0; d < 8; ++d) sum[best][d] += x[d];
-        }
-        for (int k = 0; k < 256; ++k) {
-            if (cnt[k] > 0) {
-                double inv = 1.0 / (double)cnt[k];
-                for (int d = 0; d < 8; ++d) C[k][d] = (float)(sum[k][d] * inv);
-            }
-        }
-    }
-
-    // Store canonical fp16 centroids.
-    for (int k = 0; k < 256; ++k) {
-        for (int d = 0; d < 8; ++d) {
-            t.e8p_lut[k][d] = f32_to_f16_bits(std::max(0.0f, C[k][d]));
-        }
-    }
+    tfq_canonical::fill_canonical_pwv4(&t);
 }
 
 static inline uint64_t align_up_16k(uint64_t x) {

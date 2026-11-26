@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
             const uint32_t R = j.R, C = j.C, B = j.bits;
             const uint32_t n_bc = C >> 7, wpb = B * 2u;
             const uint32_t chunk_r = (R > 17408u) ? 16384u : R;
-            const float shrink = (B == 3u) ? 0.992f : (B == 4u ? 0.997f : 0.999f);
+            const float shrink = tfq_common::qwen27_shrink(B);
 
             const uint8_t* src_w = cache.get_tensor(j.src_mod + ".weight");
             const uint8_t* src_s = src_is_bf16 ? nullptr : cache.get_tensor(j.src_mod + ".scales");
@@ -230,11 +230,15 @@ int main(int argc, char** argv) {
                 MatParams mp{rc, C, B, shrink, r0, 0u};
 
                 if (src_is_bf16) {
-                    TFQ_CUDA_CHECK(cudaMemcpy(d_in_w, src_w + (size_t)r0 * C * 2ULL, (size_t)rc * C * 2ULL, cudaMemcpyHostToDevice));
+                    const uint16_t* w_bf16 = reinterpret_cast<const uint16_t*>(src_w + (size_t)r0 * C * 2ULL);
+                    tfq_common::check_finite_bf16(w_bf16, rc, C, j.src_mod + ".weight", r0);
+                    TFQ_CUDA_CHECK(cudaMemcpy(d_in_w, w_bf16, (size_t)rc * C * 2ULL, cudaMemcpyHostToDevice));
                     bf16_row_fwht_kernel<<<dim3(n_bc, rc, 1), 32>>>(reinterpret_cast<const uint16_t*>(d_in_w), d_tmp, mp);
                 } else {
                     size_t sb_off = (size_t)r0 * (C / 64u) * 2ULL;
                     size_t sb_len = (size_t)rc * (C / 64u) * 2ULL;
+                    tfq_common::check_finite_bf16(reinterpret_cast<const uint16_t*>(src_s + sb_off), rc, C / 64u, j.src_mod + ".scales", r0);
+                    tfq_common::check_finite_bf16(reinterpret_cast<const uint16_t*>(src_b + sb_off), rc, C / 64u, j.src_mod + ".biases", r0);
                     TFQ_CUDA_CHECK(cudaMemcpy(d_in_w, src_w + (size_t)r0 * C, (size_t)rc * C, cudaMemcpyHostToDevice));
                     TFQ_CUDA_CHECK(cudaMemcpy(d_in_s, src_s + sb_off, sb_len, cudaMemcpyHostToDevice));
                     TFQ_CUDA_CHECK(cudaMemcpy(d_in_b, src_b + sb_off, sb_len, cudaMemcpyHostToDevice));

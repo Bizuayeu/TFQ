@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include "../tfq_tables_io.hpp"
 
 // ============================================================================
 // TensorFold TFQ3 (2D-AffineCoset/half4) Qwen3.8-27B Dual-Source GPU Converter
@@ -38,20 +39,7 @@ static constexpr size_t   ALIGN_16K  = 16384;
 
 static inline size_t align_up(size_t x, size_t a) { return (x + a - 1) & ~(a - 1); }
 
-struct PwV3TablesFile {
-    uint32_t magic;
-    uint32_t version;
-    float    a3, b3, a4, b4, a5, b5;
-    uint32_t pad0[8];
-    uint32_t lut3_u32[256];
-    uint32_t lut4_u32[1024];
-    uint32_t lut5_u32[1024];
-    uint16_t c64_3[64][4];
-    uint16_t c64_4[64][4];
-    uint16_t c64_5[64][4];
-    uint8_t  pad1[16384 - 10816];
-};
-static_assert(sizeof(PwV3TablesFile) == 16384, "PwV3TablesFile must be 16384 bytes");
+using tfq_tables::PwV3TablesFile;
 
 struct NonMoeHeader {
     uint32_t magic;
@@ -82,127 +70,13 @@ static_assert(sizeof(NonMoeTensorMeta) == 128, "NonMoeTensorMeta must be 128 byt
 
 struct MatParams { uint32_t R, C, b_bits; float shrink; uint32_t r_off, pad0; };
 struct EncParams { uint32_t R, C, b_bits, stream_off, n_streams; };
-struct P2 { float x, y; };
 
-static inline uint16_t f32_to_f16(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
-static inline float f16_to_f32(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
-static inline uint32_t pack_h2(float x, float y) { return (uint32_t)f32_to_f16(x) | ((uint32_t)f32_to_f16(y) << 16); }
-
-static double inv_norm_cdf(double p) {
-    p = std::min(1.0 - 1e-12, std::max(1e-12, p));
-    static const double a[6]={-3.969683028665376e+01,2.209460984245205e+02,-2.759285104469687e+02,1.383577518672690e+02,-3.066479806614716e+01,2.506628277459239e+00};
-    static const double b[5]={-5.447609879822406e+01,1.615858368580409e+02,-1.556989798598866e+02,6.680131188771972e+01,-1.328068155288572e+01};
-    static const double c[6]={-7.784894002430293e-03,-3.223964580411365e-01,-2.400758277161838e+00,-2.549732539343734e+00,4.374664141464968e+00,2.938163982698783e+00};
-    static const double d[4]={ 7.784695709041462e-03,3.224671290700398e-01,2.445134137142996e+00,3.754408661907416e+00};
-    if (p < 0.02425) { double q=sqrt(-2*log(p)); return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0); }
-    else if (p <= 0.97575) { double q=p-0.5,r=q*q; return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q/(((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1.0); }
-    else { double q=sqrt(-2*log(1-p)); return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0); }
+static inline void load_or_generate_tables(const std::string& path, PwV3TablesFile& tbl) {
+    tfq_tables::load_or_write_pwv3_tables(path, tbl, false);
 }
 
-static std::vector<P2> train_2d(int K, int seed, int n_iter) {
-    std::mt19937 rng(seed);
-    std::normal_distribution<float> nd(0.0f, 1.0f);
-    const int NS = 200000;
-    std::vector<P2> data(NS);
-    for (int i = 0; i < NS; ++i) data[i] = {nd(rng), nd(rng)};
-    std::vector<P2> cen(K);
-    const double phi2 = 1.3247179572447460, a1 = 1.0/phi2, a2 = 1.0/(phi2*phi2);
-    for (int i = 0; i < K; ++i) {
-        double u1 = fmod(0.5 + (i+0.5)*a1 + 0.031*seed, 1.0);
-        double u2 = fmod(0.5 + (i+0.5)*a2 + 0.067*seed, 1.0);
-        cen[i] = {(float)inv_norm_cdf(u1), (float)inv_norm_cdf(u2)};
-    }
-    std::vector<double> sx(K), sy(K); std::vector<int> cnt(K);
-    for (int it = 0; it < n_iter; ++it) {
-        std::fill(sx.begin(), sx.end(), 0.0); std::fill(sy.begin(), sy.end(), 0.0); std::fill(cnt.begin(), cnt.end(), 0);
-        for (int i = 0; i < NS; ++i) {
-            float x = data[i].x, y = data[i].y; int bi = 0; float bd = 1e30f;
-            for (int k = 0; k < K; ++k) { float dx=x-cen[k].x, dy=y-cen[k].y, d=dx*dx+dy*dy; if (d < bd) { bd=d; bi=k; } }
-            sx[bi] += x; sy[bi] += y; cnt[bi]++;
-        }
-        for (int k = 0; k < K; ++k) if (cnt[k]) { cen[k].x = (float)(sx[k]/cnt[k]); cen[k].y = (float)(sy[k]/cnt[k]); }
-    }
-    return cen;
-}
-
-static void fill_c64(uint16_t out[64][4], float alpha, float beta) {
-    for (int i = 0; i < 64; ++i) {
-        float sx = (i & 1) ? -1.0f : 1.0f;
-        float sy = (i & 2) ? -1.0f : 1.0f;
-        double u0 = fmod((i + 0.5) * 0.6180339887498949, 1.0) * 2.0 - 1.0;
-        double u1 = fmod((i + 0.5) * 0.3819660112501051, 1.0) * 2.0 - 1.0;
-        double u2 = fmod((i + 0.5) * 0.7548776662466927, 1.0) * 2.0 - 1.0;
-        double u3 = fmod((i + 0.5) * 0.5698402909980532, 1.0) * 2.0 - 1.0;
-        out[i][0] = f32_to_f16(sx * (1.0f + alpha * (float)u0));
-        out[i][1] = f32_to_f16(sy * (1.0f + alpha * (float)u1));
-        out[i][2] = f32_to_f16(beta * (float)u2);
-        out[i][3] = f32_to_f16(beta * (float)u3);
-    }
-}
-
-static void load_or_generate_tables(const std::string& path, PwV3TablesFile& tbl) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (f) {
-        size_t nr = fread(&tbl, 1, sizeof(tbl), f);
-        fclose(f);
-        if (nr == sizeof(tbl) && tbl.magic == MAGIC_PWV3 && tbl.version == 3u) {
-            printf("Loaded existing v3 tables from %s\n", path.c_str());
-            return;
-        }
-    }
-    printf("Generating deterministic TFQ3 2D-AffineCoset tables -> %s ...\n", path.c_str());
-    fflush(stdout);
-    memset(&tbl, 0, sizeof(tbl));
-    tbl.magic = MAGIC_PWV3; tbl.version = 3u;
-    tbl.a3 = 0.22f; tbl.b3 = 0.38f;
-    tbl.a4 = 0.18f; tbl.b4 = 0.30f;
-    tbl.a5 = 0.10f; tbl.b5 = 0.18f;
-    for (int c = 0; c < 4; ++c) {
-        auto t3 = train_2d(64, 10 + c, 40);
-        for (int i = 0; i < 64; ++i) tbl.lut3_u32[i * 4 + c] = pack_h2(t3[i].x, t3[i].y);
-    }
-    for (int c = 0; c < 4; ++c) {
-        auto t4 = train_2d(256, 100 + c, 35);
-        for (int i = 0; i < 256; ++i) tbl.lut4_u32[i * 4 + c] = pack_h2(t4[i].x, t4[i].y);
-    }
-    auto t5 = train_2d(1024, 500, 30);
-    for (int i = 0; i < 1024; ++i) tbl.lut5_u32[i] = pack_h2(t5[i].x, t5[i].y);
-    fill_c64(tbl.c64_3, tbl.a3, tbl.b3);
-    fill_c64(tbl.c64_4, tbl.a4, tbl.b4);
-    fill_c64(tbl.c64_5, tbl.a5, tbl.b5);
-    FILE* fo = fopen(path.c_str(), "wb");
-    if (!fo) { fprintf(stderr, "Cannot write %s\n", path.c_str()); exit(1); }
-    fwrite(&tbl, 1, sizeof(tbl), fo);
-    fclose(fo);
-    printf("Saved %s (16,384 bytes)\n", path.c_str());
-}
-
-static std::vector<uint16_t> build_grid(const uint32_t* lut_u32, int lut_size, int N_sym, int C_shift, int G, int KC) {
-    int N_cb = lut_size / N_sym;
-    const float RMAX = 3.2f;
-    std::vector<uint16_t> grid((size_t)N_cb * G * G * KC);
-    std::vector<P2> pts(lut_size);
-    for (int i = 0; i < lut_size; ++i) {
-        pts[i] = {f16_to_f32((uint16_t)(lut_u32[i] & 0xFFFFu)), f16_to_f32((uint16_t)(lut_u32[i] >> 16))};
-    }
-    for (int c = 0; c < N_cb; ++c) {
-        for (int gy = 0; gy < G; ++gy) {
-            float cy = -RMAX + (gy + 0.5f) * (2.0f * RMAX / G);
-            for (int gx = 0; gx < G; ++gx) {
-                float cx = -RMAX + (gx + 0.5f) * (2.0f * RMAX / G);
-                std::vector<std::pair<float, uint16_t>> dl(N_sym);
-                for (int i = 0; i < N_sym; ++i) {
-                    int idx = (i << C_shift) | c;
-                    float dx = pts[idx].x - cx, dy = pts[idx].y - cy;
-                    dl[i] = {dx * dx + dy * dy, (uint16_t)i};
-                }
-                std::partial_sort(dl.begin(), dl.begin() + KC, dl.end());
-                size_t base = (((size_t)c * G + gy) * G + gx) * KC;
-                for (int k = 0; k < KC; ++k) grid[base + k] = dl[k].second;
-            }
-        }
-    }
-    return grid;
+static inline std::vector<uint16_t> build_grid(const uint32_t* lut_u32, int lut_size, int N_sym, int C_shift, int G, int KC) {
+    return tfq_tables::build_grid(lut_u32, lut_size, N_sym, C_shift, G, KC);
 }
 
 struct ShardCache {
@@ -544,15 +418,21 @@ int main(int argc, char** argv) {
                 for (uint32_t r0 = 0; r0 < t.R; r0 += chunk_R) {
                     uint32_t sr = std::min(chunk_R, t.R - r0);
                     if (is_bf16) {
-                        memcpy([buf_in_w contents], w_ptr + (size_t)r0 * t.C * 2, (size_t)sr * t.C * 2);
+                        const uint16_t* w_bf16 = reinterpret_cast<const uint16_t*>(w_ptr + (size_t)r0 * t.C * 2);
+                        tfq_common::check_finite_bf16(w_bf16, sr, t.C, t.src_module + ".weight", r0);
+                        memcpy([buf_in_w contents], w_bf16, (size_t)sr * t.C * 2);
                     } else {
+                        const uint16_t* s_bf16 = reinterpret_cast<const uint16_t*>(s_ptr + (size_t)r0 * (t.C / 64) * 2);
+                        const uint16_t* b_bf16 = reinterpret_cast<const uint16_t*>(b_ptr + (size_t)r0 * (t.C / 64) * 2);
+                        tfq_common::check_finite_bf16(s_bf16, sr, t.C / 64, t.src_module + ".scales", r0);
+                        tfq_common::check_finite_bf16(b_bf16, sr, t.C / 64, t.src_module + ".biases", r0);
                         memcpy([buf_in_w contents], w_ptr + (size_t)r0 * t.C, (size_t)sr * t.C);
-                        memcpy([buf_q8_s contents], s_ptr + (size_t)r0 * (t.C / 64) * 2, (size_t)sr * (t.C / 64) * 2);
-                        memcpy([buf_q8_b contents], b_ptr + (size_t)r0 * (t.C / 64) * 2, (size_t)sr * (t.C / 64) * 2);
+                        memcpy([buf_q8_s contents], s_bf16, (size_t)sr * (t.C / 64) * 2);
+                        memcpy([buf_q8_b contents], b_bf16, (size_t)sr * (t.C / 64) * 2);
                     }
                     size_t n_blks = (size_t)(sr / 128) * (t.C / 128);
 
-                    MatParams mp = {sr, t.C, t.bits, 1.0f, r0, 0u};
+                    MatParams mp = {sr, t.C, t.bits, tfq_common::qwen27_shrink(t.bits), r0, 0u};
                     uint32_t total_streams = (sr / 16) * 32;
                     uint32_t n_pairs = t.C / 4;
                     uint32_t batch_sz = (uint32_t)std::max<size_t>(1, HIST_SLOTS / n_pairs);

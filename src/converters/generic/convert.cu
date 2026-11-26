@@ -68,9 +68,10 @@ int main(int argc, char** argv) {
 
     mkdir(opt.out_dir.c_str(), 0755);
     std::string dst_tables = opt.out_dir + "/pw_v3_tables.bin";
-    if (opt.tables_path.empty()) opt.tables_path = dst_tables;
+    bool explicit_tables = !opt.tables_path.empty();
+    if (!explicit_tables) opt.tables_path = dst_tables;
     PwV3TablesFile tbl;
-    load_or_generate_tables(opt.tables_path, tbl);
+    load_or_generate_tables(opt.tables_path, tbl, explicit_tables);
     if (opt.tables_path != dst_tables) copy_file_if_exists(opt.tables_path, dst_tables);
 
     auto grid3 = build_grid(tbl.lut3_u32,  256,   64, 2, 16,  8);
@@ -129,7 +130,7 @@ int main(int argc, char** argv) {
 
         for (size_t ji : idxs) {
             auto& j = plan.jobs[ji];
-            const float shrink = (j.bits == 5u) ? 0.96f : ((j.bits == 4u) ? 0.94f : 0.92f);
+            const float shrink = tfq_common::generic_shrink(j.bits);
             const uint32_t R = j.pad_R, C = j.pad_C, B = j.bits;
             const uint32_t n_sc_tot = (R / 128u) * (C / 128u);
             const uint64_t n_w_tot  = (uint64_t)(R / 16u) * (C / 128u) * (B * 2u) * 32ULL;

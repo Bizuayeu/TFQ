@@ -45,6 +45,17 @@ kernel void f32_row_fwht(
     dst[lane +  0u] = v.x; dst[lane + 32u] = v.y; dst[lane + 64u] = v.z; dst[lane + 96u] = v.w;
 }
 
+inline float exact_fdiv(float a, float b) {
+    float y = 1.0f / b;
+    float e = fma(-b, y, 1.0f);
+    y = fma(y, e, y);
+    float q = a * y;
+    float r = fma(-b, q, a);
+    q = fma(r, y, q);
+    float r2 = fma(-b, q, a);
+    return fma(r2, y, q);
+}
+
 static inline float det_simd_sum(float v) {
     v += simd_shuffle_xor(v, 16);
     v += simd_shuffle_xor(v, 8);
@@ -74,7 +85,7 @@ kernel void col_fwht_and_ss(
     W_rot[ulong(r0 + lane + 32u) * P.C + c] = v.y;
     W_rot[ulong(r0 + lane + 64u) * P.C + c] = v.z;
     W_rot[ulong(r0 + lane + 96u) * P.C + c] = v.w;
-    float ss = det_simd_sum(dot(v, v));
+    float ss = det_simd_sum((v.x * v.x + v.y * v.y) + (v.z * v.z + v.w * v.w));
     uint bi = br * (P.C >> 7) + (c >> 7);
     if (lane == 0) col_ss[ulong(bi) * 128ul + (c & 127u)] = ss;
 }
@@ -120,7 +131,7 @@ kernel void tfq4_e8p_encode(
         uint wc = gtid - r * wpr;
         uint n_bc = P.C >> 7;
         float sc = float(scales[(r >> 7) * n_bc + (wc >> 3)]);
-        float inv_sc = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+        float inv_sc = (sc > 0.0f) ? exact_fdiv(1.0f, sc) : 0.0f;
         const device float* src = W_rot + ulong(r) * P.C + ulong(wc) * 16ul;
 
         uint codes[2];
@@ -141,7 +152,7 @@ kernel void tfq4_e8p_encode(
                 float d2 = a[2] - sm_lut[k][2], d3 = a[3] - sm_lut[k][3];
                 float d4 = a[4] - sm_lut[k][4], d5 = a[5] - sm_lut[k][5];
                 float d6 = a[6] - sm_lut[k][6], d7 = a[7] - sm_lut[k][7];
-                float dist = d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 + d7*d7;
+                float dist = ((d0*d0 + d1*d1) + (d2*d2 + d3*d3)) + ((d4*d4 + d5*d5) + (d6*d6 + d7*d7));
                 if (dist < best_d) { best_d = dist; best_k = k; }
             }
             codes[h] = (sm << 8) | best_k;

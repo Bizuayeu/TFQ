@@ -31,6 +31,7 @@ jobs:
         run: |
           python3 reference/tfq3_reference.py --self-test
           python3 reference/tfq4_lattice.py --self-test
+          python3 tests/vectors_test.py --no-gpu
           python3 tests/e2e_test.py --no-gpu
 
   macos-metal-build:
@@ -61,4 +62,5 @@ jobs:
         run: |
           python3 reference/tfq3_reference.py --self-test
           python3 reference/tfq4_lattice.py --self-test
+          python3 tests/vectors_test.py --no-gpu
           python3 tests/e2e_test.py --no-gpu

@@ -303,14 +303,18 @@ static inline float read_elem_f32(const uint8_t* ptr, const std::string& dt, uin
     if (dt == "F16") {
         uint16_t h; memcpy(&h, ptr + idx * 2, 2);
         uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 31u, m = h & 1023u;
-        float v = (e == 0) ? std::ldexp((float)m, -24)
-                           : (e == 31 ? 0.0f : std::ldexp(1.0f + (float)m / 1024.0f, (int)e - 15));
+        if (e == 31u) {
+            if (m != 0u) return std::nanf("");
+            return s ? -INFINITY : INFINITY;
+        }
+        float v = (e == 0u) ? std::ldexp((float)m, -24)
+                            : std::ldexp(1.0f + (float)m / 1024.0f, (int)e - 15);
         return s ? -v : v;
     }
     if (dt == "F8_E4M3") {
         uint8_t b = ptr[idx];
         int s = (b >> 7) & 1, e = (b >> 3) & 15, m = b & 7;
-        if (e == 15 && m == 7) return 0.0f;
+        if (e == 15 && m == 7) return std::nanf("");
         float v = (e == 0) ? std::ldexp((float)m, -9) : std::ldexp(1.0f + (float)m / 8.0f, e - 7);
         return s ? -v : v;
     }
@@ -652,6 +656,19 @@ static inline void decode_chunk_to_f32(
                 uint32_t c0 = g * job.group_size;
                 uint32_t c1 = std::min(job.orig_C, c0 + job.group_size);
                 for (uint32_t c = c0; c < c1; ++c) dst[c] = (float)src[c] * sc + bs;
+            }
+        }
+    }
+
+    // Reject NaN/Inf weights at conversion time so a damaged source checkpoint
+    // never silently corrupts a 128x128 rotated block and its fp16 scale.
+    for (uint32_t r = 0; r < r_valid; ++r) {
+        const float* row = out.data() + (size_t)r * job.pad_C;
+        for (uint32_t c = 0; c < job.orig_C; ++c) {
+            if (!std::isfinite(row[c])) {
+                fprintf(stderr, "Non-finite weight (%s) in tensor '%s' at [%u, %u]; refusing to quantize\n",
+                        std::isnan(row[c]) ? "NaN" : "Inf", job.weight_name.c_str(), r_start + r, c);
+                exit(1);
             }
         }
     }

@@ -16,6 +16,7 @@ Verifies:
 """
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
@@ -34,6 +35,22 @@ import tfq3_reference as tfq3_ref
 import tfq4_lattice as tfq4_ref
 
 ALIGN_16K = 16384
+
+GOLDEN_PWV3_SHA256 = "956c7abe5d400f302eaf8a2e9d0da50ee18f90d302de786cf6b2ec4905358bb7"
+GOLDEN_PWV4_SHA256 = "ddf28171bd5ea33e2cddc560b5543f6890f2a179bb6dce7082a66243c04b7405"
+GOLDEN_TFQ3_SHARD_SHA256 = {
+    3: "8e6a166749b1d28e4cd20934c9b0d2113a2a846acdbfbaea6d0977e68915fa64",
+    4: "c72b4d88b436404cbc5a21ea63d65419333d0f11fb14fcf5c03c7bb000f1a7d4",
+    5: "cc09a1c7e46881470ea45dde41137cea564a3118d3eab1bfdb8e05f4948f2dac",
+}
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def align16k(n: int) -> int:
@@ -375,6 +392,12 @@ def test_gpu_roundtrips(tfq3_cli: str, inspect_bin: str, model_dir: str, refs: d
         assert mf["num_quantized_tensors"] == 4 and mf["num_residual_tensors"] == 1
 
         tables_path = os.path.join(out_dir, "pw_v3_tables.bin")
+        assert sha256_file(tables_path) == GOLDEN_PWV3_SHA256, "pw_v3_tables.bin deviates from canonical SHA-256"
+        shard_path = os.path.join(out_dir, "tfq3-00001-of-00001.tffpw")
+        got_sha = sha256_file(shard_path)
+        assert got_sha == GOLDEN_TFQ3_SHARD_SHA256[bits], (
+            f"TFQ3 {bits}b cross-platform SHA-256 mismatch: got {got_sha}, expected {GOLDEN_TFQ3_SHARD_SHA256[bits]}"
+        )
 
         # Check non-128-multiple padded tensor [192, 256] -> [256, 256]
         q_name = "model.layers.0.self_attn.q_proj"
@@ -425,6 +448,7 @@ def test_gpu_roundtrips(tfq3_cli: str, inspect_bin: str, model_dir: str, refs: d
     assert mf4["num_quantized_tensors"] == 4 and mf4["num_residual_tensors"] == 1
 
     tbl4 = os.path.join(out_tfq4, "pw_v4_e8p_tables.bin")
+    assert sha256_file(tbl4) == GOLDEN_PWV4_SHA256, "pw_v4_e8p_tables.bin deviates from canonical SHA-256"
     # Padded [192, 256] tensor
     q_name = "model.layers.0.self_attn.q_proj"
     shard_q = find_shard_for_tensor(out_tfq4, ".tffp4", q_name)
@@ -463,7 +487,70 @@ def test_gpu_roundtrips(tfq3_cli: str, inspect_bin: str, model_dir: str, refs: d
     out_tfq4_r2 = os.path.join(tmp, "out_tfq4_r2")
     run([tfq3_cli, model_dir, "--bits", "2", "--max-shard-gib", "0.001", "--out", out_tfq4_r2])
     assert_dirs_byte_identical(out_tfq4, out_tfq4_r2, "TFQ4-E8P")
-    print("PASS bit-reproducibility: TFQ3-4b and TFQ4-E8P repeated runs are 100% byte-identical")
+    print("PASS bit-reproducibility: TFQ3-4b and TFQ4-E8P repeated runs are 100% byte-identical + cross-platform SHA-256 verified")
+
+    # 5. Mismatched pre-existing pw_v3_tables.bin must be refused unless --tables is passed (Issue #18)
+    out_bad_tbl = os.path.join(tmp, "out_bad_tbl")
+    os.makedirs(out_bad_tbl, exist_ok=True)
+    with open(os.path.join(out_bad_tbl, "pw_v3_tables.bin"), "wb") as f:
+        bad_tbl = bytearray(open(os.path.join(REPO_ROOT, "reference", "tables", "pw_v3_tables.bin"), "rb").read())
+        bad_tbl[128] ^= 0xFF
+        f.write(bad_tbl)
+    proc_bad_tbl = run([gen_bin, "--model", model_dir, "--out", out_bad_tbl, "--bits", "4"], expect_ok=False)
+    assert "mismatch" in proc_bad_tbl.stderr.lower(), proc_bad_tbl.stderr
+    print("PASS mismatched existing pw_v3_tables.bin refused without --tables")
+
+    # 6. TFQ4 --head-bits semantics (Issue #10): default=0 keeps lm_head in residual; 2 quantizes; 4 rejected
+    lm_dir = os.path.join(tmp, "lm_head_model")
+    os.makedirs(lm_dir, exist_ok=True)
+    rng = np.random.default_rng(77)
+    w_proj = (rng.standard_normal((256, 256)).astype(np.float32) * 0.02)
+    w_head = (rng.standard_normal((256, 256)).astype(np.float32) * 0.02)
+    hdr, pay = {}, bytearray()
+    for nm, arr in (("model.layers.0.self_attn.q_proj.weight", w_proj), ("lm_head.weight", w_head)):
+        raw = f32_to_bf16_bytes(arr)
+        hdr[nm] = {"dtype": "BF16", "shape": list(arr.shape), "data_offsets": [len(pay), len(pay) + len(raw)]}
+        pay.extend(raw)
+    hb = json.dumps(hdr, separators=(",", ":")).encode("utf-8")
+    with open(os.path.join(lm_dir, "model.safetensors"), "wb") as f:
+        f.write(struct.pack("<Q", len(hb)) + hb + pay)
+    with open(os.path.join(lm_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump({"model_type": "llama", "hidden_size": 256, "num_hidden_layers": 1}, f)
+
+    out_h0 = os.path.join(tmp, "out_tfq4_h0")
+    run([tfq3_cli, lm_dir, "--bits", "2", "--out", out_h0])
+    mf_h0 = json.load(open(os.path.join(out_h0, "tfq4_manifest.json")))
+    names_h0 = {t["name"] for t in mf_h0["tensors"]}
+    assert mf_h0["num_quantized_tensors"] == 1 and mf_h0["num_residual_tensors"] == 1, mf_h0
+    assert "lm_head" not in names_h0, mf_h0
+
+    out_h2 = os.path.join(tmp, "out_tfq4_h2")
+    run([tfq3_cli, lm_dir, "--bits", "2", "--head-bits", "2", "--out", out_h2])
+    mf_h2 = json.load(open(os.path.join(out_h2, "tfq4_manifest.json")))
+    names_h2 = {t["name"] for t in mf_h2["tensors"]}
+    assert mf_h2["num_quantized_tensors"] == 2 and "lm_head" in names_h2, mf_h2
+
+    run([tfq3_cli, lm_dir, "--bits", "2", "--head-bits", "4", "--out", os.path.join(tmp, "out_tfq4_h4")], expect_ok=False)
+    run([tfq4_bin, "--model", lm_dir, "--head-bits", "4", "--out", os.path.join(tmp, "out_tfq4_h4b")], expect_ok=False)
+    print("PASS TFQ4 --head-bits (default=0 keeps lm_head in residual, 2 quantizes, 4 rejected)")
+
+    # 7. Non-finite weights (NaN / Inf) must fail both TFQ3 and TFQ4 converters nonzero (Issue #11)
+    for bad_label, bad_val in (("nan", np.float32("nan")), ("inf", np.float32("inf"))):
+        bad_dir = os.path.join(tmp, f"bad_{bad_label}_model")
+        os.makedirs(bad_dir, exist_ok=True)
+        arr = np.zeros((128, 128), dtype=np.float32)
+        arr[7, 13] = bad_val
+        raw = arr.tobytes()
+        hdr_b = json.dumps({"model.layers.0.self_attn.q_proj.weight": {"dtype": "F32", "shape": [128, 128], "data_offsets": [0, len(raw)]}}).encode("utf-8")
+        with open(os.path.join(bad_dir, "model.safetensors"), "wb") as f:
+            f.write(struct.pack("<Q", len(hdr_b)) + hdr_b + raw)
+        with open(os.path.join(bad_dir, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"model_type": "llama", "hidden_size": 128, "num_hidden_layers": 1}, f)
+        p3 = run([gen_bin, "--model", bad_dir, "--bits", "4", "--out", os.path.join(tmp, f"bad3_{bad_label}")], expect_ok=False)
+        assert "non-finite" in p3.stderr.lower() and "[7, 13]" in p3.stderr, p3.stderr
+        p4 = run([tfq4_bin, "--model", bad_dir, "--out", os.path.join(tmp, f"bad4_{bad_label}")], expect_ok=False)
+        assert "non-finite" in p4.stderr.lower() and "[7, 13]" in p4.stderr, p4.stderr
+    print("PASS NaN/Inf weights rejected nonzero by TFQ3 and TFQ4 converters with tensor + [row, col]")
 
 
 def test_moe_datafree_ranking(tmp: str) -> None:
@@ -786,6 +873,68 @@ def test_install_script(tmp: str) -> None:
     print("PASS install.sh: nvidia-smi failure falls back to native, TFQ3_COMMIT enforced, truncated script runs nothing")
 
 
+def test_canonical_tables(tmp: str) -> None:
+    """Committed canonical tables match golden SHA-256s and tfq3-train-tables reproduces them byte-for-byte."""
+    pwv3_ref = os.path.join(REPO_ROOT, "reference", "tables", "pw_v3_tables.bin")
+    pwv4_ref = os.path.join(REPO_ROOT, "reference", "tables", "pw_v4_e8p_tables.bin")
+    assert sha256_file(pwv3_ref) == GOLDEN_PWV3_SHA256, f"pw_v3_tables.bin hash mismatch: {sha256_file(pwv3_ref)}"
+    assert sha256_file(pwv4_ref) == GOLDEN_PWV4_SHA256, f"pw_v4_e8p_tables.bin hash mismatch: {sha256_file(pwv4_ref)}"
+    trainer = os.path.join(REPO_ROOT, "build", "tfq3-train-tables")
+    if os.path.isfile(trainer):
+        out_v3 = os.path.join(tmp, "regen_pw_v3.bin")
+        out_v4 = os.path.join(tmp, "regen_pw_v4.bin")
+        run([trainer, "--out-v3", out_v3, "--out-v4", out_v4])
+        assert sha256_file(out_v3) == GOLDEN_PWV3_SHA256, "tfq3-train-tables PWV3 drifted from canonical SHA-256"
+        assert sha256_file(out_v4) == GOLDEN_PWV4_SHA256, "tfq3-train-tables PWV4 drifted from canonical SHA-256"
+        print("PASS canonical tables (PWV3 + PWV4 SHA-256 match committed files and tfq3-train-tables)")
+    else:
+        print("PASS canonical tables (committed PWV3 + PWV4 SHA-256 match golden hashes)")
+
+
+def test_planner_nonfinite(tmp: str) -> None:
+    """decode_chunk_to_f32 must refuse NaN/Inf in BF16, F16, F32, and FP8 weights with tensor name + [row, col]."""
+    cxx = "clang++" if platform.system() == "Darwin" else "g++"
+    src = os.path.join(tmp, "test_planner_nonfinite.cpp")
+    exe = os.path.join(tmp, "test_planner_nonfinite")
+    hdr = os.path.join(REPO_ROOT, "src", "converters", "generic", "planner.hpp")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(
+            f'#include "{hdr}"\n'
+            'int main(int, char** argv) {\n'
+            '    using namespace tfq_generic;\n'
+            '    SafetensorsDir st;\n'
+            '    st.init(argv[1]);\n'
+            '    GenericOptions opt;\n'
+            '    opt.model_dir = argv[1];\n'
+            '    ConversionPlan plan = build_plan(st, opt);\n'
+            '    std::vector<float> out;\n'
+            '    decode_chunk_to_f32(st, plan.jobs[0], 0, plan.jobs[0].orig_R, out);\n'
+            '    return 0;\n'
+            '}\n'
+        )
+    run([cxx, "-O2", "-std=c++17", "-Wall", "-Wextra", "-Werror", src, "-o", exe])
+    cases = [
+        ("f32_nan", "F32", np.float32("nan").tobytes()),
+        ("f32_inf", "F32", np.float32("-inf").tobytes()),
+        ("f16_nan", "F16", struct.pack("<H", 0x7E00)),
+        ("bf16_inf", "BF16", struct.pack("<H", 0x7F80)),
+        ("fp8_nan", "F8_E4M3", bytes([0x7F])),
+    ]
+    for label, dtype, bad_elem in cases:
+        d = os.path.join(tmp, f"nf_{label}")
+        os.makedirs(d, exist_ok=True)
+        esz = len(bad_elem)
+        raw = bytearray(128 * 128 * esz)
+        pos = (5 * 128 + 9) * esz
+        raw[pos : pos + esz] = bad_elem
+        hdr_b = json.dumps({"layer.0.proj.weight": {"dtype": dtype, "shape": [128, 128], "data_offsets": [0, len(raw)]}}).encode("utf-8")
+        with open(os.path.join(d, "model.safetensors"), "wb") as f:
+            f.write(struct.pack("<Q", len(hdr_b)) + hdr_b + raw)
+        proc = run([exe, d], expect_ok=False)
+        assert "non-finite" in proc.stderr.lower() and "[5, 9]" in proc.stderr, f"{label}: {proc.stderr}"
+    print(f"PASS planner rejects non-finite weights ({len(cases)} dtype/value cases)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-gpu", action="store_true", help="Skip GPU converter round-trips (for headless CI runners)")
@@ -802,9 +951,11 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="tfq_e2e_") as tmp:
         model_dir = os.path.join(tmp, "synth_model")
         refs = write_synthetic_model(model_dir)
+        test_canonical_tables(tmp)
         test_moe_datafree_ranking(tmp)
         test_planner_shape_whitespace(tmp)
         test_planner_fp8_scales(tmp)
+        test_planner_nonfinite(tmp)
         test_planner_budget_minimum(tmp)
         test_planner_mlx_bits(tmp)
         test_inspector_negative_controls(inspect_bin, tmp)

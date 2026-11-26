@@ -24,6 +24,10 @@ Fixed size: **16,384 bytes** (active payload: **10,816 bytes**, zero-padded to 1
 | `10304` | 512 | `half4[64]` | `c64_5` | 64 affine coset tuples `(sx, sy, tx, ty)` for 5-bit |
 | `10816` | 5,568 | `u8[5568]` | `pad1` | Zero padding to `16,384` bytes |
 
+- **Canonical table SHA-256 (`reference/tables/pw_v3_tables.bin`):**
+  `956c7abe5d400f302eaf8a2e9d0da50ee18f90d302de786cf6b2ec4905358bb7`
+  All Metal and CUDA converters embed and emit this exact canonical codebook by default unless `--tables <path>` is passed explicitly.
+
 **Validation requirements:**
 - File size `>= 10,816` bytes (canonically `16,384` bytes).
 - `magic == 0x33565750` and `version == 3`.
@@ -178,7 +182,202 @@ Any compliant reader (and `build/tfq3-inspect`) enforces:
 
 - **`pw_v4_e8p_tables.bin` (`PWV4`, fixed 16,384 bytes):**
   - Header (`64` bytes): `magic = 0x34565750` (`"PWV4"`), `version = 4`, `k_codes = 256`, `dim = 8`, `pad0[12]`.
-  - Offset `64..4160`: `e8p_lut[256][8]` (`fp16`, **`4,096` bytes**) — deterministic positive-orthant 8D `E8P` centroids.
+  - Offset `64..4160`: `e8p_lut[256][8]` (`fp16`, **`4,096` bytes**) — deterministic positive-orthant 8D E8-initialized Voronoi codebook.
+  - **Canonical table SHA-256 (`reference/tables/pw_v4_e8p_tables.bin`):**
+    `ddf28171bd5ea33e2cddc560b5543f6890f2a179bb6dce7082a66243c04b7405`
 - **`*.tffp4` (`TFP4`, 16 KiB-aligned):**
   - Identical 64-byte header (`magic = 0x34504654`, `version = 4`) and 128-byte tensor metadata (`b_bits = 2`, `word_count = R * (C / 16)`, `pad = [orig_R, orig_C, flags]`) as `TFPN`.
   - Row-major packed `uint32_t[R, C / 16]`: each `uint32_t` holds two 16-bit codes `(sign_mask << 8) | abs_idx` (`c0 = w & 0xFFFF`, `c1 = w >> 16`), decoding 16 rotated weights via branchless `half2` sign XOR against `e8p_lut[abs_idx]`.
+
+---
+
+## 6. Decoding Specification (Normative)
+
+This section defines the exact mapping from packed binary words and scales to spatial `fp32` weights `W[R, C]`. The Python implementations in [`reference/tfq3_reference.py`](../reference/tfq3_reference.py) and [`reference/tfq4_lattice.py`](../reference/tfq4_lattice.py) are normative; golden test vectors generated from the canonical tables live in `reference/vectors/` and are verified against the reference, Metal, and CUDA decoders by `tests/vectors_test.py`.
+
+All unsigned integer arithmetic below is modulo $2^{32}$ (`u32`, masked with `& 0xFFFFFFFF`).
+
+### 6.1 Common Rotation Primitives (TFQ3 & TFQ4)
+
+Both TFQ3 and TFQ4 rotate every `128 × 128` weight tile `(rb, bc)` using deterministic Rademacher sign flips and an orthonormal 128-point Fast Walsh-Hadamard Transform (`FWHT-128`):
+
+```python
+SEED_COL = 0x12345678
+SEED_ROW = 0x9E3779B9
+
+def pw_sgn(seed: u32, idx: u32) -> f32:
+    h = ((idx ^ seed) * 2654435761) & 0xFFFFFFFF
+    return -1.0 if ((h >> 31) & 1) else 1.0
+
+def fwht_128(x: f32[128]) -> f32[128]:
+    # In-place radix-2 butterfly for h = 1, 2, 4, 8, 16, 32, 64:
+    #   for block_start in range(0, 128, 2*h):
+    #     for j in range(h):
+    #       u, v = x[block_start + j], x[block_start + j + h]
+    #       x[block_start + j]     = u + v
+    #       x[block_start + j + h] = u - v
+    # Then normalize by 1 / sqrt(128) = 0.08838834764831845.
+```
+
+Given a decoded, scaled rotated tile `W_rot[128, 128]` at **absolute** tensor coordinates `(r_off = rb * 128, c_off = bc * 128)`:
+
+1. Column-wise `FWHT-128` followed by absolute row signs:
+   `tmp[r, c] = fwht_128(W_rot[:, c])[r] * pw_sgn(SEED_ROW, r_off + r)`
+2. Row-wise `FWHT-128` followed by absolute column signs:
+   `W[r, c]   = fwht_128(tmp[r, :])[c] * pw_sgn(SEED_COL, c_off + c)`
+
+> **Important (Row-Chunked & Column-TP Decoding):** Row signs always index by the **absolute row** `r_off + r` of the tensor (`r_off = 0` for standalone tensors; `r_off = n_start` when decoding a Column-TP slice or fused second projection). Equivalently, for a GEMM `Y = X @ W.T`, a kernel rotates `X` along `K` with `pw_sgn(SEED_COL, k_off + c)` + `FWHT-128`, accumulates `Y_rot = X_rot @ W_rot.T`, and unrotates `Y_rot` along `N` with `FWHT-128` + `pw_sgn(SEED_ROW, row_off + r)`.
+
+### 6.2 TFQ3 Trellis State, Lane Mapping, and Block Resume
+
+A TFQ3 tensor `[R, C]` has `n_rb = R / 128` row blocks, `n_bc = C / 128` column blocks, `R / 16` horizontal strips (`strip = rb * 8 + s`, `s ∈ [0..7]`), and `wpb = b_bits * 2` words per lane per column block. Each strip carries `32` independent trellis streams (`lane ∈ [0..31]`):
+
+```python
+HASH_MULT    = 0x9E3779B1
+INIT_ST_BASE = 0x13579BDF
+
+def pw_frag_home(lane: u32) -> (col: u32, row: u32):
+    col = (lane & 1) * 4 + ((lane >> 3) & 1) * 8   # {0, 4, 8, 12}
+    row = ((lane >> 1) & 3) + ((lane >> 4) & 1) * 4 # {0..7}
+    return (col, row)
+```
+
+For strip `strip` (`strip_base = strip * n_bc * wpb * 32`), column block `bc ∈ [0..n_bc)`, and `lane ∈ [0..31]`:
+
+- **Initial state (`bc == 0`):**
+  `st = (INIT_ST_BASE ^ ((lane * HASH_MULT) & 0xFFFFFFFF)) & 0xFFFFFFFF`
+- **Random-access resume (`bc > 0`, e.g., split-K or Row-TP):**
+  Every bit width's 32-bit state at the start of block `bc` is stored verbatim in the last packed `u32` word of block `bc - 1` for that `(strip, lane)`:
+  - `b_bits == 4`: `st = words[strip_base + (bc * 2 - 1) * 128 + lane * 4 + 3]` (`uint4` element `.w` of half `h = 1` of block `bc - 1`)
+  - `b_bits == 3` or `5`: `st = words[strip_base + (bc * wpb - 1) * 32 + lane]` (the final SoA plane of half `h = 1` of block `bc - 1`)
+
+Within each column block `bc`, the `128` columns are split into `2` halves `h ∈ {0, 1}` of `64` columns each, and each half contains `4` subtiles `k ∈ {0, 1, 2, 3}` of `16` columns each (`kt = h * 4 + k ∈ [0..7]`). Each subtile decodes `8` rotated unit-variance weights `q[0..7]` and writes them scaled by `sc = f32(scales[rb * n_bc + bc])`:
+
+```python
+hc, hr = pw_frag_home(lane)
+c0 = h * 64 + k * 16 + hc
+W_rot[s * 16 + hr,     c0 : c0 + 4] = q[0:4] * sc
+W_rot[s * 16 + hr + 8, c0 : c0 + 4] = q[4:8] * sc
+```
+
+### 6.3 TFQ3 Subtile Decode Pseudo-Code (`3b`, `4b`, `5b`)
+
+Let `lut[idx] = (lx, ly)` be the `fp16` pair unpacked from `lut{3,4,5}_u32[idx]` and `c64[ci] = (sx, sy, tx, ty)` be the `half4` affine coset tuple from `c64_{3,4,5}[ci]`. For every subtile, pairs `(0, 1)` share coset `c0 = c64[(h0 >> 16) & 63]` and pairs `(2, 3)` share coset `c2 = c64[(h2 >> 16) & 63]`:
+
+```python
+def affine_pair(p: (f32, f32), c: (f32, f32, f32, f32)) -> (f32, f32):
+    # GPU kernels compute fma(half2(p), half2(c.x, c.y), half2(c.z, c.w)) in fp16;
+    # the normative Python reference evaluates the same formula in fp32.
+    return (p[0] * c[0] + c[2], p[1] * c[1] + c[3])
+```
+
+#### 4-bit (`b_bits = 4`, `wpb = 8`, AoS `uint4`)
+
+Half `h ∈ {0, 1}` loads four `u32` words for `lane` at `idx = strip_base + (bc * 2 + h) * 128 + lane * 4`; subtile `k ∈ {0..3}` uses `wc = words[idx + k]`:
+
+```python
+def decode_8_4b(st: u32, wc: u32, lut4, c64_4) -> (new_st: u32, q: f32[8]):
+    s0 = st
+    h0 = (s0 * 0x9E3779B1) & 0xFFFFFFFF
+    h1 = ((((s0 <<  8) | (wc >> 24)) & 0xFFFFFFFF) * 0x9E3779B1) & 0xFFFFFFFF
+    h2 = ((((s0 << 16) | (wc >> 16)) & 0xFFFFFFFF) * 0x9E3779B1) & 0xFFFFFFFF
+    h3 = ((((s0 << 24) | (wc >>  8)) & 0xFFFFFFFF) * 0x9E3779B1) & 0xFFFFFFFF
+    c0 = c64_4[(h0 >> 16) & 63]
+    c2 = c64_4[(h2 >> 16) & 63]
+    p0 = lut4[((( wc >> 24)        << 2) ^ (h0 >> 22)) & 1023]
+    p1 = lut4[((((wc >> 16) & 255) << 2) ^ (h1 >> 22)) & 1023]
+    p2 = lut4[((((wc >>  8) & 255) << 2) ^ (h2 >> 22)) & 1023]
+    p3 = lut4[((( wc        & 255) << 2) ^ (h3 >> 22)) & 1023]
+    q  = [*affine_pair(p0, c0), *affine_pair(p1, c0),
+          *affine_pair(p2, c2), *affine_pair(p3, c2)]
+    return (wc, q)
+```
+
+#### 3-bit (`b_bits = 3`, `wpb = 6`, 3 SoA planes per half)
+
+Half `h ∈ {0, 1}` loads three `u32` plane words at `idx = strip_base + (bc * 6 + h * 3) * 32 + lane`:
+`a0 = words[idx]`, `a1 = words[idx + 32]`, `a2 = words[idx + 64]`.
+These 96 bits unpack big-endian into four 24-bit codes `m24[0..3]`:
+
+```python
+m24 = [
+    a0 >> 8,
+    ((a0 << 16) | (a1 >> 16)) & 0xFFFFFF,
+    ((a1 <<  8) | (a2 >> 24)) & 0xFFFFFF,
+    a2 & 0xFFFFFF,
+]
+
+def decode_8_3b(st: u32, m24: u32, lut3, c64_3) -> (new_st: u32, q: f32[8]):
+    s0 = st
+    h0 = (s0 * 0x9E3779B1) & 0xFFFFFFFF
+    h1 = ((((s0 <<  6) | (m24 >> 18)) & 0xFFFFFFFF) * 0x9E3779B1) & 0xFFFFFFFF
+    h2 = ((((s0 << 12) | (m24 >> 12)) & 0xFFFFFFFF) * 0x9E3779B1) & 0xFFFFFFFF
+    h3 = ((((s0 << 18) | (m24 >>  6)) & 0xFFFFFFFF) * 0x9E3779B1) & 0xFFFFFFFF
+    new_st = ((s0 << 24) | m24) & 0xFFFFFFFF
+    c0 = c64_3[(h0 >> 16) & 63]
+    c2 = c64_3[(h2 >> 16) & 63]
+    p0 = lut3[(((m24 >> 16) & 0xFC) ^ (h0 >> 24)) & 255]
+    p1 = lut3[(((m24 >> 10) & 0xFC) ^ (h1 >> 24)) & 255]
+    p2 = lut3[(((m24 >>  4) & 0xFC) ^ (h2 >> 24)) & 255]
+    p3 = lut3[(((m24 <<  2) & 0xFC) ^ (h3 >> 24)) & 255]
+    q  = [*affine_pair(p0, c0), *affine_pair(p1, c0),
+          *affine_pair(p2, c2), *affine_pair(p3, c2)]
+    return (new_st, q)
+```
+
+Notice why `bc > 0` resume works for 3-bit: `new_st` shifts in 24 bits per subtile (`4 × 24 = 96` bits per half), so after subtile `k = 3` of half `h = 1`, the low 32 bits of the bit stream equal `a2` verbatim (`words[strip_base + (bc * 6 - 1) * 32 + lane]`).
+
+#### 5-bit (`b_bits = 5`, `wpb = 10`, 5 SoA planes per half)
+
+Half `h ∈ {0, 1}` loads five `u32` plane words at `idx = strip_base + (bc * 10 + h * 5) * 32 + lane`:
+`w0..w4 = words[idx + j * 32]` for `j ∈ {0..4}`.
+These 160 bits unpack big-endian into four 40-bit codes `(hi8, lo32)`:
+
+```python
+codes_40b = [
+    (w0 >> 24,         ((w0 <<  8) | (w1 >> 24)) & 0xFFFFFFFF),
+    ((w1 >> 16) & 255, ((w1 << 16) | (w2 >> 16)) & 0xFFFFFFFF),
+    ((w2 >>  8) & 255, ((w2 << 24) | (w3 >>  8)) & 0xFFFFFFFF),
+    (w3 & 255,         w4),
+]
+
+def decode_8_5b(st: u32, hi8: u32, lo32: u32, lut5, c64_5) -> (new_st: u32, q: f32[8]):
+    s0 = st
+    b0 = ((hi8 << 2) | (lo32 >> 30)) & 1023
+    b1 = (lo32 >> 20) & 1023
+    b2 = (lo32 >> 10) & 1023
+    b3 = lo32 & 1023
+    h0 = (s0 * 0x9E3779B1) & 0xFFFFFFFF
+    h1 = ((((s0 << 10) | b0) & 0xFFFFFFFF) * 0x9E3779B1) & 0xFFFFFFFF
+    h2 = ((((s0 << 20) | (hi8 << 12) | (lo32 >> 20)) & 0xFFFFFFFF) * 0x9E3779B1) & 0xFFFFFFFF
+    h3 = ((((s0 << 30) | (hi8 << 22) | (lo32 >> 10)) & 0xFFFFFFFF) * 0x9E3779B1) & 0xFFFFFFFF
+    c0 = c64_5[(h0 >> 16) & 63]
+    c2 = c64_5[(h2 >> 16) & 63]
+    p0 = lut5[(b0 ^ (h0 >> 22)) & 1023]
+    p1 = lut5[(b1 ^ (h1 >> 22)) & 1023]
+    p2 = lut5[(b2 ^ (h2 >> 22)) & 1023]
+    p3 = lut5[(b3 ^ (h3 >> 22)) & 1023]
+    q  = [*affine_pair(p0, c0), *affine_pair(p1, c0),
+          *affine_pair(p2, c2), *affine_pair(p3, c2)]
+    return (lo32, q)
+```
+
+Because `new_st = lo32` and subtile `k = 3` of half `h = 1` has `lo32 = w4`, the state entering block `bc > 0` equals `words[strip_base + (bc * 10 - 1) * 32 + lane]` verbatim.
+
+### 6.4 TFQ4 (`2.001 bpw`) Decode Pseudo-Code
+
+TFQ4 stores row-major `words[R, C / 16]` (`u32`) and block scales `scales[R / 128, C / 128]` (`fp16`) using `e8p_lut[256, 8]` (`fp16`, non-negative):
+
+```python
+def decode_16_tfq4(w: u32, e8p_lut: f32[256, 8]) -> f32[16]:
+    out = [0.0] * 16
+    for half_idx, code in enumerate((w & 0xFFFF, w >> 16)):
+        abs_idx   = code & 0xFF
+        sign_mask = code >> 8
+        for d in range(8):
+            sgn = -1.0 if ((sign_mask >> d) & 1) else 1.0
+            out[half_idx * 8 + d] = e8p_lut[abs_idx][d] * sgn
+    return out
+```
+
+For each row `r ∈ [0..R)` and word column `wc ∈ [0..C/16)`, write `W_rot[r, wc*16 : wc*16 + 16] = decode_16_tfq4(words[r, wc], e8p_lut) * f32(scales[r // 128, wc // 8])`, then apply the same `128 × 128` tile inverse `2D FWHT-128` (§6.1) with `r_off = rb * 128, c_off = bc * 128`.

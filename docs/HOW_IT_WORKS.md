@@ -1,6 +1,6 @@
 # How TFQ3 Works
 
-TFQ3 is a **cross-platform, transform-coded 2D vector quantization** scheme designed for both **maximum information-theoretic fidelity** (beating uniform affine 4-bit by ~2.5 dB weight SNR and −31% to −46% KL divergence) and **maximum GPU throughput on both Apple Silicon (Metal) and NVIDIA GPUs (CUDA `sm_80+`)** — with one binary checkpoint working byte-for-byte on both platforms.
+TFQ3 is a **cross-platform, transform-coded 2D vector quantization** scheme designed for both **high weight fidelity** (beating uniform affine 4-bit by ~2.5 dB weight SNR) and **high GPU throughput on both Apple Silicon (Metal) and NVIDIA GPUs (CUDA `sm_80+`)** — the same binary checkpoint file runs unmodified on both platforms, and both the Metal and CUDA converters produce byte-for-byte identical files (matching SHA-256) from the same source weights. *(Runtime inference kernels use each architecture's native MMA/reduction schedules, so Metal and CUDA inference outputs match within normal fp16/bf16 rounding tolerance rather than bit-for-bit across vendors.)*
 
 ---
 
@@ -68,9 +68,7 @@ Each GPU thread (`lane ∈ [0..31]`) decodes 8 weights (4 pairs = two `half4` ve
 - **Why this matters for GPU speed:** To start a `split-K` threadgroup at *any* arbitrary 128-column block boundary `bc0 > 0`, the kernel does **not** need to walk from `bc = 0` or store sideband state! It simply loads the single preceding 32-bit weight word at `bc0 - 1` (`q27_pw_init_st`) and immediately has the exact rolling state `st` for `bc0`!
 
 ### Encoding (Apple Silicon Metal & NVIDIA CUDA)
-At conversion time, both the Metal (`.mm`/`.metal`) and CUDA (`.cu`) GPU encoders perform the exact same fast **2-step lookahead search** (using spatial acceleration grids over `lut3`/`lut4`/`lut5`) to jointly choose the 2D code indices that minimize L2 distortion across the state transitions, followed by an exact closed-form optimal RMS scale polish per $128 \times 128$ block:
-
-$$\sigma^* = \frac{\langle \widetilde{W}, \widehat{W} \rangle}{\|\widehat{W}\|_2^2}$$
+At conversion time, both the Metal (`src/converters/metal_encode_common.metal`) and CUDA (`src/converters/cuda_encode_common.cuh`) GPU encoders run the exact same deterministic **256-wide beam search** over 32-bit trellis states (`K_KEEP = 5` for 3b/4b, `6` for 5b) using spatial acceleration grids over `lut3`/`lut4`/`lut5` and a deterministic 64-bin histogram cut with prefix-scan compaction. Before encoding each $128 \times 128$ rotated block $\widetilde{W}$, its `fp16` block scale is set once to $\sigma = \mathrm{fp16}(\mathrm{RMS}(\widetilde{W}) \cdot \text{shrink})$ (`0.92 / 0.94 / 0.96` in the generic converter for `3b / 4b / 5b`, `0.992 / 0.997 / 0.999` in `qwen27`, `1.0` in MoE). Both backends compile encoder kernels without fast-math/FMA contraction, embed the same canonical `PWV3` tables, and emit **byte-for-byte identical `.tffpw` files** (matching SHA-256). *(Optional calibration-aware Hessian-LDLQ encoding with closed-form Hessian-optimal scale polish lives in [`tools/tfq3_hessian.py`](../tools/tfq3_hessian.py).)*
 
 Achieved weight SNR on real transformer weights (zero calibration):
 - **3-bit (`3.001 bpw`):** **`17.17 dB`**
@@ -89,8 +87,8 @@ Inside each `16 × 16` subtile, 32 lanes (one Apple Silicon SIMD group or one NV
   - During **prefill**, decoded `q0, q1` populate `tfp::frag<half>` registers directly in place — feeding Apple M5 NAX `tfp::mma_16x32` with zero shared-memory staging (and falling back cleanly to `simdgroup_matrix` via `TF_SIMD_FRAGS` on M1–M4).
 - **NVIDIA GPUs (CUDA, `sm_80+` Ampere / Ada / Hopper / Blackwell):**
   - Each warp decodes its `16 × 16` strip into a bank-conflict-free `16 × 24` shared-memory tile (`ldm = 24`, activations at `ldm = 136`) and executes direct PTX `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` Tensor Core instructions.
-  - The 3D split-K=8 kernel (`grid = (N/64, 8, ceil(rows/16))`, 4 warps/CTA) uses the exact same accumulation order for every speculative verify batch width `rows = 1..64`, guaranteeing **100% bit-exact** outputs across `--no-drafts`, `DFlash2`, `DSpine`, and `MTP` while saturating memory bandwidth (~265–274 GB/s on NVIDIA GB10).
-  - Wide-N (`lm_head`), small-K, and prompt prefill (`rows > 64`) use the fused 8-warp `m16n8k16` + inverse-FWHT-128 kernel (`tfq3_mma_fused_kernel`), and routed MoE layers run fused mixed-bit `3b/4b/5b` `gate+up+SwiGLU` and `down` kernels (`tfq3_moe_gu_swiglu_kernel`, `tfq3_moe_down_kernel`).
+  - Multi-row decode (`rows = 1..64`) decodes each weight tile **once per CTA** and runs all `MTILES = ceil(rows / 16) ∈ {1..4}` row slices in an inner loop (`tfq3_mma_sk_kernel<BITS, MTILES>` for split-K, `tfq3_mma_fused_mt_kernel<BITS, MTILES>` for `ksplit = 1`). The split-K factor is fixed solely by `(N, K)` (`ks = 1` with zero partial buffer for wide projections `N >= 32768`, `ks = 4/8` with ≤ `10 MiB` partials for narrower `N`), guaranteeing **100% bit-exact** outputs across `rows = 1..64` for `--no-drafts`, `DFlash2`, `DSpine`, and `MTP` speculative verification.
+  - Long-context prompt prefill (`rows > 64`) uses `tfq3_mma_fused_mt_kernel<BITS, 4>`, zero-repack multi-GPU Tensor Parallelism uses `tfq3_mma_prefill_tp_kernel`, and routed MoE layers run fused mixed-bit `3b/4b/5b` `gate+up+SwiGLU` and `down` kernels (`tfq3_moe_gu_swiglu_kernel`, `tfq3_moe_down_kernel`).
 
 Word packing per `16 × 128` block (8 subtiles × 32 lanes):
 - **4-bit:** `8` uint32 words/lane (`2 × uint4` vectorized AoS loads = `256` uint32 words per strip-block).

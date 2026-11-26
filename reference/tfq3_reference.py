@@ -243,10 +243,32 @@ def dequantize_tfpn_tensor(shard_path: str, tables_path: str, tensor_name: str, 
     return out
 
 
-def decode_tfpn_fast_np(words: np.ndarray, scales: np.ndarray, R: int, C: int, bits: int, tbl: dict) -> np.ndarray:
-    """Vectorized NumPy decoder for TFPN v3 (exact match to tfq3_reference.dequantize_tfpn_tensor, ~50x faster)."""
+def decode_tfpn_fast_np(
+    words: np.ndarray,
+    scales: np.ndarray,
+    R: int,
+    C: int,
+    bits: int,
+    tbl: dict,
+    r_off: int = 0,
+    bc0: int = 0,
+    bc1: int | None = None,
+    c_sign_off: int | None = None,
+) -> np.ndarray:
+    """Vectorized NumPy decoder for TFPN v3 (exact match to dequantize_tfpn_tensor, ~50x faster).
+
+    Optional TP/slice arguments:
+      - `r_off`: absolute row offset (multiple of 128) for row sign hash `SEED_ROW`.
+      - `bc0`, `bc1`: column-block slice `[bc0, bc1)` within `n_bc = C // 128`, resuming trellis state
+        at `bc0 > 0` from block `bc0 - 1` and indexing column sign hash `SEED_COL` by absolute column.
+    """
     n_strips = R // 16
     n_bc = C // 128
+    if bc1 is None:
+        bc1 = n_bc
+    assert 0 <= bc0 < bc1 <= n_bc and (r_off % 128 == 0)
+    n_bc_out = bc1 - bc0
+    C_out = n_bc_out * 128
     wpb = bits * 2
     W = words.reshape(n_strips, n_bc * wpb * 32).astype(np.uint64)
     lut = tbl["lut"][bits].astype(np.float32)  # [N, 2]
@@ -258,12 +280,13 @@ def decode_tfpn_fast_np(words: np.ndarray, scales: np.ndarray, R: int, C: int, b
     mask32 = np.uint64(0xFFFFFFFF)
     mult = np.uint64(HASH_MULT)
     st = (np.uint64(INIT_ST_BASE) ^ ((lanes * mult) & mask32))[None, :].repeat(n_strips, axis=0)
-    blk_rot = np.empty((R, C), dtype=np.float32)
+    blk_rot = np.empty((R, C_out), dtype=np.float32)
     s_idx = (np.arange(n_strips, dtype=np.int64) * 16)[:, None]
     r_lo = s_idx + hr[None, :]
     r_hi = r_lo + 8
 
-    for cb in range(n_bc):
+    for cb in range(bc0, bc1):
+        cb_loc = cb - bc0
         if cb > 0:
             if bits == 4:
                 st = W[:, (cb * 2 - 1) * 128 + lanes * 4 + 3] & mask32
@@ -285,7 +308,7 @@ def decode_tfpn_fast_np(words: np.ndarray, scales: np.ndarray, R: int, C: int, b
                     p2 = lut[(((((wc >> 8) & 255) << 2) ^ (h2 >> 22)) & 1023).astype(np.int64)]
                     p3 = lut[((((wc & 255) << 2) ^ (h3 >> 22)) & 1023).astype(np.int64)]
                     st = wc & mask32
-                    cc = cb * 128 + h * 64 + k * 16 + hc[None, :]
+                    cc = cb_loc * 128 + h * 64 + k * 16 + hc[None, :]
                     blk_rot[r_lo, cc + 0] = p0[..., 0] * c0[..., 0] + c0[..., 2]
                     blk_rot[r_lo, cc + 1] = p0[..., 1] * c0[..., 1] + c0[..., 3]
                     blk_rot[r_lo, cc + 2] = p1[..., 0] * c0[..., 0] + c0[..., 2]
@@ -315,7 +338,7 @@ def decode_tfpn_fast_np(words: np.ndarray, scales: np.ndarray, R: int, C: int, b
                     p2 = lut[((((m24 >> 4) & 0xFC) ^ (h2 >> 24)) & 255).astype(np.int64)]
                     p3 = lut[((((m24 << 2) & 0xFC) ^ (h3 >> 24)) & 255).astype(np.int64)]
                     st = ((st << 24) | m24) & mask32
-                    cc = cb * 128 + h * 64 + k * 16 + hc[None, :]
+                    cc = cb_loc * 128 + h * 64 + k * 16 + hc[None, :]
                     blk_rot[r_lo, cc + 0] = p0[..., 0] * c0[..., 0] + c0[..., 2]
                     blk_rot[r_lo, cc + 1] = p0[..., 1] * c0[..., 1] + c0[..., 3]
                     blk_rot[r_lo, cc + 2] = p1[..., 0] * c0[..., 0] + c0[..., 2]
@@ -349,7 +372,7 @@ def decode_tfpn_fast_np(words: np.ndarray, scales: np.ndarray, R: int, C: int, b
                     p2 = lut[((b2v ^ (h2 >> 22)) & 1023).astype(np.int64)]
                     p3 = lut[((b3v ^ (h3 >> 22)) & 1023).astype(np.int64)]
                     st = lo32 & mask32
-                    cc = cb * 128 + h * 64 + k * 16 + hc[None, :]
+                    cc = cb_loc * 128 + h * 64 + k * 16 + hc[None, :]
                     blk_rot[r_lo, cc + 0] = p0[..., 0] * c0[..., 0] + c0[..., 2]
                     blk_rot[r_lo, cc + 1] = p0[..., 1] * c0[..., 1] + c0[..., 3]
                     blk_rot[r_lo, cc + 2] = p1[..., 0] * c0[..., 0] + c0[..., 2]
@@ -359,10 +382,17 @@ def decode_tfpn_fast_np(words: np.ndarray, scales: np.ndarray, R: int, C: int, b
                     blk_rot[r_hi, cc + 2] = p3[..., 0] * c2[..., 0] + c2[..., 2]
                     blk_rot[r_hi, cc + 3] = p3[..., 1] * c2[..., 1] + c2[..., 3]
 
-    from tfq4_lattice import inv_fwht2d_128  # numpy-only sibling in reference/
-
-    sc_tile = np.repeat(np.repeat(scales.astype(np.float32), 128, axis=0), 128, axis=1)
-    return inv_fwht2d_128(blk_rot * sc_tile)
+    sc_sub = scales[:, bc0:bc1].astype(np.float32)
+    sc_tile = np.repeat(np.repeat(sc_sub, 128, axis=0), 128, axis=1)
+    scaled = blk_rot * sc_tile
+    sr = pw_sgn(SEED_ROW, np.arange(r_off, r_off + R, dtype=np.uint32))
+    c_start = (bc0 * 128) if c_sign_off is None else c_sign_off
+    sc_v = pw_sgn(SEED_COL, np.arange(c_start, c_start + C_out, dtype=np.uint32))
+    # Inverse 2D FWHT-128 on [R, C_out] with absolute row/col signs
+    tmp = fwht_128(scaled.reshape(R // 128, 128, C_out).transpose(0, 2, 1)).transpose(0, 2, 1).reshape(R, C_out)
+    tmp = tmp * sr[:, None]
+    out = fwht_128(tmp.reshape(R, n_bc_out, 128)).reshape(R, C_out) * sc_v[None, :]
+    return out.astype(np.float32, copy=False)
 
 
 def self_test() -> None:

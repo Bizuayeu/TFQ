@@ -6,17 +6,17 @@
 
 **Cross-Platform: Apple Silicon (Metal) & NVIDIA GPUs (CUDA `sm_80+`) · Standalone PyTorch / Hugging Face / vLLM & TensorFold**
 
-**TFQ3** (*TensorFold Quantization v3 — supports **3-, 4-, and 5-bit**, including mixed-bit per layer or per expert; `3` is the format version, not 3-bit only*) and **TFQ4-E8P** (`2.001 bpw` 8D lattice) provide a fast, **data-free by default** (with **optional Hessian-LDLQ calibration** and **optional trace-guided MoE HeatAlloc**) weight quantization format, GPU converter suite, and standalone inference kernels.
+**TFQ3** (*TensorFold Quantization v3 — supports **3-, 4-, and 5-bit**, including mixed-bit per layer or per expert; `3` is the format version, not 3-bit only*) and **TFQ4-E8P** (`2.001 bpw` 8D E8-initialized Voronoi codebook) provide a fast, **data-free by default** (with **optional Hessian-LDLQ calibration** and **optional trace-guided MoE HeatAlloc**) weight quantization format, GPU converter suite, and standalone inference kernels.
 
-> **One Checkpoint, Both Platforms (Zero Re-Conversion):**
-> A TFQ3/TFQ4 checkpoint quantized on a Mac runs **byte-for-byte unmodified** on an NVIDIA CUDA GPU — and vice versa. Same `pw_v3_tables.bin`, same `.tffpw` shards, same residual `.safetensors`, and the same `DFlash2` / `DSpine` / `MTP` speculative drafters.
+> **One Checkpoint Format, Byte-Identical Conversion Across Platforms:**
+> The same `.tffpw`/`.tffp4` checkpoint file runs unmodified on both Apple Silicon (Metal) and NVIDIA GPUs (CUDA `sm_80+`), and both Metal and CUDA converters emit **byte-for-byte identical files** (matching SHA-256) from the same source weights via embedded canonical tables (`reference/tables/`) and deterministic IEEE-754 encoder paths. *(Inference kernels on Metal vs CUDA use each architecture's native MMA and reduction schedules, so cross-vendor inference outputs match within normal fp16/bf16 rounding tolerance.)*
 
 ### How TFQ Works (and When to Use Data-Free vs. Calibrated Mode)
-1. **Default mode (`100% data-free`, minutes to convert):** Applies a deterministic **randomized 2D Fast Walsh–Hadamard Transform (`2D FWHT-128`)** to every `128×128` tile, then encodes 2D weight pairs via a 128-state Viterbi search against one fixed **16 KiB universal Gaussian codebook** (`pw_v3_tables.bin`). For MoE models without `--trace`, expert sensitivity is scored **100% data-free** from router row L2 norms + expert weight-scale energy ([`src/converters/moe_heat_rank.hpp`](src/converters/moe_heat_rank.hpp)) — never index order.
+1. **Default mode (`100% data-free`, minutes to convert):** Applies a deterministic **randomized 2D Fast Walsh–Hadamard Transform (`2D FWHT-128`)** to every `128×128` tile, sets the `fp16` block scale to `RMS * shrink`, and encodes 2D weight pairs via a **256-wide beam search** over 32-bit trellis states against one fixed **16 KiB canonical Gaussian codebook** (`pw_v3_tables.bin`). For MoE models without `--trace`, expert sensitivity is scored **100% data-free** from router row L2 norms + expert weight-scale energy ([`src/converters/moe_heat_rank.hpp`](src/converters/moe_heat_rank.hpp)) — never index order.
 2. **Optional calibration-aware modes (same binary format, zero runtime cost):**
-   - **Hessian-LDLQ (`tools/tfq3_hessian.py`):** Optimizes real activation output error $\|(W - \hat{W})X^T\|_F^2$ in TFQ3's rotated domain via block-Cholesky LDLQ + closed-form Hessian-optimal fp16 tile scales, exporting byte-identical `TFPN`/`TFP4` shards.
+   - **Hessian-LDLQ (`tools/tfq3_hessian.py`):** Optimizes real activation output error $\|(W - \hat{W})X^T\|_F^2$ in TFQ3's rotated domain via block-Cholesky LDLQ + closed-form Hessian-optimal fp16 tile scales, exporting standard `TFPN`/`TFP4` shards.
    - **Trace-guided HeatAlloc (`--trace <counts.txt>`):** Uses calibration routing counts (explicitly **uses calibration data**) to assign higher bit widths to hotter MoE experts.
-3. **16 KiB–aligned zero-copy shards + bit-exact speculative decoding:** Same reduction order for `rows = 1..32` on Metal and CUDA guarantees 100% bit-exact `DFlash2`, `DSpine`, and `MTP` speculative verification (`--no-drafts == drafted` at `temp=0`).
+3. **16 KiB–aligned zero-copy shards + bit-exact speculative decoding:** Fixed reduction order per `(N, K)` guarantees **100% bit-exact** `DFlash2`, `DSpine`, and `MTP` speculative verification (`--no-drafts == drafted` at `temp=0`) across the tested decode ranges: **`rows = 1..32` on Metal** and **`rows = 1..64` on CUDA** (single-weight-read multi-row decode across all Qwen3.8-27B shapes and `N > 34816`).
 
 ---
 
@@ -98,13 +98,15 @@ Controlled comparison on **`Qwen/Qwen2.5-1.5B`** (all **196** transformer linear
 
 **Trade-off summary:** Data-free TFQ3 converts in seconds with zero calibration data and beats RTN/MLX-Affine, calibrated AWQ, and calibrated GPTQ (especially at 3-bit: `-1.48 PPL` and `-44%` p99 KL vs GPTQ at `0.25` fewer bpw). Full per-column Hessian LDLQ (`EXL3/QTIP/EAQ`) still achieves lower PPL/KL when you can afford calibration data and slow conversion.
 
-### Flagship TensorFold Runtime Families `[MEASURED]`
+### Flagship TensorFold Runtime Families `[MEASURED — TensorFold runner, no per-sequence JSON receipt in benchmarks/]`
+
+> *Provenance note: The table below summarizes earlier TensorFold hardware measurements; unlike the Qwen2.5-1.5B receipt above, these runs do not yet have committed per-sequence JSON receipts under `benchmarks/`. On `Qwen3.8-Flash-Next` (`2,004` scored tokens), the `0.011` PPL difference between `5.996` and `6.007` is within sampling noise (i.e. parity with 8-bit gold).*
 
 | Model | Recipe & Exact bpw | **TFQ3 Size** | Quality Status | Metal & CUDA Runtime / Drafters |
 |---|---|---:|---|---|
-| **Qwen3.8-27B** (Dense 64L) | 4.001 bpw linear + BF16 or Q8 residuals (data-free) | **14.37 GiB** (BF16) / **13.23 GiB** (Q8) | **`[MEASURED]`** 4,790-tok PPL `5.368`, **−31% mean KL / −46% p99 KL** vs MLX 4-bit (`248,320` vocab) | Metal [`#4974`](https://github.com/ashhart/TensorFold/pull/4974) (`DFlash2` **+75%**, bit-exact) · CUDA [`#4986`](https://github.com/ashhart/TensorFold/pull/4986) (`BM=64` **1.73×** prefill, `DFlash2` **3.50×**, `DSpine` **3.97×**, bit-exact) |
-| **Qwen3.8-Flash-Next** (512E MoE) | 3.411 bpw MoE + 8b non-MoE + 3b PLE | **78.99 GiB** (fits 128 GB Macs) | **`[MEASURED]`** 2,004-tok PPL `5.996` vs `6.007` 8-bit gold (`MLX 4b = 6.644`) | Metal [`#4964`](https://github.com/ashhart/TensorFold/pull/4964) (`MTP d3` **+86%**, `154.5 tok/s`, bit-exact) · CUDA [`#4986`](https://github.com/ashhart/TensorFold/pull/4986) |
-| **GLM-5.3-Flash** (288E MoE) | Compact: `3.39 bpw` MoE (`heat43`=3.33 bpw) + 4b/5b `nonmoe.tffpw` (or `--glm-mode uniform4 --keep-nonmoe-bf16` for 4.00 bpw + BF16 non-MoE) | **139.6 GB** (compact) / ~168–175 GB (uniform 4b + BF16 non-MoE) | **`[NOT VERIFIED]`** *(throughput & parity measured; multi-thousand-token KL/PPL eval pending)* | Metal [`#4953`](https://github.com/ashhart/TensorFold/pull/4953) (`p2048 +11.9%`, `MTP` `95.2 tok/s`, `DFlash2` `85.3 tok/s`, bit-exact) · CUDA [`#4986`](https://github.com/ashhart/TensorFold/pull/4986) |
+| **Qwen3.8-27B** (Dense 64L) | 4.001 bpw linear + BF16 or Q8 residuals (data-free) | **14.37 GiB** (BF16) / **13.23 GiB** (Q8) | **`[MEASURED]`** 4,790-tok PPL `5.368`, −31% mean KL / −46% p99 KL vs MLX 4-bit (`248,320` vocab, 1,022 pos) | Metal [`#4974`](https://github.com/ashhart/TensorFold/pull/4974) (`DFlash2` **+75%**, bit-exact) · CUDA [`#4986`](https://github.com/ashhart/TensorFold/pull/4986) (`BM=64` **1.73×** prefill, `DFlash2` **3.50×**, `DSpine` **3.97×**, bit-exact) |
+| **Qwen3.8-Flash-Next** (512E MoE) | 3.411 bpw MoE + 8b non-MoE + 3b PLE | **78.99 GiB** (fits 128 GB Macs) | **`[MEASURED]`** 2,004-tok PPL `5.996` vs `6.007` 8-bit gold (within noise; `MLX 4b = 6.644`) | Metal [`#4964`](https://github.com/ashhart/TensorFold/pull/4964) (`MTP d3` **+86%**, `154.5 tok/s`, bit-exact) · CUDA [`#4986`](https://github.com/ashhart/TensorFold/pull/4986) |
+| **GLM-5.3-Flash** (288E MoE) | Compact: `3.39 bpw` MoE (`heat43`=3.33 bpw) + 4b/5b `nonmoe.tffpw` (or `--glm-mode uniform4 --keep-nonmoe-bf16` for 4.00 bpw + BF16 non-MoE) | **139.6 GB** (compact) / **167.5 GB** (uniform 4b + BF16 non-MoE) | **`[MEASURED — 4,094 tok]`** Matched-4b PPL `1.8326` vs `1.7943` FP8 (`+0.0211` nats); full task eval pending | Metal [`#4953`](https://github.com/ashhart/TensorFold/pull/4953) (`p2048 +11.9%`, `MTP` `95.2 tok/s`, `DFlash2` `85.3 tok/s`, bit-exact) · CUDA [`#4986`](https://github.com/ashhart/TensorFold/pull/4986) |
 
 *See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for complete tables, provenance tags, and Metal/CUDA microbenchmarks.*
 
@@ -122,9 +124,9 @@ cd TFQ
 
 # macOS (Apple Silicon Metal):
 make install           # builds Metal converters (TFQ3 + TFQ4) + metallibs and installs `tfq3` into ~/.local/bin
-make test              # runs Python references, data-free MoE ranker test, strict validator negative controls, and full GPU E2E round-trips
-make test-metal        # fp64 Metal parity (3b/4b/5b bit-exact sk8 r1==r16 + BM=32 prefill + Col-TP/Row-TP=4) + bench
-make test-tfq4-metal   # fp64 Metal parity (2.001 bpw 8D E8P, bit-exact r1==r16, 366–390 GB/s on M5 Max) + bench
+make test              # runs Python references, golden vectors, data-free MoE ranker, strict validator controls, and GPU E2E round-trips
+make test-metal        # fp64 Metal parity (3b/4b/5b bit-exact sk8 r1==r16==r32 + BM=32 prefill + Col-TP/Row-TP=4) + bench
+make test-tfq4-metal   # fp64 Metal parity (2.001 bpw 8D E8-initialized Voronoi, bit-exact r1==r16) + bench
 
 # Linux (NVIDIA CUDA — pass CUDA_ARCH=sm_80 / sm_86 / sm_89 / sm_90 / sm_100 / sm_121):
 make install CUDA_ARCH=sm_121

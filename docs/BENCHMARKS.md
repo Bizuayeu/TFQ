@@ -57,9 +57,11 @@ Every section and claim in this document is explicitly tagged with its verificat
 
 ---
 
-## 2. Qwen3.8-27B (Dense 64-Layer Hybrid GDN + Attention) `[MEASURED]`
+## 2. Qwen3.8-27B (Dense 64-Layer Hybrid GDN + Attention) `[MEASURED — TensorFold runner, no per-sequence JSON receipt]`
 
-Measured directly on **Apple M5 Ultra** (TensorFold Metal) and **NVIDIA GB10** (`sm_121`, TensorFold CUDA) using the **exact same cross-platform TFQ3 checkpoints**.
+> *Provenance note: Sections 2–4 report hardware measurements taken on the TensorFold runtime (`ashhart/TensorFold` PRs `#4953`, `#4964`, `#4974`, `#4986`). Unlike Section 1 (`benchmarks/provenance_qwen25_1p5b.json`), they do not currently have committed per-sequence JSON receipts or script/token hashes in `benchmarks/`.*
+
+Measured directly on **Apple M5 Ultra** (TensorFold Metal) and **NVIDIA GB10** (`sm_121`, TensorFold CUDA) using the **exact same cross-platform TFQ3 checkpoint files**.
 - **Calibration data used:** **None (100% data-free)**.
 - **Weight SNR (`tfq3-qwen27-convert`):** `3b = 17.17 dB`, `4b = 23.37 dB` (`lm_head = 22.70 dB`), conversion time ~3.2 min on Apple M5 Ultra; `23.35 dB` (~5.5 s/layer) on NVIDIA GB10.
 - **Perplexity evaluation:** Exact `fp64` log-softmax over **4,790 tokens** (`1,717` multi-domain + `3,071` unseen README/Zig/CHANGELOG).
@@ -85,7 +87,9 @@ Measured directly on **Apple M5 Ultra** (TensorFold Metal) and **NVIDIA GB10** (
 
 ---
 
-## 3. Qwen3.8-Flash-Next (48L + MTP, 512-Expert MoE) `[MEASURED]`
+## 3. Qwen3.8-Flash-Next (48L + MTP, 512-Expert MoE) `[MEASURED — TensorFold runner, 2,004 tok, no per-sequence receipt]`
+
+> *Sample-size note: On 2,004 scored tokens, the `0.011` PPL difference between `5.996` and `6.007` (8-bit gold) is well within sampling noise and indicates parity with 8-bit gold rather than statistical superiority.*
 
 - **Footprint breakdown:**
   - Routed MoE (49 layers, mixed 5b/4b/3b averaging **`3.411 bpw`**): `48.98 GiB` (converted in `17.5 min`; `3b = 17.13 dB`, `4b = 23.33 dB`, `5b = 29.31 dB`).
@@ -102,7 +106,7 @@ Measured directly on **Apple M5 Ultra** (TensorFold Metal) and **NVIDIA GB10** (
 
 ---
 
-## 4. GLM-5.3-Flash (45L, 288-Expert MoE) `[MEASURED]`
+## 4. GLM-5.3-Flash (45L, 288-Expert MoE) `[MEASURED — TensorFold runner, 4,094 tok, no per-sequence receipt]`
 
 ### Explicit Footprint & Bit-Rate Breakdown (Apples-to-Apples)
 
@@ -140,14 +144,19 @@ Evaluated on Apple M5 Ultra Metal (`tf-glm-run`, `GLM_PROMPT_NLL=128`, exact sam
 
 ### Standalone NVIDIA CUDA Kernels (`src/kernels/cuda/tfq3_cuda.cuh`, NVIDIA GB10 `sm_121`, CUDA 13.0) `[MEASURED]`
 
-Verified via `make test-cuda CUDA_ARCH=sm_121`: `PASS` vs `fp64` across 3b/4b/5b direct PTX `m16n8k16` split-K=8 (`sk8`), fused, `BM=64, BN=128` prefill, **bit-exact `rows=1 == rows=16 == rows=32`**, zero-repack `Col-TP`/`Row-TP` (`tp=2,4`), and mixed-bit MoE.
+Verified via `make test-cuda CUDA_ARCH=sm_121` and `python3 tests/vectors_test.py`:
+- **Single-weight-read multi-row decode (`rows = 1..64`):** `tfq3_mma_sk_kernel<BITS, MTILES>` and `tfq3_mma_fused_mt_kernel<BITS, MTILES>` (`MTILES ∈ {1,2,3,4}`, zero register spills) decode each weight tile **once per CTA** and run up to 4 `m16` row tiles in an inner loop. Split-K is fixed purely by `(N, K)` (`ks = 1` with zero partial buffer for `N >= 32768`; `ks = 4` for `qkv`; `ks = 8` for `down`/`o_proj`), cutting peak FP32 partials at `rows = 64` from **`71.3 MiB` → `10.0 MiB` (7.1× smaller)** and guaranteeing **bit-exact `rows = 1 == rows = k` across `k = 1..64`** on all 4 Qwen3.8-27B shapes (`qkv`, `o_proj`, `gate+up`, `down`) plus `N = 40960 > 34816`.
+- **Golden vectors & TP:** `PASS` vs `fp64`, `reference/vectors/tfq3_vectors.json` (including `r_off = 128` and `bc > 0` trellis state resume), zero-repack `Col-TP` / `Row-TP` (`tp = 2, 4`, including compact 1-block-resume `launch_dense_tp_sliced`), fp16 activation saturation, and mixed-bit MoE.
 
-| Qwen3.8-27B Projection | Shape `[N × K]` | `rows=1` (`sk8`) | `rows=16` Verify (`sk8`, bit-exact) | `rows=256–1024` (`BM=64` prefill) |
-|---|---|---:|---:|---:|
-| `gate+up` | `[34816 × 5120]` | 0.336 ms (`265.2 GB/s`) | 0.489 ms (`182.2 GB/s`, 11.66 TFLOP/s) | **26.64 TFLOP/s** (`rows=256`, 3.43 ms) |
-| `down` | `[5120 × 17408]` | 0.187 ms (`238.5 GB/s`) | 0.198 ms (`225.0 GB/s`, 14.40 TFLOP/s) | **24.71 TFLOP/s** (`rows=1024`, 7.39 ms) |
-| `qkv` (L2-hot) | `[10240 × 5120]` | 0.079 ms (`330.1 GB/s`) | 0.106 ms (`248.4 GB/s`, 15.89 TFLOP/s) | **28.96 TFLOP/s** (`rows=1024`, 3.71 ms) |
-| `lm_head` | `[248320 × 5120]` | 2.713 ms (`234.4 GB/s`) | 2.812 ms (`226.1 GB/s`, 14.47 TFLOP/s) | **26.99 TFLOP/s** (`rows=64`, 6.03 ms) |
+Earlier idle-GPU `rows=1`/`rows=16` GB10 measurements (before multi-row single-read optimization) plus updated single-weight-read multi-row `rows = 1..64` cold-L2 (64 MiB L2 flush) measurements on GB10 *(note: updated multi-row run was recorded while a background service used ~89% GPU, so idle GB10 latency is lower; peak partial traffic dropped from `71.3 MiB` to `0.0–10.0 MiB`)*:
+
+| Qwen3.8-27B Projection | Shape `[N × K]` | `ks` (`rows ≤ 64`) | `yr` @ `rows=64` | Cold-L2 `rows=1` | Cold-L2 `rows=32` (1× weight read) | Cold-L2 `rows=64` (1× weight read) |
+|---|---|---:|---:|---:|---:|---:|
+| `gate+up` | `[34816 × 5120]` | `1` (fused) | **0.0 MiB** | 0.486 ms (`183.5 GB/s`) | **0.488 ms (`23.36 TF/s`)** | **0.919 ms (`24.82 TF/s`)** |
+| `down` | `[5120 × 17408]` | `8` (`sk`) | **10.0 MiB** | 0.236 ms (`188.7 GB/s`) | **0.300 ms (`18.99 TF/s`)** | **0.399 ms (`28.57 TF/s`)** |
+| `qkv` | `[10240 × 5120]` | `4` (`sk`) | **10.0 MiB** | 0.163 ms (`161.1 GB/s`) | **0.213 ms (`15.74 TF/s`)** | **0.231 ms (`29.05 TF/s`)** |
+| `o_proj` | `[5120 × 6144]` | `8` (`sk`) | **10.0 MiB** | 0.140 ms (`112.7 GB/s`) | **0.148 ms (`13.63 TF/s`)** | **0.177 ms (`22.77 TF/s`)** |
+| `lm_head` | `[248320 × 5120]` | `1` (fused) | **0.0 MiB** | 5.468 ms (`116.3 GB/s`) | **5.720 ms (`14.23 TF/s`)** | 12.914 ms (`12.60 TF/s`) |
 
 ### Live TensorFold CUDA Serving (`Qwen3.8-27B-TFQ3`, NVIDIA GB10 `sm_121`) `[MEASURED]`
 
@@ -160,7 +169,7 @@ Verified via `make test-cuda CUDA_ARCH=sm_121`: `PASS` vs `fp64` across 3b/4b/5b
 
 ### Standalone Apple Silicon Metal Kernels (`src/kernels/metal/tfq3_metal.metal` & `tfq4_metal.metal`, Apple M5 Max) `[MEASURED]`
 
-Verified via `make test-metal` and `make test-tfq4-metal`: `PASS` vs `fp64`, bit-exact `rows=1 == rows=16`, and `Col-TP=4` / `Row-TP=4`:
+Verified via `make test-metal`, `make test-tfq4-metal`, and `python3 tests/vectors_test.py`: `PASS` vs `fp64`, bit-exact `rows=1 == rows=16 == rows=32` on TFQ3 (`rows=1 == rows=16` on TFQ4), fp16 activation saturation, golden vectors, and `Col-TP=4` / `Row-TP=4`:
 
 | Kernel / Projection | Shape `[N × K]` | `rows=1` (`sk8` / TFQ4) | `rows=16` Verify (bit-exact) | `rows=512` (`BM=32` prefill) |
 |---|---|---:|---:|---:|
@@ -189,6 +198,6 @@ Verified via `make test-metal` and `make test-tfq4-metal`: `PASS` vs `fp64`, bit
 | Component | Status | Notes |
 |---|---|---|
 | **PyTorch + Hugging Face `transformers`** (`integrations/pytorch/tfq_torch.py`) | **`[MEASURED]`** | `Tfq3Linear` & `Tfq4Linear` verified end-to-end loading real `.tffpw`/`.tffp4` `Qwen2.5-1.5B` checkpoints into `AutoModelForCausalLM.generate()` with zero TensorFold dependency (`tests/integrations_test.py`). |
-| **PyTorch CUDA Extension** (`integrations/pytorch/tfq3_cuda_ext.cu`) | **`[SOURCE-INSPECTED]`** | Directly binds `tfq3::launch_dense` from `src/kernels/cuda/tfq3_cuda.cuh`; requires PyTorch+CUDA on target host to build (`pip install -e integrations/pytorch`). |
-| **vLLM Quantization Plugin** (`integrations/vllm/tfq3_quant.py`) | **`[SOURCE-INSPECTED]`** | `Tfq3Config` + `Tfq3LinearMethod` verified against vLLM's plugin contract via unit tests; live vLLM server benchmark pending a `vllm`+CUDA host. |
+| **PyTorch CUDA Extension** (`integrations/pytorch/tfq3_cuda_ext.cu`) | **`[SOURCE-INSPECTED]`** | Directly binds `tfq3::launch_dense` and `tfq3::launch_dense_tp_sliced` (`row_off`, `k_sign_off`, `bc0_buf`, `n_bc_buf`) from `src/kernels/cuda/tfq3_cuda.cuh`; requires PyTorch+CUDA on target host to build (`pip install -e integrations/pytorch`). |
+| **vLLM Quantization Plugin** (`integrations/vllm/tfq3_quant.py`) | **`[UNIT-TESTED / LIVE SERVING PENDING]`** | Automatic `--quantization tfq3` registration, real `.tffpw` + `pw_v3_tables.bin` weight loader, per-tensor manifest bits (3b/4b/5b mixed), merged `qkv`/`gate+up` per-partition padding & row signs, and Col/Row TP (`tp=2,4`) verified numerically against `tfq3_reference` in `tests/vllm_plugin_test.py`; live multi-GPU vLLM serving pending a `vllm`+CUDA host. |
 | **AMD ROCm / HIP** (`src/kernels/hip/tfq3_hip.h`) | **`[SOURCE-ONLY / NOT HARDWARE-VERIFIED]`** | Portable wave32/wave64 kernels written and syntax-checked only; **no AMD GPU hardware compilation or runtime verification has been performed yet.** |

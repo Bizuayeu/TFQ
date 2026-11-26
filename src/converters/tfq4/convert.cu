@@ -74,7 +74,7 @@ __global__ void col_fwht_ss_k(
     W_rot[(uint64_t)(r0 + lane + 32u) * C + c] = v.y;
     W_rot[(uint64_t)(r0 + lane + 64u) * C + c] = v.z;
     W_rot[(uint64_t)(r0 + lane + 96u) * C + c] = v.w;
-    float ss = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    float ss = (v.x * v.x + v.y * v.y) + (v.z * v.z + v.w * v.w);
     #pragma unroll
     for (int d = 16; d >= 1; d >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, d);
     uint32_t bi = br * (C >> 7) + (c >> 7);
@@ -88,13 +88,13 @@ __global__ void finalize_scales_k(const float* __restrict__ col_ss, __half* __re
     float s = (cs[lane + 0u] + cs[lane + 32u]) + (cs[lane + 64u] + cs[lane + 96u]);
     #pragma unroll
     for (int d = 16; d >= 1; d >>= 1) s += __shfl_xor_sync(0xFFFFFFFFu, s, d);
-    if (lane == 0) sc[bi] = __float2half(sqrtf(s * (1.0f / 16384.0f) + 1e-12f));
+    if (lane == 0) sc[bi] = __float2half_rn(sqrtf(s * (1.0f / 16384.0f) + 1e-12f));
 }
 
 __global__ void tfq4_e8p_encode_k(
     const float* __restrict__ W_rot, const __half* __restrict__ scales,
     const __half* __restrict__ e8p_lut, uint32_t* __restrict__ out_words,
-    double* __restrict__ metrics, uint32_t R, uint32_t C
+    float* __restrict__ metrics, uint32_t R, uint32_t C
 ) {
     __shared__ float sm_lut[256][8];
     uint32_t tid = threadIdx.x;
@@ -105,7 +105,7 @@ __global__ void tfq4_e8p_encode_k(
     uint64_t gtid = (uint64_t)blockIdx.x * blockDim.x + tid;
     uint32_t wpr = C >> 4;
     uint64_t total_words = (uint64_t)R * wpr;
-    double my_sig = 0.0, my_err = 0.0;
+    float my_sig = 0.0f, my_err = 0.0f;
 
     if (gtid < total_words) {
         uint32_t r = (uint32_t)(gtid / wpr), wc = (uint32_t)(gtid - (uint64_t)r * wpr);
@@ -125,7 +125,7 @@ __global__ void tfq4_e8p_encode_k(
                 v[d] = x;
                 if (x < 0.0f) sm |= (1u << d);
                 a[d] = fabsf(x) * inv_sc;
-                my_sig += (double)x * (double)x;
+                my_sig += x * x;
             }
             uint32_t best_k = 0u;
             float best_d = 1e30f;
@@ -134,13 +134,13 @@ __global__ void tfq4_e8p_encode_k(
                 float d2 = a[2] - sm_lut[k][2], d3 = a[3] - sm_lut[k][3];
                 float d4 = a[4] - sm_lut[k][4], d5 = a[5] - sm_lut[k][5];
                 float d6 = a[6] - sm_lut[k][6], d7 = a[7] - sm_lut[k][7];
-                float dist = d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 + d7*d7;
+                float dist = ((d0*d0 + d1*d1) + (d2*d2 + d3*d3)) + ((d4*d4 + d5*d5) + (d6*d6 + d7*d7));
                 if (dist < best_d) { best_d = dist; best_k = k; }
             }
             codes[h] = (sm << 8) | best_k;
             #pragma unroll
             for (uint32_t d = 0u; d < 8u; ++d) {
-                double e = fabs((double)v[d]) - (double)sm_lut[best_k][d] * (double)sc;
+                float e = fabsf(v[d]) - sm_lut[best_k][d] * sc;
                 my_err += e * e;
             }
         }
@@ -152,14 +152,14 @@ __global__ void tfq4_e8p_encode_k(
         my_sig += __shfl_xor_sync(0xFFFFFFFFu, my_sig, d);
         my_err += __shfl_xor_sync(0xFFFFFFFFu, my_err, d);
     }
-    __shared__ double sm_sig[8], sm_err[8];
+    __shared__ float sm_sig[8], sm_err[8];
     if ((tid & 31u) == 0u) {
         sm_sig[tid >> 5] = my_sig;
         sm_err[tid >> 5] = my_err;
     }
     __syncthreads();
     if (tid == 0u) {
-        double bs = 0.0, be = 0.0;
+        float bs = 0.0f, be = 0.0f;
         #pragma unroll
         for (int w = 0; w < 8; ++w) { bs += sm_sig[w]; be += sm_err[w]; }
         metrics[(uint64_t)blockIdx.x * 2ull + 0ull] = bs;
@@ -190,7 +190,7 @@ static std::vector<std::vector<size_t>> partition_tfq4_shards(
 int main(int argc, char** argv) {
     tfq_generic::GenericOptions opt;
     opt.default_bits = 3;
-    opt.head_bits = 4;
+    opt.head_bits = 0;
     double max_shard_gib = 3.4;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -209,6 +209,10 @@ int main(int argc, char** argv) {
     }
     if (opt.model_dir.empty() || opt.out_dir.empty()) {
         fprintf(stderr, "Usage: tfq4-convert-cuda --model DIR --out DIR [--head-bits 0|2] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
+        return 2;
+    }
+    if (opt.head_bits != 0u && opt.head_bits != 2u) {
+        fprintf(stderr, "tfq4-convert-cuda: invalid --head-bits %u (TFQ4 supports 0 [keep lm_head in residual, default] or 2 [quantize lm_head to 2-bit])\n", opt.head_bits);
         return 2;
     }
     uint64_t max_shard_bytes = (uint64_t)std::max(1.0 * (double)(1ULL << 20), max_shard_gib * (double)(1ULL << 30));
@@ -253,11 +257,11 @@ int main(int argc, char** argv) {
     __half *d_lut = nullptr, *d_sc = nullptr;
     float *d_in = nullptr, *d_tmp = nullptr, *d_rot = nullptr, *d_ss = nullptr;
     uint32_t* d_out = nullptr;
-    double* d_met = nullptr;
+    float* d_met = nullptr;
     const size_t MAX_MET_BLKS = (MAX_WORDS + 255ULL) / 256ULL;
     CUDA_CHECK(cudaMalloc((void**)&d_lut, sizeof(tbl.e8p_lut)));
     CUDA_CHECK(cudaMemcpy(d_lut, tbl.e8p_lut, sizeof(tbl.e8p_lut), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMalloc((void**)&d_met, MAX_MET_BLKS * 2ULL * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void**)&d_met, MAX_MET_BLKS * 2ULL * sizeof(float)));
     CUDA_CHECK(cudaMalloc((void**)&d_in,  MAX_ELEMS * 4ULL));
     CUDA_CHECK(cudaMalloc((void**)&d_tmp, MAX_ELEMS * 4ULL));
     CUDA_CHECK(cudaMalloc((void**)&d_rot, MAX_ELEMS * 4ULL));
@@ -313,11 +317,11 @@ int main(int argc, char** argv) {
                 tfq4_e8p_encode_k<<<n_mblk, 256>>>(d_rot, d_sc, d_lut, d_out, d_met, rc, C);
                 CUDA_CHECK(cudaDeviceSynchronize());
 
-                std::vector<double> h_met((size_t)n_mblk * 2u);
-                CUDA_CHECK(cudaMemcpy(h_met.data(), d_met, h_met.size() * sizeof(double), cudaMemcpyDeviceToHost));
+                std::vector<float> h_met((size_t)n_mblk * 2u);
+                CUDA_CHECK(cudaMemcpy(h_met.data(), d_met, h_met.size() * sizeof(float), cudaMemcpyDeviceToHost));
                 for (uint32_t mi = 0; mi < n_mblk; ++mi) {
-                    tot_sig += h_met[(size_t)mi * 2u + 0u];
-                    tot_err += h_met[(size_t)mi * 2u + 1u];
+                    tot_sig += (double)h_met[(size_t)mi * 2u + 0u];
+                    tot_err += (double)h_met[(size_t)mi * 2u + 1u];
                 }
 
                 CUDA_CHECK(cudaMemcpy(all_scales.data() + m.sc_off + sc_cur, d_sc, (size_t)n_blk * 2ULL, cudaMemcpyDeviceToHost));

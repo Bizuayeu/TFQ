@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     @autoreleasepool {
         tfq_generic::GenericOptions opt;
         opt.default_bits = 3;
-        opt.head_bits = 4;
+        opt.head_bits = 0;
         double max_shard_gib = 3.4;
         std::string metallib = default_metallib("tfq4-convert.metallib");
         for (int i = 1; i < argc; ++i) {
@@ -77,6 +77,10 @@ int main(int argc, char** argv) {
         }
         if (opt.model_dir.empty() || opt.out_dir.empty()) {
             fprintf(stderr, "Usage: tfq4-convert --model DIR --out DIR [--head-bits 0|2] [--max-shard-gib 3.4] [--quantize-vision] [--quantize-drafter] [--quantize-embed] [--dry-run]\n");
+            return 2;
+        }
+        if (opt.head_bits != 0u && opt.head_bits != 2u) {
+            fprintf(stderr, "tfq4-convert: invalid --head-bits %u (TFQ4 supports 0 [keep lm_head in residual, default] or 2 [quantize lm_head to 2-bit])\n", opt.head_bits);
             return 2;
         }
         uint64_t max_shard_bytes = (uint64_t)std::max(1.0 * (double)(1ULL << 20), max_shard_gib * (double)(1ULL << 30));
@@ -123,8 +127,10 @@ int main(int argc, char** argv) {
         tfq4::PwV4E8Tables tbl;
         tfq4::build_e8p_tables(tbl);
         {
-            std::ofstream tf(fs::path(opt.out_dir) / "pw_v4_e8p_tables.bin", std::ios::binary);
+            std::string tf_path = (fs::path(opt.out_dir) / "pw_v4_e8p_tables.bin").string();
+            std::ofstream tf(tf_path, std::ios::binary);
             tf.write(reinterpret_cast<const char*>(&tbl), sizeof(tbl));
+            tfq_generic::close_or_die(tf, tf_path);
         }
         id<MTLBuffer> b_lut = [dev newBufferWithBytes:tbl.e8p_lut length:sizeof(tbl.e8p_lut) options:MTLResourceStorageModeShared];
 

@@ -306,6 +306,8 @@ int main(int argc, char** argv) {
                 size_t nw = 0, ns = 0;
                 const uint8_t* wp = cache.get_tensor(std::string(base) + ".weight", nullptr, &nw);
                 const uint8_t* sp = cache.get_tensor(std::string(base) + ".weight_scale_inv", nullptr, &ns);
+                tfq_common::check_finite_fp8_e4m3(wp, R, C, std::string(base) + ".weight");
+                tfq_common::check_finite_f32((const float*)sp, R / 128u, C / 128u, std::string(base) + ".weight_scale_inv");
                 TFQ_CUDA_CHECK(cudaMemcpy(d_fp8, wp, nw, cudaMemcpyHostToDevice));
                 TFQ_CUDA_CHECK(cudaMemcpy(d_scinv, sp, ns, cudaMemcpyHostToDevice));
                 MatParams mp{R, C, b, 1.0f, 0u, 0u};

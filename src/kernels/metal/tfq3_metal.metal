@@ -78,8 +78,10 @@ kernel void tfq3_fwht_x(
     v.w = float(src[lane + 96u]) * pw_sgn(0x12345678u, cs + lane + 96u);
     pw_fwht128_simd4(v, lane);
     device half* dst = X_rot + ulong(row) * P.k + c0;
-    dst[lane +  0u] = half(v.x); dst[lane + 32u] = half(v.y);
-    dst[lane + 64u] = half(v.z); dst[lane + 96u] = half(v.w);
+    dst[lane +  0u] = half(clamp(v.x, -65504.0f, 65504.0f));
+    dst[lane + 32u] = half(clamp(v.y, -65504.0f, 65504.0f));
+    dst[lane + 64u] = half(clamp(v.z, -65504.0f, 65504.0f));
+    dst[lane + 96u] = half(clamp(v.w, -65504.0f, 65504.0f));
 }
 
 kernel void tfq3_fwht_y(
@@ -191,7 +193,7 @@ kernel void tfq3_sk8_tp_impl(
     uint bc_e = min(P.bc1, bc_s + chunk);
     uint strip = P.strip_off + blk * 4u + uint(sg);
     const device uint* w_s = W + ulong(strip) * P.n_bc_total * (BITS * 2u) * 32ul;
-    const device half* sc0 = scales + ulong(P.sc_row_off + (strip >> 3)) * P.n_bc_total;
+    const device half* sc0 = scales + ulong(P.sc_row_off + (blk >> 1)) * P.n_bc_total;
     uint st = (bc_s < bc_e) ? pw_init_st<BITS>(w_s, bc_s, lane) : 0u;
     short2 home = pw_frag_home(lane);
 

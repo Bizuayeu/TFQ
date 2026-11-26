@@ -251,9 +251,15 @@ int main(int argc, char** argv) {
             uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;
             for (int p = 0; p < 3; ++p) {
                 uint32_t R = proj_R[p], C = proj_C[p];
+                const uint8_t* sp_e = stacked_s[p] + (size_t)e * exp_sb;
+                const uint8_t* bp_e = stacked_b[p] + (size_t)e * exp_sb;
+                char tlabel[128];
+                snprintf(tlabel, sizeof(tlabel), "L%d.expert%d.%s", lyr, e, (p == 0 ? "gate" : (p == 1 ? "up" : "down")));
+                tfq_common::check_finite_bf16((const uint16_t*)sp_e, R, C / 32u, std::string(tlabel) + ".scales");
+                tfq_common::check_finite_bf16((const uint16_t*)bp_e, R, C / 32u, std::string(tlabel) + ".biases");
                 TFQ_CUDA_CHECK(cudaMemcpy(d_q8w, stacked_w[p] + (size_t)e * MAX_ELEMS, MAX_ELEMS, cudaMemcpyHostToDevice));
-                TFQ_CUDA_CHECK(cudaMemcpy(d_q8s, stacked_s[p] + (size_t)e * exp_sb, exp_sb, cudaMemcpyHostToDevice));
-                TFQ_CUDA_CHECK(cudaMemcpy(d_q8b, stacked_b[p] + (size_t)e * exp_sb, exp_sb, cudaMemcpyHostToDevice));
+                TFQ_CUDA_CHECK(cudaMemcpy(d_q8s, sp_e, exp_sb, cudaMemcpyHostToDevice));
+                TFQ_CUDA_CHECK(cudaMemcpy(d_q8b, bp_e, exp_sb, cudaMemcpyHostToDevice));
                 MatParams mp{R, C, b, 1.0f, 0u, 0u};
                 q8_32_dequant_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_q8w, d_q8s, d_q8b, d_tmp, mp);
                 col_fwht_and_ss_kernel<<<dim3(C, R / 128u, 1), 32>>>(d_tmp, d_rot, d_ss, mp);

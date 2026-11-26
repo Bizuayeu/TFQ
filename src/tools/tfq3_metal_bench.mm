@@ -142,7 +142,11 @@ static std::string default_metallib(const char* name) {
 int main(int argc, char** argv) {
     @autoreleasepool {
         bool do_bench = false;
-        for (int i = 1; i < argc; ++i) if (strcmp(argv[i], "--bench") == 0) do_bench = true;
+        std::string vec_path;
+        for (int i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "--bench") == 0) do_bench = true;
+            else if (strcmp(argv[i], "--verify-vectors") == 0 && i + 1 < argc) vec_path = argv[++i];
+        }
 
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         if (!dev) { fprintf(stderr, "No Apple Metal device\n"); return 1; }
@@ -164,6 +168,83 @@ int main(int argc, char** argv) {
         pso_mm[4]  = mk("tfq3_prefill_tp_4b");
         pso_mm[5]  = mk("tfq3_prefill_tp_5b");
         id<MTLCommandQueue> q = [dev newCommandQueue];
+
+        if (!vec_path.empty()) {
+            FILE* vf = fopen(vec_path.c_str(), "rb");
+            if (!vf) { fprintf(stderr, "Cannot open vector bundle: %s\n", vec_path.c_str()); return 1; }
+            uint32_t hdr[2] = {};
+            if (fread(hdr, 4, 2, vf) != 2 || hdr[0] != 0x56454333u) {
+                fprintf(stderr, "Bad VEC3 vector header in %s\n", vec_path.c_str()); fclose(vf); return 1;
+            }
+            PwV3Tables vtbl{};
+            uint8_t pad_tbl[16384];
+            if (fread(pad_tbl, 1, 16384, vf) != 16384) { fprintf(stderr, "Truncated VEC3 tables\n"); fclose(vf); return 1; }
+            memcpy(&vtbl, pad_tbl, sizeof(vtbl));
+            id<MTLBuffer> bt = [dev newBufferWithBytes:&vtbl length:sizeof(vtbl) options:MTLResourceStorageModeShared];
+            for (uint32_t ci = 0; ci < hdr[1]; ++ci) {
+                uint32_t ch[10] = {};
+                if (fread(ch, 4, 10, vf) != 10) { fprintf(stderr, "Truncated VEC3 case %u\n", ci); fclose(vf); return 1; }
+                uint32_t bits = ch[0], R = ch[1], C = ch[2], rows = ch[3], r_off = ch[4], c_off = ch[5], n_loc = ch[6], k_loc = ch[7];
+                uint32_t n_words = ch[8], n_scales = ch[9];
+                std::vector<uint32_t> W(n_words);
+                std::vector<uint16_t> sc(n_scales), X((size_t)rows * k_loc);
+                std::vector<float> Y_ref((size_t)rows * n_loc);
+                if (fread(W.data(), 4, n_words, vf) != n_words ||
+                    fread(sc.data(), 2, n_scales, vf) != n_scales ||
+                    fread(X.data(), 2, X.size(), vf) != X.size() ||
+                    fread(Y_ref.data(), 4, Y_ref.size(), vf) != Y_ref.size()) {
+                    fprintf(stderr, "Truncated VEC3 payload case %u\n", ci); fclose(vf); return 1;
+                }
+                id<MTLBuffer> bW = [dev newBufferWithBytes:W.data() length:W.size() * 4 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> bS = [dev newBufferWithBytes:sc.data() length:sc.size() * 2 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> bX = [dev newBufferWithBytes:X.data() length:X.size() * 2 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> bXr = [dev newBufferWithLength:X.size() * 2 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> bYr = [dev newBufferWithLength:8ULL * rows * n_loc * 4 options:MTLResourceStorageModePrivate];
+                id<MTLBuffer> bY = [dev newBufferWithLength:Y_ref.size() * 4 options:MTLResourceStorageModeShared];
+                for (bool decode : {true, false}) {
+                    uint32_t ks = decode ? std::min<uint32_t>(8u, k_loc / 128u) : 1u;
+                    MetalDenseParams p{rows, n_loc, k_loc, k_loc, n_loc, r_off, c_off, r_off >> 4, r_off >> 7, c_off >> 7, (c_off + k_loc) >> 7, C >> 7, ks};
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:pso_fx];
+                    [enc setBuffer:bX offset:0 atIndex:0]; [enc setBuffer:bXr offset:0 atIndex:1];
+                    [enc setBytes:&p length:sizeof(p) atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(k_loc / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    if (decode) {
+                        [enc setComputePipelineState:pso_dec[bits]];
+                        [enc setBuffer:bW offset:0 atIndex:0]; [enc setBuffer:bS offset:0 atIndex:1];
+                        [enc setBuffer:bt offset:0 atIndex:2]; [enc setBuffer:bXr offset:0 atIndex:3];
+                        [enc setBuffer:bYr offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
+                        [enc dispatchThreadgroups:MTLSizeMake(n_loc / 64u, ks, (rows + 15u) / 16u) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        [enc setComputePipelineState:pso_fy];
+                        [enc setBuffer:bYr offset:0 atIndex:0]; [enc setBuffer:bY offset:0 atIndex:1];
+                        [enc setBytes:&p length:sizeof(p) atIndex:2];
+                        [enc dispatchThreadgroups:MTLSizeMake(n_loc / 128u, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    } else {
+                        [enc setComputePipelineState:pso_mm[bits]];
+                        [enc setBuffer:bW offset:0 atIndex:0]; [enc setBuffer:bS offset:0 atIndex:1];
+                        [enc setBuffer:bt offset:0 atIndex:2]; [enc setBuffer:bXr offset:0 atIndex:3];
+                        [enc setBuffer:bY offset:0 atIndex:4]; [enc setBytes:&p length:sizeof(p) atIndex:5];
+                        [enc dispatchThreadgroups:MTLSizeMake(n_loc / 128u, (rows + 31u) / 32u, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    }
+                    [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                    const float* got = (const float*)[bY contents];
+                    double dot = 0.0, na = 0.0, nb = 0.0;
+                    for (size_t i = 0; i < Y_ref.size(); ++i) {
+                        dot += (double)got[i] * Y_ref[i]; na += (double)got[i] * got[i]; nb += (double)Y_ref[i] * Y_ref[i];
+                    }
+                    double cos_v = dot / (std::sqrt(na * nb) + 1e-30);
+                    if (cos_v < 0.99998) {
+                        fprintf(stderr, "FAIL Metal VEC3 case=%u bits=%u %s r_off=%u c_off=%u cos=%.8f\n",
+                                ci, bits, decode ? "sk8" : "prefill", r_off, c_off, cos_v);
+                        fclose(vf); return 1;
+                    }
+                }
+            }
+            fclose(vf);
+            printf("PASS Metal TFQ3 golden vectors (%u cases across 3b/4b/5b sk8 + prefill, including r_off & bc>0 resume)\n", hdr[1]);
+            return 0;
+        }
 
         PwV3Tables h_tbl; init_synth_tables(h_tbl);
         id<MTLBuffer> b_tbl = [dev newBufferWithBytes:&h_tbl length:sizeof(h_tbl) options:MTLResourceStorageModeShared];
@@ -218,12 +299,15 @@ int main(int argc, char** argv) {
                 memcpy(out.data(), [b_Y contents], (size_t)r_cnt * n_loc * 4);
             };
 
-            std::vector<float> y_dec1, y_dec16, y_full;
+            std::vector<float> y_dec1, y_dec16, y_dec32, y_full;
             run_tp(true, 1u, 0, N, 0, K, y_dec1);
             run_tp(true, 16u, 0, N, 0, K, y_dec16);
-            // Bit-exact speculative verification parity: row 0 at rows=1 MUST equal row 0 at rows=16!
+            run_tp(true, 32u, 0, N, 0, K, y_dec32);
+            // Bit-exact speculative verification parity: row 0 at rows=1 MUST equal row 0 at rows=16 and rows=32!
             for (uint32_t r = 0; r < N; ++r) {
-                if (y_dec1[r] != y_dec16[r]) { fprintf(stderr, "FAIL Metal decode bit-exact r1!=r16 %ub @ %u\n", bits, r); return 1; }
+                if (y_dec1[r] != y_dec16[r] || y_dec1[r] != y_dec32[r]) {
+                    fprintf(stderr, "FAIL Metal decode bit-exact r1!=r16/r32 %ub @ %u\n", bits, r); return 1;
+                }
             }
             run_tp(false, rows, 0, N, 0, K, y_full);
             double dot = 0.0, na = 0.0, nb = 0.0, dot_d = 0.0, nda = 0.0, ndb = 0.0;
@@ -260,8 +344,19 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < y_sum.size(); ++i) { dtp += (double)y_sum[i] * y_full[i]; n1 += (double)y_sum[i] * y_sum[i]; n2 += (double)y_full[i] * y_full[i]; }
             double cos_tp = dtp / (std::sqrt(n1 * n2) + 1e-30);
             if (cos_tp < 0.999999) { fprintf(stderr, "FAIL Metal Row-TP=4 %ub cos=%.8f\n", bits, cos_tp); return 1; }
+
+            // Issue #11: Verify fp16 saturation prevents Inf/NaN when rotated activation exceeds 65504
+            if (bits == 4u) {
+                std::vector<uint16_t> big_x(K, f32_to_f16(10000.0f));
+                memcpy([b_X contents], big_x.data(), K * 2);
+                std::vector<float> y_big;
+                run_tp(true, 1u, 0, N, 0, K, y_big);
+                for (float v : y_big) {
+                    if (!std::isfinite(v)) { fprintf(stderr, "FAIL Metal TFQ3 fp16 overflow produced non-finite output\n"); return 1; }
+                }
+            }
         }
-        printf("PASS tfq3_metal_test (%s: 3b/4b/5b decode r1==r16 bit-exact + simdgroup_matrix prefill32 vs fp64 + Col-TP=4 + Row-TP=4)\n", [[dev name] UTF8String]);
+        printf("PASS tfq3_metal_test (%s: 3b/4b/5b decode r1==r16==r32 bit-exact + simdgroup_matrix prefill32 vs fp64 + Col-TP=4 + Row-TP=4 + fp16 sat)\n", [[dev name] UTF8String]);
 
         if (do_bench) {
             struct Shape { const char* name; uint32_t N, K; };
@@ -277,7 +372,7 @@ int main(int argc, char** argv) {
                 id<MTLBuffer> b_sc = [dev newBufferWithLength:ns * 2 options:MTLResourceStorageModeShared];
                 double bytes = (double)(nw * 4 + ns * 2);
                 for (uint32_t rows : {1u, 16u, 32u, 256u, 512u}) {
-                    bool dec = (rows <= 16u);
+                    bool dec = (rows <= 32u);
                     uint32_t ks = dec ? 8u : 1u;
                     MetalDenseParams p{rows, s.N, s.K, s.K, s.N, 0, 0, 0, 0, 0, s.K >> 7, s.K >> 7, ks};
                     auto run_n = [&](int reps) {

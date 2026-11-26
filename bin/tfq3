@@ -22,7 +22,7 @@ Options:
   --target-gib GB            Fit total checkpoint into GB via data-free sensitivity allocation
   --fit auto|GB              Auto-size to local GPU memory budget (or explicit GB)
   --residual MODE            Qwen3.8-27B residual precision: auto | bf16 | q8 (default: auto)
-  --head-bits N              lm_head bits: 0 | 4 | 5 (default: 4; 0 keeps lm_head in residual)
+  --head-bits N              lm_head bits: TFQ3 0 | 4 | 5 (default: 4); TFQ4 0 | 2 (default: 0 keeps lm_head in residual)
   --ple-bits N               Qwen3.8-Flash-Next PLE bits: 3 | 4 (default: 3)
   --quantize-vision          Also quantize vision tower linears (generic converter)
   --quantize-drafter         Quantize standalone DFlash2 / DSpine drafter checkpoint
@@ -223,7 +223,7 @@ elif mt in ("glm5_next", "glm_moe_dsa"):
     family = "glm"
 elif mt == "ernie5_5_moe":
     family = "ernie"
-nl =tc.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0
+nl = tc.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0
 mtp = cfg.get("num_nextn_predict_layers") or 0
 if mt == "glm_moe_dsa":
     nl = int(nl) + int(mtp)
@@ -306,6 +306,7 @@ run_convert() {
     local fit_mode=""
     local residual="auto"
     local head_bits="4"
+    local head_bits_set=0
     local ple_bits="3"
     local quantize_vision=0
     local quantize_drafter=0
@@ -329,7 +330,7 @@ run_convert() {
             --target-gib) [ $# -ge 2 ] || die "--target-gib requires GB"; target_gib="$2"; shift 2 ;;
             --fit) [ $# -ge 2 ] || die "--fit requires auto or GB"; fit_mode="$2"; shift 2 ;;
             --residual) [ $# -ge 2 ] || die "--residual requires auto|bf16|q8"; residual="$2"; shift 2 ;;
-            --head-bits) [ $# -ge 2 ] || die "--head-bits requires 0|4|5"; head_bits="$2"; shift 2 ;;
+            --head-bits) [ $# -ge 2 ] || die "--head-bits requires 0|2|4|5"; head_bits="$2"; head_bits_set=1; shift 2 ;;
             --ple-bits) [ $# -ge 2 ] || die "--ple-bits requires 3|4"; ple_bits="$2"; shift 2 ;;
             --quantize-vision) quantize_vision=1; shift ;;
             --quantize-drafter) quantize_drafter=1; shift ;;
@@ -419,9 +420,16 @@ run_convert() {
     case "$family" in
         generic)
             if [ "${bits_override}" = "2" ]; then
+                local tfq4_head_bits="0"
+                if [ "$head_bits_set" -eq 1 ]; then
+                    case "$head_bits" in
+                        0|2) tfq4_head_bits="$head_bits" ;;
+                        *) die "invalid --head-bits '${head_bits}' for TFQ4 (--bits 2): expected 0 (keep lm_head in residual, default) or 2" ;;
+                    esac
+                fi
                 local conv_bin
                 conv_bin="$(require_tool "$lib_dir" "tfq4-convert${suffix}")"
-                local g_flags=(--model "$src_dir" --out "$out_dir" --head-bits "$head_bits")
+                local g_flags=(--model "$src_dir" --out "$out_dir" --head-bits "$tfq4_head_bits")
                 [ -n "$max_shard_gib" ] && g_flags+=(--max-shard-gib "$max_shard_gib")
                 [ "$quantize_vision" -eq 1 ] && g_flags+=(--quantize-vision)
                 [ "$quantize_drafter" -eq 1 ] && g_flags+=(--quantize-drafter)
@@ -436,6 +444,7 @@ run_convert() {
                     run_cmd "$inspect_bin" "$out_dir"
                 fi
             else
+                case "$head_bits" in 0|4|5) ;; *) die "invalid --head-bits '${head_bits}' for TFQ3 (expected 0, 4, or 5)" ;; esac
                 local conv_bin
                 conv_bin="$(require_tool "$lib_dir" "tfq3-generic-convert${suffix}")"
                 local g_flags=(--model "$src_dir" --out "$out_dir" --profile "$profile" --head-bits "$head_bits")

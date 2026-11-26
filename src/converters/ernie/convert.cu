@@ -108,8 +108,9 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "Unexpected %s: dtype %s shape [%d, %d] bytes %zu (want BF16 [%u, %u])\n", name, dtype.c_str(), tR, tC, nbytes, R, C);
                     return 1;
                 }
+                tfq_common::check_finite_bf16(reinterpret_cast<const uint16_t*>(wp), R, C, name);
                 TFQ_CUDA_CHECK(cudaMemcpy(d_bf16, wp, nbytes, cudaMemcpyHostToDevice));
-                MatParams mp{R, C, b, 1.0f, 0u, 0u};
+                MatParams mp{R, C, b, tfq_common::moe_shrink(b), 0u, 0u};
                 bf16_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_bf16, d_tmp, mp);
                 col_fwht_and_ss_kernel<<<dim3(C, R / 128u, 1), 32>>>(d_tmp, d_rot, d_ss, mp);
                 finalize_scales_and_pack_nax_kernel<<<dim3(R / 16u, C / 128u, 1), 32>>>(d_rot, d_ss, d_sc, d_str, mp);

@@ -53,8 +53,10 @@ kernel void tfq4_fwht_x(
     v.w = float(src[lane + 96u]) * pw_sgn(0x12345678u, cs + lane + 96u);
     pw_fwht128_simd4(v, lane);
     device half* dst = X_rot + ulong(row) * P.k + c0;
-    dst[lane +  0u] = half(v.x); dst[lane + 32u] = half(v.y);
-    dst[lane + 64u] = half(v.z); dst[lane + 96u] = half(v.w);
+    dst[lane +  0u] = half(clamp(v.x, -65504.0f, 65504.0f));
+    dst[lane + 32u] = half(clamp(v.y, -65504.0f, 65504.0f));
+    dst[lane + 64u] = half(clamp(v.z, -65504.0f, 65504.0f));
+    dst[lane + 96u] = half(clamp(v.w, -65504.0f, 65504.0f));
 }
 
 inline float e8p_dot8(uint4 lut_u4, uint smask, const threadgroup uint4* xv) {
