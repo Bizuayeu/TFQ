@@ -356,6 +356,40 @@ def test_cli_ernie(tfq3_cli: str, tmp: str) -> None:
     print("PASS CLI ERNIE (detection, --profile widths, BF16-only and --bits refusals)")
 
 
+def test_cli_glm_bf16(tfq3_cli: str, tmp: str) -> None:
+    # GLM from a BF16 checkpoint, against stub binaries: CUDA-only, and only with --keep-nonmoe-bf16 or --nonmoe-model
+    # (the non-MoE pass reads MLX 8-bit tensors); an FP8 checkpoint keeps its plan
+    src = os.path.join(tmp, "glm_bf16_cli")
+    lib = os.path.join(tmp, "glm_lib")
+    os.makedirs(src)
+    os.makedirs(lib)
+    cfg = {"model_type": "glm5_next", "num_hidden_layers": 45}
+    with open(os.path.join(src, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    for name in ("tfq3-glm-convert-cuda", "tfq3-glm-convert", "tfq3-inspect"):
+        p = os.path.join(lib, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(p, 0o755)
+    env = dict(os.environ, TFQ3_LIB_DIR=lib)
+    keep = ["--glm-mode", "uniform4", "--keep-nonmoe-bf16", "--dry-run"]
+    if platform.system() == "Darwin":
+        assert "CUDA-only" in run([tfq3_cli, src, *keep], expect_ok=False, env=env).stderr
+        print("PASS CLI GLM BF16 (refused on Metal)")
+        return
+    err = run([tfq3_cli, src, "--dry-run"], expect_ok=False, env=env).stderr
+    assert "--keep-nonmoe-bf16" in err and "--nonmoe-model" in err, err
+    out = run([tfq3_cli, src, *keep], env=env).stdout
+    assert "--mode uniform4 --layers 3 6" in out and "--mode uniform4 --layers 7 44" in out, out
+    assert "--mode nonmoe" not in out and "Keeping non-MoE" in out, out
+    cfg["quantization_config"] = {"quant_method": "fp8"}
+    with open(os.path.join(src, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    out = run([tfq3_cli, src, "--dry-run"], env=env).stdout
+    assert "--mode heat543 --layers 3 6" in out and "--mode heat43 --layers 7 44" in out, out
+    print("PASS CLI GLM BF16 (needs --keep-nonmoe-bf16 or --nonmoe-model, plans uniform4; the FP8 plan unchanged)")
+
+
 def fp8_e4m3_to_f32(codes: np.ndarray) -> np.ndarray:
     """The converters' fp8_e4m3_to_f32 (cuda_encode_common.cuh): E4M3 bytes to float32, 0x7F/0xFF to 0."""
     c = codes.astype(np.int32)
@@ -1038,6 +1072,7 @@ def main() -> None:
             test_gpu_roundtrips(tfq3_cli, inspect_bin, model_dir, refs, tmp)
             test_glm_bf16_source(inspect_bin, tmp)
         test_cli_ernie(tfq3_cli, tmp)
+        test_cli_glm_bf16(tfq3_cli, tmp)
 
     print("ALL E2E TESTS PASSED")
 

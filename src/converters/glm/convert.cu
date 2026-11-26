@@ -289,13 +289,17 @@ int main(int argc, char** argv) {
             ranks = tfq_moe::rank_glm_experts_datafree(cache, lyr, N_EXP, H, &used_router, layer_prefix.c_str());
         }
         if (lyr == l_start) {
-            // A BF16 checkpoint has no weight_scale_inv, so the data-free rank there comes from the router alone.
+            // A BF16 checkpoint has no weight_scale_inv, so its data-free rank has no weight term.
+            const char* datafree = src_bf16
+                ? (used_router ? "DATA-FREE router sensitivity (BF16 source: no weight_scale_inv for the weight term)"
+                               : "none (BF16 source without a router: index order)")
+                : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
+                               : "DATA-FREE expert weight-scale sensitivity (no calibration data)");
             printf("GLM MoE CUDA | H=%d I=%d E=%d prefix=%s src=%s | HeatAlloc: %s\n",
                 H, I, N_EXP, layer_prefix.c_str(), src_dtype.c_str(),
                 used_trace
                 ? ("TRACE-GUIDED (uses calibration routing counts from " + trace_path + ")").c_str()
-                : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
-                               : "DATA-FREE expert weight-scale sensitivity (no calibration data)"));
+                : datafree);
             fflush(stdout);
         }
         std::vector<PrismExpertMeta> metas(N_EXP);
