@@ -150,12 +150,24 @@ def compute_h_inv_cholesky(H_rot: torch.Tensor, damp: float = 0.01) -> torch.Ten
 def ldlq_upper_factor(H_inv: torch.Tensor) -> torch.Tensor:
     """Upper Cholesky factor U of H^-1 (H^-1 = U^T U); trailing blocks of U give the conditional inverse once earlier columns are fixed."""
     U = torch.linalg.cholesky(H_inv.detach().cpu().to(torch.float64), upper=True)
+    if H_inv.device.type == "mps":
+        # Keep U in CPU float64 on MPS to avoid PyTorch MPSMatrixSolveTriangular
+        # memory corruption on repeated triangular solves.
+        return U
     return U.to(device=H_inv.device, dtype=torch.float32)
 
 
-def ldlq_gain(U: torch.Tensor, c0: int, c1: int) -> torch.Tensor:
+def ldlq_gain(U: torch.Tensor, c0: int, c1: int, out_device: torch.device | None = None) -> torch.Tensor:
     """LDLQ feedback gain from columns [c0, c1) to columns [c1, C) given columns [0, c0) are fixed: U_bb^-1 U_b,rest."""
-    return torch.linalg.solve_triangular(U[c0:c1, c0:c1], U[c0:c1, c1:], upper=True)
+    if U.device.type == "mps":
+        a = U[c0:c1, c0:c1].detach().cpu().to(torch.float64).contiguous()
+        b = U[c0:c1, c1:].detach().cpu().to(torch.float64).contiguous()
+        g = torch.linalg.solve_triangular(a, b, upper=True)
+        return g.to(device=out_device or U.device, dtype=torch.float32)
+    g = torch.linalg.solve_triangular(U[c0:c1, c0:c1].contiguous(), U[c0:c1, c1:].contiguous(), upper=True)
+    if out_device is not None and (g.device != out_device or g.dtype != torch.float32):
+        return g.to(device=out_device, dtype=torch.float32)
+    return g
 
 
 def _lane_maps(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -490,7 +502,7 @@ def quantize_tfq3_matrix(
         if H_inv is not None and (c_blk + 128) < C:
             sc_rows = scales[:, cb].repeat_interleave(128)[:, None]
             E_blk = W_rot[:, c_blk : c_blk + 128] - Q_unit[:, c_blk : c_blk + 128] * sc_rows
-            W_rot[:, c_blk + 128 :] -= E_blk @ ldlq_gain(U_inv, c_blk, c_blk + 128)
+            W_rot[:, c_blk + 128 :] -= E_blk @ ldlq_gain(U_inv, c_blk, c_blk + 128, out_device=device)
 
     # Optional closed-form per-128x128-tile Hessian scale refinement (exact same single fp16 scale!)
     if refine_scales:
@@ -508,8 +520,8 @@ def quantize_tfq3_matrix(
                 else:
                     num = float(torch.sum(W_b * Q_b).item())
                     den = float(torch.sum(Q_b * Q_b).item())
-                if den > 1e-12 and num > 0.0:
-                    scales_f16[rb, cb] = torch.tensor(num / den, dtype=torch.float16, device=device)
+                if den > 1e-12 and num > 0.0 and math.isfinite(num / den):
+                    scales_f16[rb, cb] = torch.tensor(min(num / den, 65504.0), dtype=torch.float16, device=device)
 
     scales_final = scales_f16.to(torch.float32)
     W_rot_hat = Q_unit * scales_final.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
@@ -604,7 +616,7 @@ def quantize_tfq4_matrix(
 
         if H_inv is not None and (c0 + 8) < C:
             E_sub = W_rot[:, c0 : c0 + 8] - q_sub * sc_rows
-            W_rot[:, c0 + 8 :] -= E_sub @ ldlq_gain(U_inv, c0, c0 + 8)
+            W_rot[:, c0 + 8 :] -= E_sub @ ldlq_gain(U_inv, c0, c0 + 8, out_device=device)
 
     if refine_scales:
         for cb in range(n_bc):
@@ -621,8 +633,8 @@ def quantize_tfq4_matrix(
                 else:
                     num = float(torch.sum(W_b * Q_b).item())
                     den = float(torch.sum(Q_b * Q_b).item())
-                if den > 1e-12 and num > 0.0:
-                    scales_f16[rb, cb] = torch.tensor(num / den, dtype=torch.float16, device=device)
+                if den > 1e-12 and num > 0.0 and math.isfinite(num / den):
+                    scales_f16[rb, cb] = torch.tensor(min(num / den, 65504.0), dtype=torch.float16, device=device)
 
     scales_final = scales_f16.to(torch.float32)
     W_hat = unrotate_2d_torch(Q_unit * scales_final.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1))[:orig_R, :orig_C]

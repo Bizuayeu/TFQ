@@ -143,9 +143,11 @@ def quant_awq_salient(W: torch.Tensor, H: torch.Tensor, bits: int, group: int = 
         W_q = quant_affine_rtn(Wf * s[None, :], bits, group=group) / s[None, :]
         d = Wf - W_q
         err = float(torch.sum((d @ Hf) * d).item())
-        if err < best_err:
+        if math.isfinite(err) and err < best_err:
             best_err = err
             best_W = W_q
+    if best_W is None:
+        best_W = quant_affine_rtn(Wf, bits, group=group)
     return best_W
 
 
@@ -560,26 +562,27 @@ def main() -> None:
         name: str, baseline_kind: str, bits: int, eff_bpw: float, uses_calib: bool,
         quant_fn, conv_sec_override: float | None = None, converter_prov: dict | None = None,
     ):
-        t_q = time.time()
-        q_hats: dict[str, torch.Tensor] = {}
-        for nm in target_linears:
-            W_orig = orig_weights[nm].to(device=device, dtype=torch.float32)
-            q_hats[nm] = quant_fn(nm, W_orig)
-        if device.type == "mps":
-            torch.mps.synchronize()
-        elif device.type == "cuda":
-            torch.cuda.synchronize()
-        conv_s = conv_sec_override if conv_sec_override is not None else (time.time() - t_q)
-
         w_snrs, o_snrs = [], []
+        quant_time = 0.0
         for nm in target_linears:
             W_orig = orig_weights[nm].to(device=device, dtype=torch.float32)
-            W_hat = q_hats[nm]
+            t_layer = time.time()
+            W_hat = quant_fn(nm, W_orig)
+            if device.type == "mps":
+                torch.mps.synchronize()
+            elif device.type == "cuda":
+                torch.cuda.synchronize()
+            quant_time += time.time() - t_layer
+            if not torch.isfinite(W_hat).all():
+                raise RuntimeError(f"Non-finite W_hat produced by {name!r} on layer {nm}")
             ws, osnr = compute_layer_snrs(W_orig, W_hat, H_eval[nm])
             w_snrs.append(ws)
             o_snrs.append(osnr)
             mod_map[nm].weight.data.copy_(W_hat.to(device=device, dtype=torch.bfloat16))
-        del q_hats
+            del W_hat, W_orig
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        conv_s = conv_sec_override if conv_sec_override is not None else quant_time
         ev = evaluate_model_ppl_and_kl(model, eval_batches, args.kl_seqs, ref_model, gold_seq_nlls, device)
         row = {
             "name": name,
@@ -614,8 +617,8 @@ def main() -> None:
         H_inv_raw = tfq3_h.compute_h_inv_cholesky(Hc, damp=0.01)
         gptq_uinv[nm] = torch.linalg.cholesky(H_inv_raw.to(torch.float64)).T.to(torch.float32)
 
-        H_pad = tfq3_h.pad_hessian_128(Hc, pad_C)
-        H_rot = tfq3_h.rotate_hessian_torch(H_pad)
+        H_pad = tfq3_h.pad_hessian_128(Hc.to(device), pad_C)
+        H_rot = tfq3_h.rotate_hessian_torch(H_pad).cpu()
         H_rot_inv = tfq3_h.compute_h_inv_cholesky(H_rot, damp=0.01)
         U_rot_inv = torch.linalg.cholesky(H_rot_inv.to(torch.float64)).T.to(torch.float32)
         rot_h_cache[nm] = (H_rot, H_rot_inv)
