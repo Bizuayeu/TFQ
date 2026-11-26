@@ -149,10 +149,9 @@ def compute_h_inv_cholesky(H_rot: torch.Tensor, damp: float = 0.01) -> torch.Ten
 
 def ldlq_upper_factor(H_inv: torch.Tensor) -> torch.Tensor:
     """Upper Cholesky factor U of H^-1 (H^-1 = U^T U); trailing blocks of U give the conditional inverse once earlier columns are fixed."""
-    U = torch.linalg.cholesky(H_inv.detach().cpu().to(torch.float64), upper=True)
+    # Compute lower Cholesky L (H^-1 = L L^T) and transpose to U = L^T; avoids macOS PyTorch/Accelerate upper=True heap corruption.
+    U = torch.linalg.cholesky(H_inv.detach().cpu().to(torch.float64)).T.contiguous()
     if H_inv.device.type == "mps":
-        # Keep U in CPU float64 on MPS to avoid PyTorch MPSMatrixSolveTriangular
-        # memory corruption on repeated triangular solves.
         return U
     return U.to(device=H_inv.device, dtype=torch.float32)
 
