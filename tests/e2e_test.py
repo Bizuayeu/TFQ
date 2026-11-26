@@ -399,6 +399,45 @@ def test_moe_datafree_ranking(tmp: str) -> None:
     print(out.stdout.strip())
 
 
+def test_planner_shape_whitespace(tmp: str) -> None:
+    """The generic planner must parse a Safetensors header with JSON whitespace inside a shape array."""
+    cxx = "clang++" if platform.system() == "Darwin" else "g++"
+    model_dir = os.path.join(tmp, "ws_model")
+    os.makedirs(model_dir, exist_ok=True)
+    nbytes = 128 * 256 * 4
+    header = {"layer.weight": {"dtype": "F32", "shape": [128, 256], "data_offsets": [0, nbytes]}}
+    hdr_bytes = json.dumps(header, indent=2).encode("utf-8")  # newline between the shape dims
+    with open(os.path.join(model_dir, "model.safetensors"), "wb") as f:
+        f.write(struct.pack("<Q", len(hdr_bytes)))
+        f.write(hdr_bytes)
+        f.write(b"\x00" * nbytes)
+    src = os.path.join(tmp, "test_planner_ws.cpp")
+    exe = os.path.join(tmp, "test_planner_ws")
+    hdr = os.path.join(REPO_ROOT, "src", "converters", "generic", "planner.hpp")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(
+            f'#include "{hdr}"\n'
+            '#include <cassert>\n'
+            'int main(int, char** argv) {\n'
+            '    tfq_generic::SafetensorsDir st;\n'
+            '    st.init(argv[1]);\n'
+            '    const auto& shape = st.tensors.at("layer.weight").shape;\n'
+            '    assert(shape.size() == 2 && shape[0] == 128 && shape[1] == 256);\n'
+            '    std::printf("PASS planner parses whitespace in Safetensors shapes ([%llu, %llu])\\n",\n'
+            '                (unsigned long long)shape[0], (unsigned long long)shape[1]);\n'
+            '    return 0;\n'
+            '}\n'
+        )
+    run([cxx, "-O2", "-std=c++17", "-Wall", "-Wextra", "-Werror", src, "-o", exe])
+    try:
+        out = subprocess.run([exe, model_dir], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("planner hung parsing a Safetensors shape with a newline between dims")
+    if out.returncode != 0:
+        raise AssertionError(f"planner whitespace test failed (rc={out.returncode}):\n{out.stdout}\n{out.stderr}")
+    print(out.stdout.strip())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-gpu", action="store_true", help="Skip GPU converter round-trips (for headless CI runners)")
@@ -416,6 +455,7 @@ def main() -> None:
         model_dir = os.path.join(tmp, "synth_model")
         refs = write_synthetic_model(model_dir)
         test_moe_datafree_ranking(tmp)
+        test_planner_shape_whitespace(tmp)
         test_inspector_negative_controls(inspect_bin, tmp)
         test_cli_basics(tfq3_cli, model_dir)
         if not args.no_gpu:

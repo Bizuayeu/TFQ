@@ -122,11 +122,12 @@ struct SafetensorsDir {
                 std::string sb = obj.substr(slb + 1, srb - slb - 1);
                 size_t si = 0;
                 while (si < sb.size()) {
-                    while (si < sb.size() && (sb[si] == ' ' || sb[si] == ',' || sb[si] == '\t')) ++si;
+                    while (si < sb.size() && (sb[si] == ' ' || sb[si] == ',' || sb[si] == '\t' || sb[si] == '\n' || sb[si] == '\r')) ++si;
                     if (si >= sb.size()) break;
                     size_t sj = si;
                     while (sj < sb.size() && sb[sj] >= '0' && sb[sj] <= '9') ++sj;
-                    if (sj > si) ti.shape.push_back(std::stoull(sb.substr(si, sj - si)));
+                    if (sj == si) { fprintf(stderr, "Bad shape for %s in %s\n", tname.c_str(), shard_file.c_str()); exit(1); }
+                    ti.shape.push_back(std::stoull(sb.substr(si, sj - si)));
                     si = sj;
                 }
             }
