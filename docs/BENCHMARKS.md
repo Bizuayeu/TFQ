@@ -102,17 +102,26 @@ Measured directly on **Apple M5 Ultra** (TensorFold Metal) and **NVIDIA GB10** (
 
 ---
 
-## 4. GLM-5.3-Flash (45L, 288-Expert MoE) `[MEASURED — THROUGHPUT & FOOTPRINT; QUALITY EVAL NOT VERIFIED]`
+## 4. GLM-5.3-Flash (45L, 288-Expert MoE) `[MEASURED]`
 
 ### Explicit Footprint & Bit-Rate Breakdown (Apples-to-Apples)
 
-The compact TFQ3 GLM pack (`139.6 GB` / `130.0 GiB`) is smaller than a uniform 4.0 bpw + BF16-non-MoE pack (~`175.6 GB`) **primarily because it uses fewer bits on deep MoE experts (`3.333 bpw`) and quantizes non-MoE projections (`nonmoe.tffpw`), NOT because of higher coding density at equal bits**:
+The compact TFQ3 GLM pack (`139.6 GB` / `130.0 GiB`) is smaller than a uniform 4.0 bpw + full-precision non-MoE pack (`167.5 GB`–`175.6 GB`) **primarily because it uses fewer bits on deep MoE experts (`3.333 bpw`) and quantizes non-MoE projections (`nonmoe.tffpw`), NOT because of higher coding density at equal bits**:
 
 | Profile / Command | Routed MoE Precision | Non-MoE Precision (Attn / Shared / Head) | Routed MoE Size | Non-MoE + Residuals | Total Size | Status |
 |---|---|---|---:|---:|---:|---|
-| Raw FP8 Source | 8-bit FP8 | BF16 / FP8 | ~304 GB | ~16 GB | 319.8 GB | Reference |
-| **TFQ3 Compact** (`heat543` L3-6 + `heat43` L7-44 + `nonmoe --fast4b`) | **3.39 bpw avg** (`heat43` = `3.333 bpw`: 96×4b + 192×3b) | 4b/5b `nonmoe.tffpw` | ~128.4 GB | ~11.2 GB | **139.6 GB (130.0 GiB)** | `[MEASURED]` |
-| **TFQ3 Matched-4b** (`--glm-mode uniform4 --keep-nonmoe-bf16`) | **4.001 bpw uniform** (all 288E @ 4b) | Full-precision BF16/FP8 untouched | ~152.1 GB | ~16–23 GB | ~168–175 GB | `[PROJECTED]` |
+| Raw FP8 Source (`GLM-5.3-Flash-FP8E-MLX8-MTP4H`) | 8-bit FP8 | Native 8-bit / BF16 untouched | 304.5 GB | 15.3 GB | 319.8 GB (297.8 GiB) | Reference |
+| **TFQ3 Compact** (`heat543` L3-6 + `heat43` L7-44 + `nonmoe --fast4b`) | **3.39 bpw avg** (`heat43` = `3.333 bpw`: 96×4b + 192×3b) | 4b/5b `nonmoe.tffpw` | 128.4 GB | 11.2 GB | **139.6 GB (130.0 GiB)** | `[MEASURED]` |
+| **TFQ3 Matched-4b** (`--glm-mode uniform4 --keep-nonmoe-bf16`) | **4.001 bpw uniform** (all 288E @ 4b, mean **23.361 dB** across 36,288 matrices) | Native 8-bit / BF16 untouched (63 shards, 5,332 tensors) | **152.24 GB (141.79 GiB)** | **15.26 GB (14.21 GiB)** | **167.50 GB (156.00 GiB)** | `[MEASURED]` |
+
+### Measured 4,094-Token WikiText-2 Quality (`TFQ3 Matched-4b` vs. Raw FP8 Source) `[MEASURED]`
+
+Evaluated on Apple M5 Ultra Metal (`tf-glm-run`, `GLM_PROMPT_NLL=128`, exact same two 2,048-token `wikitext-2-raw-v1` test chunks = `4,094` scored tokens, 100% data-free conversion in ~42 min with zero calibration data):
+
+| Checkpoint | Buffers in RAM | Chunk 0 NLL (2,047 tok) | Chunk 1 NLL (2,047 tok) | Mean NLL (4,094 tok) | ΔNLL vs FP8 | PPL (4,094 tok) | `d0 == d3` (MTP) |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **FP8 Gold Source** | 318.60 GB | 0.661032 | 0.508224 | 0.584628 | — | 1.7943 | Reference |
+| **TFQ3 Matched-4b** (`uniform4 --keep-nonmoe-bf16`, 100% data-free) | **166.36 GB** | **0.683424** | **0.528005** | **0.605715** | **+0.0211 nats** | **1.8326 (+2.1%)** | **Bit-exact** |
 
 ### Measured Runtime Throughput (Apple M5 Ultra, Compact `130.0 GiB` Pack) `[MEASURED]`
 
@@ -123,7 +132,7 @@ The compact TFQ3 GLM pack (`139.6 GB` / `130.0 GiB`) is smaller than a uniform 4
 | Live Speculative (`MTP + copies`, bit-exact `d3 == d0`) | — | **87.0–104.3 tok/s** (mean `95.2 tok/s`) |
 | Live Speculative (`DFlash2` 4-bit, bit-exact) | — | **85.3 tok/s** |
 
-> **Quality evaluation note (`[NOT VERIFIED]`):** An earlier draft listed a 4-prompt (`235`-token) PPL comparison (`22.61` vs `24.16` FP8). We removed that figure because `235` tokens is far too small to measure quantization quality reliably (a quant appearing to beat its source on 235 tokens is statistical noise). Full multi-thousand-token KL divergence and coding-task evaluation of GLM-5.3-Flash-TFQ3 (both compact and `--glm-mode uniform4 --keep-nonmoe-bf16`) against BF16/FP8 and Hessian-calibrated packs is pending.
+> **Scope note:** An earlier draft listed a 4-prompt (`235`-token) PPL comparison (`22.61` vs `24.16` FP8); that noisy figure was removed and replaced by the 4,094-token WikiText-2 evaluation above. Full coding-task (SWE-bench / Docker-graded) and `panel72` KL comparison against Hessian-calibrated packs (e.g. EXL3/EAQ) remains pending (`[NOT VERIFIED]`).
 
 ---
 
