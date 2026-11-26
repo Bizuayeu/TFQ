@@ -213,8 +213,7 @@ static void load_or_generate_tables(const std::string& path, PwV3TablesFile& tbl
     fill_c64(tbl.c64_5, tbl.a5, tbl.b5);
     FILE* fo = fopen(path.c_str(), "wb");
     if (!fo) { fprintf(stderr, "Cannot write %s\n", path.c_str()); exit(1); }
-    fwrite(&tbl, 1, sizeof(tbl), fo);
-    fclose(fo);
+    if (fwrite(&tbl, 1, sizeof(tbl), fo) != sizeof(tbl) || fclose(fo) != 0) { fprintf(stderr, "Write error on %s\n", path.c_str()); exit(1); }
     printf("Saved %s (16,384 bytes)\n", path.c_str());
 }
 
@@ -293,6 +292,7 @@ struct ShardCache {
         if (e.fd < 0) { fprintf(stderr, "Cannot open %s\n", full.c_str()); exit(1); }
         struct stat st{}; fstat(e.fd, &st); e.len = (size_t)st.st_size;
         e.ptr = (uint8_t*)mmap(nullptr, e.len, PROT_READ, MAP_PRIVATE, e.fd, 0);
+        if (e.ptr == MAP_FAILED) { fprintf(stderr, "mmap failed on %s\n", full.c_str()); exit(1); }
         uint64_t hlen = 0; memcpy(&hlen, e.ptr, 8);
         e.data_base = 8 + hlen;
         std::string hdr((const char*)e.ptr + 8, hlen);
