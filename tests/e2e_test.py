@@ -399,6 +399,61 @@ def test_moe_datafree_ranking(tmp: str) -> None:
     print(out.stdout.strip())
 
 
+def test_planner_mlx_bits(tmp: str) -> None:
+    """MLX checkpoints quantized to other than 8 bits must be refused, not decoded as MLX 8-bit."""
+    cxx = "clang++" if platform.system() == "Darwin" else "g++"
+
+    def write_mlx(d: str, bits: int) -> None:
+        os.makedirs(d, exist_ok=True)
+        R, C, gs = 256, 256, 64
+        cols = C * bits // 32
+        tensors = [
+            ("model.layers.0.mlp.up_proj.weight", "U32", [R, cols], bytes(R * cols * 4)),
+            ("model.layers.0.mlp.up_proj.scales", "F16", [R, C // gs], bytes(R * (C // gs) * 2)),
+            ("model.layers.0.mlp.up_proj.biases", "F16", [R, C // gs], bytes(R * (C // gs) * 2)),
+        ]
+        header, payload = {}, bytearray()
+        for name, dtype, shape, raw in tensors:
+            header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [len(payload), len(payload) + len(raw)]}
+            payload.extend(raw)
+        hdr_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        with open(os.path.join(d, "model.safetensors"), "wb") as f:
+            f.write(struct.pack("<Q", len(hdr_bytes)))
+            f.write(hdr_bytes)
+            f.write(payload)
+        with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"model_type": "llama", "quantization": {"group_size": gs, "bits": bits}}, f)
+
+    src = os.path.join(tmp, "test_planner_mlx.cpp")
+    exe = os.path.join(tmp, "test_planner_mlx")
+    hdr = os.path.join(REPO_ROOT, "src", "converters", "generic", "planner.hpp")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(
+            f'#include "{hdr}"\n'
+            'int main(int, char** argv) {\n'
+            '    using namespace tfq_generic;\n'
+            '    SafetensorsDir st;\n'
+            '    st.init(argv[1]);\n'
+            '    GenericOptions opt;\n'
+            '    opt.model_dir = argv[1];\n'
+            '    ConversionPlan plan = build_plan(st, opt);\n'
+            '    for (const auto& j : plan.jobs)\n'
+            '        std::printf("%s %s [%u, %u] group=%u\\n", j.tfpn_name.c_str(), j.src_format.c_str(), j.orig_R, j.orig_C, j.group_size);\n'
+            '    return 0;\n'
+            '}\n'
+        )
+    run([cxx, "-O2", "-std=c++17", "-Wall", "-Wextra", "-Werror", src, "-o", exe])
+    q8 = os.path.join(tmp, "mlx_q8")
+    write_mlx(q8, 8)
+    out = run([exe, q8])
+    assert "MLX_Q8 [256, 256] group=64" in out.stdout, out.stdout
+    q4 = os.path.join(tmp, "mlx_q4")
+    write_mlx(q4, 4)
+    bad = run([exe, q4], expect_ok=False)
+    assert "4-bit" in bad.stderr, bad.stderr
+    print("PASS planner reads MLX 8-bit and refuses MLX 4-bit: " + bad.stderr.strip())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-gpu", action="store_true", help="Skip GPU converter round-trips (for headless CI runners)")
@@ -416,6 +471,7 @@ def main() -> None:
         model_dir = os.path.join(tmp, "synth_model")
         refs = write_synthetic_model(model_dir)
         test_moe_datafree_ranking(tmp)
+        test_planner_mlx_bits(tmp)
         test_inspector_negative_controls(inspect_bin, tmp)
         test_cli_basics(tfq3_cli, model_dir)
         if not args.no_gpu:
