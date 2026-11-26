@@ -17,6 +17,8 @@ struct MatParams {
     uint C;
     uint b_bits;
     float shrink;
+    uint r_off;  // the chunk's first absolute row: TFQ3 row signs are absolute (spec)
+    uint pad0;
 };
 
 struct EncParams {
@@ -111,12 +113,12 @@ kernel void col_fwht_and_ss(
     uint2 gid                   [[threadgroup_position_in_grid]],
     ushort lane                 [[thread_index_in_simdgroup]]
 ) {
-    uint c = gid.x, br = gid.y, r0 = br * 128u;
+    uint c = gid.x, br = gid.y, r0 = br * 128u, rs = P.r_off + r0;
     float4 v;
-    v.x = W_tmp[ulong(r0 + lane +  0u) * P.C + c] * sgn_bit(0x9E3779B9u, r0 + lane +  0u);
-    v.y = W_tmp[ulong(r0 + lane + 32u) * P.C + c] * sgn_bit(0x9E3779B9u, r0 + lane + 32u);
-    v.z = W_tmp[ulong(r0 + lane + 64u) * P.C + c] * sgn_bit(0x9E3779B9u, r0 + lane + 64u);
-    v.w = W_tmp[ulong(r0 + lane + 96u) * P.C + c] * sgn_bit(0x9E3779B9u, r0 + lane + 96u);
+    v.x = W_tmp[ulong(r0 + lane +  0u) * P.C + c] * sgn_bit(0x9E3779B9u, rs + lane +  0u);
+    v.y = W_tmp[ulong(r0 + lane + 32u) * P.C + c] * sgn_bit(0x9E3779B9u, rs + lane + 32u);
+    v.z = W_tmp[ulong(r0 + lane + 64u) * P.C + c] * sgn_bit(0x9E3779B9u, rs + lane + 64u);
+    v.w = W_tmp[ulong(r0 + lane + 96u) * P.C + c] * sgn_bit(0x9E3779B9u, rs + lane + 96u);
     fwht128_simd4(v, lane);
     W_rot[ulong(r0 + lane +  0u) * P.C + c] = v.x;
     W_rot[ulong(r0 + lane + 32u) * P.C + c] = v.y;
