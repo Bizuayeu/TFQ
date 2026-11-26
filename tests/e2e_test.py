@@ -499,6 +499,44 @@ def test_planner_fp8_scales(tmp: str) -> None:
     print(out.stdout.strip())
 
 
+def test_planner_budget_minimum(tmp: str) -> None:
+    """A --target-gib below the all-3-bit footprint must be refused, not silently exceeded."""
+    cxx = "clang++" if platform.system() == "Darwin" else "g++"
+    model_dir = os.path.join(tmp, "budget_model")
+    os.makedirs(model_dir, exist_ok=True)
+    nbytes = 1024 * 1024 * 4
+    header = {"model.layers.0.mlp.up_proj.weight": {"dtype": "F32", "shape": [1024, 1024], "data_offsets": [0, nbytes]}}
+    hdr_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    with open(os.path.join(model_dir, "model.safetensors"), "wb") as f:
+        f.write(struct.pack("<Q", len(hdr_bytes)))
+        f.write(hdr_bytes)
+        f.write(b"\x00" * nbytes)
+    src = os.path.join(tmp, "test_planner_budget.cpp")
+    exe = os.path.join(tmp, "test_planner_budget")
+    hdr = os.path.join(REPO_ROOT, "src", "converters", "generic", "planner.hpp")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(
+            f'#include "{hdr}"\n'
+            'int main(int, char** argv) {\n'
+            '    using namespace tfq_generic;\n'
+            '    SafetensorsDir st;\n'
+            '    st.init(argv[1]);\n'
+            '    GenericOptions opt;\n'
+            '    opt.model_dir = argv[1];\n'
+            '    opt.out_dir = argv[1];\n'
+            '    opt.target_gib = atof(argv[2]);\n'
+            '    ConversionPlan plan = build_plan(st, opt);\n'
+            '    print_plan_summary(opt, plan);\n'
+            '    return 0;\n'
+            '}\n'
+        )
+    run([cxx, "-O2", "-std=c++17", "-Wall", "-Wextra", "-Werror", src, "-o", exe])
+    run([exe, model_dir, "0.01"])  # 3-bit minimum is ~0.0006 GiB: fits
+    low = run([exe, model_dir, "0.0001"], expect_ok=False)
+    assert "minimum" in low.stderr, low.stderr
+    print("PASS planner refuses a --target-gib below the 3-bit minimum: " + low.stderr.strip())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-gpu", action="store_true", help="Skip GPU converter round-trips (for headless CI runners)")
@@ -518,6 +556,7 @@ def main() -> None:
         test_moe_datafree_ranking(tmp)
         test_planner_shape_whitespace(tmp)
         test_planner_fp8_scales(tmp)
+        test_planner_budget_minimum(tmp)
         test_inspector_negative_controls(inspect_bin, tmp)
         test_cli_basics(tfq3_cli, model_dir)
         if not args.no_gpu:
