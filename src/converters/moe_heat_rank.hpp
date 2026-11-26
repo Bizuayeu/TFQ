@@ -98,10 +98,12 @@ static inline bool compute_router_norms(
     return false;
 }
 
-// GLM-5.3-Flash data-free expert ranking using router L2 norm + FP8 block-scale energy.
+// GLM data-free expert ranking using router L2 norm + FP8 block-scale energy.
+// Supports both GLM-5.3-Flash ("model.language_model.layers") and GLM-5.3 753B ("model.layers").
 template <typename CacheT>
 static inline std::vector<int> rank_glm_experts_datafree(
-    CacheT& cache, int lyr, int n_exp, int H, bool* used_router = nullptr
+    CacheT& cache, int lyr, int n_exp, int H, bool* used_router = nullptr,
+    const char* layer_prefix = "model.language_model.layers"
 ) {
     static const char* projs[3] = {"gate_proj", "up_proj", "down_proj"};
     std::vector<double> w_energy(n_exp, 0.0);
@@ -109,7 +111,7 @@ static inline std::vector<int> rank_glm_experts_datafree(
         double acc = 0.0;
         for (int p = 0; p < 3; ++p) {
             char nm[256];
-            std::snprintf(nm, sizeof(nm), "model.language_model.layers.%d.mlp.experts.%d.%s.weight_scale_inv", lyr, e, projs[p]);
+            std::snprintf(nm, sizeof(nm), "%s.%d.mlp.experts.%d.%s.weight_scale_inv", layer_prefix, lyr, e, projs[p]);
             if (!cache.has_tensor(nm)) continue;
             size_t ns = 0;
             const uint8_t* sp = fetch_tensor_bytes(cache, nm, &ns, 0);
@@ -124,7 +126,7 @@ static inline std::vector<int> rank_glm_experts_datafree(
 
     std::vector<double> r_norms;
     char rname[256];
-    std::snprintf(rname, sizeof(rname), "model.language_model.layers.%d.mlp.gate.weight", lyr);
+    std::snprintf(rname, sizeof(rname), "%s.%d.mlp.gate.weight", layer_prefix, lyr);
     bool has_r = compute_router_norms(cache, rname, n_exp, H, r_norms);
     if (used_router) *used_router = has_r;
 

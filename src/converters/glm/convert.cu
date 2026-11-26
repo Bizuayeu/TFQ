@@ -6,7 +6,7 @@
 #include "../cuda_encode_common.cuh"
 #include "../moe_heat_rank.hpp"
 
-static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_path) {
+static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_path, int n_exp) {
     std::map<int, std::vector<int>> counts;
     std::ifstream f(trace_path);
     std::string line;
@@ -14,19 +14,19 @@ static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_
         if (line.rfind("LAYER ", 0) == 0) {
             int lyr = 0, eid = 0; long long cnt = 0;
             if (sscanf(line.c_str(), "LAYER %d E%d %lld", &lyr, &eid, &cnt) == 3) {
-                if (!counts.count(lyr)) counts[lyr].assign(288, 0);
-                if (eid >= 0 && eid < 288) counts[lyr][eid] += (int)cnt;
+                if (!counts.count(lyr)) counts[lyr].assign(n_exp, 0);
+                if (eid >= 0 && eid < n_exp) counts[lyr][eid] += (int)cnt;
             }
         }
     }
     std::map<int, std::vector<int>> ranks;
     for (auto& kv : counts) {
-        std::vector<int> order(288); std::iota(order.begin(), order.end(), 0);
+        std::vector<int> order(n_exp); std::iota(order.begin(), order.end(), 0);
         std::sort(order.begin(), order.end(), [&](int a, int b) {
             return (kv.second[a] != kv.second[b]) ? (kv.second[a] > kv.second[b]) : (a < b);
         });
-        std::vector<int> r(288);
-        for (int idx = 0; idx < 288; ++idx) r[order[idx]] = idx;
+        std::vector<int> r(n_exp);
+        for (int idx = 0; idx < n_exp; ++idx) r[order[idx]] = idx;
         ranks[kv.first] = std::move(r);
     }
     return ranks;
@@ -210,23 +210,42 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // MoE Layer Mode ("TFPW" v3, H=4096, I=2048, E=288)
-    constexpr int H = 4096, I = 2048, N_EXP = 288;
-    constexpr size_t MAX_E = (size_t)H * I;
+    // MoE Layer Mode ("TFPW" v3): auto-detect GLM-5.3-Flash vs GLM-5.3 753B (glm_moe_dsa)
+    std::string layer_prefix = "model.language_model.layers";
+    {
+        char probe[256];
+        snprintf(probe, sizeof(probe), "model.layers.%d.mlp.experts.0.gate_proj.weight", l_start);
+        if (cache.has_tensor(probe)) layer_prefix = "model.layers";
+    }
+    int H = 4096, I = 2048, N_EXP = 0;
+    {
+        char probe[256];
+        snprintf(probe, sizeof(probe), "%s.%d.mlp.experts.0.gate_proj.weight", layer_prefix.c_str(), l_start);
+        size_t dummy = 0;
+        cache.get_tensor(probe, nullptr, &dummy, &I, &H);
+        while (true) {
+            snprintf(probe, sizeof(probe), "%s.%d.mlp.experts.%d.gate_proj.weight", layer_prefix.c_str(), l_start, N_EXP);
+            if (!cache.has_tensor(probe)) break;
+            N_EXP++;
+        }
+        cache.evict_all();
+    }
+    const uint32_t N_SC = (uint32_t)((H / 128) * (I / 128));
+    const size_t MAX_E = (size_t)H * (size_t)I;
     uint8_t *d_fp8; float *d_scinv, *d_tmp, *d_rot, *d_ss, *d_str, *d_se;
     __half *d_sc; uint32_t *d_hist, *d_pack;
     TFQ_CUDA_CHECK(cudaMalloc(&d_fp8, MAX_E));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_scinv, 512 * 4));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_tmp, MAX_E * 4));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_rot, MAX_E * 4));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_ss,  512 * 4));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_str, MAX_E * 4));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_hist, (size_t)CHUNK_STR * (H / 4) * 256ULL * 4ULL));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_pack, (size_t)(I / 16) * (H / 128) * 10 * 32 * 4));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_sc,  512 * 2));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_scinv, (size_t)N_SC * 4ULL));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_tmp, MAX_E * 4ULL));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_rot, MAX_E * 4ULL));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_ss,  (size_t)N_SC * 4ULL));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_str, MAX_E * 4ULL));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_hist, (size_t)CHUNK_STR * (size_t)(H / 4) * 256ULL * 4ULL));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_pack, (size_t)(I / 16) * (size_t)(H / 128) * 10ULL * 32ULL * 4ULL));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_sc,  (size_t)N_SC * 2ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_se,  8));
 
-    auto heat_ranks = trace_path.empty() ? std::map<int, std::vector<int>>{} : load_heat_ranks(trace_path);
+    auto heat_ranks = trace_path.empty() ? std::map<int, std::vector<int>>{} : load_heat_ranks(trace_path, N_EXP);
     const char* proj_names[3] = {"gate_proj", "up_proj", "down_proj"};
     const int proj_R[3] = {I, I, H}, proj_C[3] = {H, H, I};
 
@@ -240,10 +259,12 @@ int main(int argc, char** argv) {
             ranks = heat_ranks[lyr];
             used_trace = true;
         } else {
-            ranks = tfq_moe::rank_glm_experts_datafree(cache, lyr, N_EXP, H, &used_router);
+            ranks = tfq_moe::rank_glm_experts_datafree(cache, lyr, N_EXP, H, &used_router, layer_prefix.c_str());
         }
         if (lyr == l_start) {
-            printf("HeatAlloc: %s\n", used_trace
+            printf("GLM MoE CUDA | H=%d I=%d E=%d prefix=%s | HeatAlloc: %s\n",
+                H, I, N_EXP, layer_prefix.c_str(),
+                used_trace
                 ? ("TRACE-GUIDED (uses calibration routing counts from " + trace_path + ")").c_str()
                 : (used_router ? "DATA-FREE router+weight sensitivity (no calibration data)"
                                : "DATA-FREE expert weight-scale sensitivity (no calibration data)"));
@@ -251,13 +272,16 @@ int main(int argc, char** argv) {
         }
         std::vector<PrismExpertMeta> metas(N_EXP);
         memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
+        const int thr5 = (N_EXP == 288) ? 64  : (N_EXP / 4);
+        const int thr4 = (N_EXP == 288) ? 160 : ((N_EXP * 5) / 8);
+        const int thr43 = (N_EXP == 288) ? 96 : (N_EXP / 3);
         uint64_t cur_word = 0; uint32_t cur_sc = 0;
         for (int e = 0; e < N_EXP; ++e) {
             int r = ranks[e];
             uint32_t b = 4u;
-            if (mode == "heat543")       b = (r < 64) ? 5u : (r < 160 ? 4u : 3u);
-            else if (mode == "heat443")  b = (r < 160) ? 4u : 3u;
-            else if (mode == "heat43")   b = (r < 96) ? 4u : 3u;
+            if (mode == "heat543")       b = (r < thr5) ? 5u : (r < thr4 ? 4u : 3u);
+            else if (mode == "heat443")  b = (r < thr4) ? 4u : 3u;
+            else if (mode == "heat43")   b = (r < thr43) ? 4u : 3u;
             else if (mode == "uniform4") b = 4u;
             else if (mode == "uniform3") b = 3u;
             metas[e].b_bits = b; metas[e].heat_rank = (uint32_t)r;
@@ -265,9 +289,9 @@ int main(int argc, char** argv) {
             metas[e].gate_word_off = cur_word; cur_word += wpm;
             metas[e].up_word_off   = cur_word; cur_word += wpm;
             metas[e].down_word_off = cur_word; cur_word += wpm;
-            metas[e].gate_sc_off = cur_sc; cur_sc += 512;
-            metas[e].up_sc_off   = cur_sc; cur_sc += 512;
-            metas[e].down_sc_off = cur_sc; cur_sc += 512;
+            metas[e].gate_sc_off = cur_sc; cur_sc += N_SC;
+            metas[e].up_sc_off   = cur_sc; cur_sc += N_SC;
+            metas[e].down_sc_off = cur_sc; cur_sc += N_SC;
         }
         std::vector<uint16_t> all_scales(cur_sc);
         std::vector<uint32_t> all_weights(cur_word);
@@ -276,13 +300,13 @@ int main(int argc, char** argv) {
             uint64_t wpm = (uint64_t)(I / 16) * (H / 128) * (b * 2u) * 32u;
             for (int p = 0; p < 3; ++p) {
                 uint32_t R = proj_R[p], C = proj_C[p];
-                char base[256]; snprintf(base, sizeof(base), "model.language_model.layers.%d.mlp.experts.%d.%s", lyr, e, proj_names[p]);
+                char base[256]; snprintf(base, sizeof(base), "%s.%d.mlp.experts.%d.%s", layer_prefix.c_str(), lyr, e, proj_names[p]);
                 size_t nw = 0, ns = 0;
                 const uint8_t* wp = cache.get_tensor(std::string(base) + ".weight", nullptr, &nw);
                 const uint8_t* sp = cache.get_tensor(std::string(base) + ".weight_scale_inv", nullptr, &ns);
                 TFQ_CUDA_CHECK(cudaMemcpy(d_fp8, wp, nw, cudaMemcpyHostToDevice));
                 TFQ_CUDA_CHECK(cudaMemcpy(d_scinv, sp, ns, cudaMemcpyHostToDevice));
-                TFQ_CUDA_CHECK(cudaMemset(d_ss, 0, 512 * 4)); TFQ_CUDA_CHECK(cudaMemset(d_se, 0, 8));
+                TFQ_CUDA_CHECK(cudaMemset(d_ss, 0, (size_t)N_SC * 4ULL)); TFQ_CUDA_CHECK(cudaMemset(d_se, 0, 8));
                 MatParams mp{R, C, b, 1.0f, 0u, 0u};
                 fp8_dequant_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_fp8, d_scinv, d_fp8_lut, d_tmp, mp);
                 col_fwht_and_ss_kernel<<<dim3(C, R / 128u, 1), 32>>>(d_tmp, d_rot, d_ss, mp);
@@ -300,9 +324,10 @@ int main(int argc, char** argv) {
                 uint32_t s_off = (p == 0) ? metas[e].gate_sc_off   : (p == 1 ? metas[e].up_sc_off   : metas[e].down_sc_off);
                 if (p == 0) metas[e].gate_snr_db = snr; else if (p == 1) metas[e].up_snr_db = snr; else metas[e].down_snr_db = snr;
                 TFQ_CUDA_CHECK(cudaMemcpy(all_weights.data() + w_off, d_pack, wpm * 4, cudaMemcpyDeviceToHost));
-                TFQ_CUDA_CHECK(cudaMemcpy(all_scales.data() + s_off, d_sc, 512 * 2, cudaMemcpyDeviceToHost));
+                TFQ_CUDA_CHECK(cudaMemcpy(all_scales.data() + s_off, d_sc, (size_t)N_SC * 2ULL, cudaMemcpyDeviceToHost));
             }
         }
+        cache.evict_all();
         size_t off_meta = sizeof(PrismLayerHeader);
         size_t off_sc = align_up(off_meta + metas.size() * sizeof(PrismExpertMeta), ALIGN_16K);
         size_t off_w  = align_up(off_sc + all_scales.size() * 2ULL, ALIGN_16K);

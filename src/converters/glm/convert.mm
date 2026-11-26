@@ -325,12 +325,14 @@ struct ShardCache {
         return sh.ptr + sh.data_base + tit->second.off;
     }
 
-    ~ShardCache() {
+    void evict_all() {
         for (auto& kv : shards) { if (kv.second.ptr) munmap(kv.second.ptr, kv.second.len); if (kv.second.fd >= 0) close(kv.second.fd); }
+        shards.clear();
     }
+    ~ShardCache() { evict_all(); }
 };
 
-static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_path) {
+static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_path, int n_exp) {
     std::map<int, std::vector<int>> counts;
     std::ifstream f(trace_path);
     std::string line;
@@ -338,19 +340,19 @@ static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_
         if (line.rfind("LAYER ", 0) == 0) {
             int lyr = 0, eid = 0; long long cnt = 0;
             if (sscanf(line.c_str(), "LAYER %d E%d %lld", &lyr, &eid, &cnt) == 3) {
-                if (!counts.count(lyr)) counts[lyr].assign(288, 0);
-                if (eid >= 0 && eid < 288) counts[lyr][eid] += (int)cnt;
+                if (!counts.count(lyr)) counts[lyr].assign(n_exp, 0);
+                if (eid >= 0 && eid < n_exp) counts[lyr][eid] += (int)cnt;
             }
         }
     }
     std::map<int, std::vector<int>> ranks;
     for (auto& kv : counts) {
-        std::vector<int> order(288); std::iota(order.begin(), order.end(), 0);
+        std::vector<int> order(n_exp); std::iota(order.begin(), order.end(), 0);
         std::sort(order.begin(), order.end(), [&](int a, int b) {
             return (kv.second[a] != kv.second[b]) ? (kv.second[a] > kv.second[b]) : (a < b);
         });
-        std::vector<int> r(288);
-        for (int idx = 0; idx < 288; ++idx) r[order[idx]] = idx;
+        std::vector<int> r(n_exp);
+        for (int idx = 0; idx < n_exp; ++idx) r[order[idx]] = idx;
         ranks[kv.first] = std::move(r);
     }
     return ranks;
@@ -657,27 +659,50 @@ int main(int argc, char** argv) {
         // ====================================================================
         // MODE B: MOE LAYER CONVERSION -> layer_XX.tffpw ("TFPW", version=3)
         // ====================================================================
-        const size_t MAX_ELEMS = 2048 * 4096;
-        const int BATCH_STREAMS = 4096;
+        // Auto-detect GLM-5.3-Flash ("model.language_model.layers", H=4096, I=2048, E=288)
+        // vs GLM-5.3 753B glm_moe_dsa ("model.layers", H=6144, I=2048, E=256) from safetensors metadata.
+        std::string layer_prefix = "model.language_model.layers";
+        {
+            char probe[256];
+            snprintf(probe, sizeof(probe), "model.layers.%d.mlp.experts.0.gate_proj.weight", l_start);
+            if (cache.has_tensor(probe)) layer_prefix = "model.layers";
+        }
+        int H = 4096, I = 2048, N_EXP = 0;
+        {
+            char probe[256];
+            snprintf(probe, sizeof(probe), "%s.%d.mlp.experts.0.gate_proj.weight", layer_prefix.c_str(), l_start);
+            size_t dummy = 0;
+            cache.get_tensor(probe, &dummy, &I, &H);
+            while (true) {
+                snprintf(probe, sizeof(probe), "%s.%d.mlp.experts.%d.gate_proj.weight", layer_prefix.c_str(), l_start, N_EXP);
+                if (!cache.has_tensor(probe)) break;
+                N_EXP++;
+            }
+            cache.evict_all();
+        }
+        const uint32_t N_SC = (uint32_t)((H / 128) * (I / 128));
+        const size_t MAX_ELEMS = (size_t)H * (size_t)I;
+        const int BATCH_STREAMS = (H > 4096) ? 2048 : 4096;
+        const size_t MAX_PACK_BYTES = (size_t)(I / 16) * (size_t)(H / 128) * 10ULL * 32ULL * 4ULL;
         id<MTLBuffer> buf_fp8_in   = [dev newBufferWithLength:MAX_ELEMS options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_sc_inv   = [dev newBufferWithLength:512 * 4 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_w_tmp    = [dev newBufferWithLength:MAX_ELEMS * 4 options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> buf_w_rot    = [dev newBufferWithLength:MAX_ELEMS * 4 options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> buf_blk_ss   = [dev newBufferWithLength:512 * 4 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_streams  = [dev newBufferWithLength:MAX_ELEMS * 4 options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> buf_hist     = [dev newBufferWithLength:(size_t)BATCH_STREAMS * 1024 * 512 * 4 options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> buf_mat_pack = [dev newBufferWithLength:(size_t)256 * 16 * 10 * 32 * 4 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_mat_sc   = [dev newBufferWithLength:512 * 2 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_sc_inv   = [dev newBufferWithLength:(size_t)N_SC * 4ULL options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_w_tmp    = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> buf_w_rot    = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> buf_blk_ss   = [dev newBufferWithLength:(size_t)N_SC * 4ULL options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_streams  = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> buf_hist     = [dev newBufferWithLength:(size_t)BATCH_STREAMS * (size_t)(H / 4) * 256ULL * 4ULL options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> buf_mat_pack = [dev newBufferWithLength:MAX_PACK_BYTES options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_mat_sc   = [dev newBufferWithLength:(size_t)N_SC * 2ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_se_out   = [dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
 
-        auto heat_ranks = load_heat_ranks(trace_path);
-        const int H = 4096, I = 2048, N_EXP = 288;
+        auto heat_ranks = load_heat_ranks(trace_path, N_EXP);
         const char* proj_names[3] = {"gate_proj", "up_proj", "down_proj"};
         const int proj_R[3] = {I, I, H};
         const int proj_C[3] = {H, H, I};
 
         printf("============================================================================================================\n");
-        printf("TFF-PrismWave v3 MOE CONVERTER | mode=%s | layers=%d..%d | out=%s\n", mode.c_str(), l_start, l_end, out_dir.c_str());
+        printf("TFF-PrismWave v3 MOE CONVERTER | mode=%s | layers=%d..%d | H=%d I=%d E=%d prefix=%s | out=%s\n",
+               mode.c_str(), l_start, l_end, H, I, N_EXP, layer_prefix.c_str(), out_dir.c_str());
         printf("============================================================================================================\n");
         fflush(stdout);
 
@@ -700,7 +725,7 @@ int main(int argc, char** argv) {
                 ranks = heat_ranks[lyr];
                 used_trace = true;
             } else {
-                ranks = tfq_moe::rank_glm_experts_datafree(cache, lyr, N_EXP, H, &used_router);
+                ranks = tfq_moe::rank_glm_experts_datafree(cache, lyr, N_EXP, H, &used_router, layer_prefix.c_str());
             }
             if (lyr == l_start) {
                 printf("HeatAlloc: %s\n", used_trace
@@ -712,13 +737,16 @@ int main(int argc, char** argv) {
 
             std::vector<PrismExpertMeta> metas(N_EXP);
             memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
+            const int thr5 = (N_EXP == 288) ? 64  : (N_EXP / 4);
+            const int thr4 = (N_EXP == 288) ? 160 : ((N_EXP * 5) / 8);
+            const int thr43 = (N_EXP == 288) ? 96 : (N_EXP / 3);
             uint64_t cur_word = 0; uint32_t cur_sc = 0;
             for (int e = 0; e < N_EXP; ++e) {
                 int r = ranks[e];
                 uint32_t b = 4;
-                if (mode == "heat543")       b = (r < 64) ? 5u : (r < 160 ? 4u : 3u);
-                else if (mode == "heat443")  b = (r < 160) ? 4u : 3u;
-                else if (mode == "heat43")   b = (r < 96) ? 4u : 3u;
+                if (mode == "heat543")       b = (r < thr5) ? 5u : (r < thr4 ? 4u : 3u);
+                else if (mode == "heat443")  b = (r < thr4) ? 4u : 3u;
+                else if (mode == "heat43")   b = (r < thr43) ? 4u : 3u;
                 else if (mode == "uniform4") b = 4u;
                 else if (mode == "uniform3") b = 3u;
                 metas[e].b_bits = b; metas[e].heat_rank = (uint32_t)r;
@@ -726,9 +754,9 @@ int main(int argc, char** argv) {
                 metas[e].gate_word_off = cur_word; cur_word += wpm;
                 metas[e].up_word_off   = cur_word; cur_word += wpm;
                 metas[e].down_word_off = cur_word; cur_word += wpm;
-                metas[e].gate_sc_off = cur_sc; cur_sc += 512;
-                metas[e].up_sc_off   = cur_sc; cur_sc += 512;
-                metas[e].down_sc_off = cur_sc; cur_sc += 512;
+                metas[e].gate_sc_off = cur_sc; cur_sc += N_SC;
+                metas[e].up_sc_off   = cur_sc; cur_sc += N_SC;
+                metas[e].down_sc_off = cur_sc; cur_sc += N_SC;
             }
             std::vector<uint16_t> all_scales(cur_sc);
             std::vector<uint32_t> all_weights(cur_word);
@@ -740,18 +768,18 @@ int main(int argc, char** argv) {
                 for (int p = 0; p < 3; ++p) {
                     int R = proj_R[p], C = proj_C[p];
                     char base[256];
-                    snprintf(base, sizeof(base), "model.language_model.layers.%d.mlp.experts.%d.%s", lyr, e, proj_names[p]);
+                    snprintf(base, sizeof(base), "%s.%d.mlp.experts.%d.%s", layer_prefix.c_str(), lyr, e, proj_names[p]);
                     size_t nw = 0, ns = 0;
                     const uint8_t* w_ptr = cache.get_tensor(std::string(base) + ".weight", &nw);
                     const uint8_t* s_ptr = cache.get_tensor(std::string(base) + ".weight_scale_inv", &ns);
                     memcpy([buf_fp8_in contents], w_ptr, nw);
                     memcpy([buf_sc_inv contents], s_ptr, ns);
-                    memset([buf_blk_ss contents], 0, 512 * 4);
+                    memset([buf_blk_ss contents], 0, (size_t)N_SC * 4ULL);
                     memset([buf_se_out contents], 0, 8);
 
                     MatParams mp = {(uint32_t)R, (uint32_t)C, b, 1.0f};
                     int total_streams = (R / 16) * 32;
-                    int batch_sz = (C == 2048) ? (BATCH_STREAMS * 2) : BATCH_STREAMS;
+                    int batch_sz = (C < H) ? (BATCH_STREAMS * (H / C)) : BATCH_STREAMS;
 
                     @autoreleasepool {
                     id<MTLCommandBuffer> cb = [q commandBuffer];
@@ -808,10 +836,11 @@ int main(int argc, char** argv) {
                     uint64_t w_off = (p == 0) ? metas[e].gate_word_off : (p == 1 ? metas[e].up_word_off : metas[e].down_word_off);
                     uint32_t s_off = (p == 0) ? metas[e].gate_sc_off   : (p == 1 ? metas[e].up_sc_off   : metas[e].down_sc_off);
                     if (p == 0) metas[e].gate_snr_db = snr; else if (p == 1) metas[e].up_snr_db = snr; else metas[e].down_snr_db = snr;
-                    memcpy(all_scales.data() + s_off, [buf_mat_sc contents], 512 * 2);
+                    memcpy(all_scales.data() + s_off, [buf_mat_sc contents], (size_t)N_SC * 2ULL);
                     memcpy(all_weights.data() + w_off, [buf_mat_pack contents], wpm * 4);
                 }
             }
+            cache.evict_all();
 
             uint64_t off_meta    = sizeof(PrismLayerHeader);
             uint64_t off_scales  = align_up(off_meta + metas.size() * sizeof(PrismExpertMeta), ALIGN_16K);
