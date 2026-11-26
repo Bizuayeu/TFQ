@@ -195,17 +195,19 @@ int main(int argc, char** argv) {
         size_t off_w  = align_up(off_sc + all_scales.size() * 2ULL, ALIGN_16K);
         TfpnHeader hdr{MAGIC_TFPN, FORMAT_VER, (uint32_t)metas.size(), 0u, off_meta, off_sc, off_w, all_scales.size(), all_weights.size(), 0u};
         std::vector<uint8_t> zeros(ALIGN_16K, 0);
-        std::string out_path = out_dir + "/nonmoe.tffpw";
-        FILE* fo = fopen(out_path.c_str(), "wb");
-        fwrite(&hdr, 1, sizeof(hdr), fo);
-        fwrite(metas.data(), sizeof(TfpnTensorMeta), metas.size(), fo);
-        if (off_sc > off_meta + metas.size() * sizeof(TfpnTensorMeta)) fwrite(zeros.data(), 1, off_sc - (off_meta + metas.size() * sizeof(TfpnTensorMeta)), fo);
-        fwrite(all_scales.data(), 2, all_scales.size(), fo);
-        if (off_w > off_sc + all_scales.size() * 2ULL) fwrite(zeros.data(), 1, off_w - (off_sc + all_scales.size() * 2ULL), fo);
-        fwrite(all_weights.data(), 4, all_weights.size(), fo);
+        std::string out_path = out_dir + "/nonmoe.tffpw", tmp = out_path + ".tmp";
+        FILE* fo = fopen(tmp.c_str(), "wb");
+        if (!fo) { fprintf(stderr, "Cannot write %s\n", tmp.c_str()); return 1; }
+        write_all_or_exit(fo, &hdr, sizeof(hdr), tmp);
+        write_all_or_exit(fo, metas.data(), metas.size() * sizeof(TfpnTensorMeta), tmp);
+        write_all_or_exit(fo, zeros.data(), off_sc - (off_meta + metas.size() * sizeof(TfpnTensorMeta)), tmp);
+        write_all_or_exit(fo, all_scales.data(), all_scales.size() * 2ULL, tmp);
+        write_all_or_exit(fo, zeros.data(), off_w - (off_sc + all_scales.size() * 2ULL), tmp);
+        write_all_or_exit(fo, all_weights.data(), all_weights.size() * 4ULL, tmp);
         size_t endp = off_w + all_weights.size() * 4ULL, pade = align_up(endp, ALIGN_16K) - endp;
-        if (pade) fwrite(zeros.data(), 1, pade, fo);
-        fclose(fo);
+        write_all_or_exit(fo, zeros.data(), pade, tmp);
+        close_or_exit(fo, tmp);
+        rename_or_exit(tmp, out_path);
         printf("NON-MOE DONE -> %s (%.3f GiB)\n", out_path.c_str(), (double)(endp + pade) / (double)(1ULL << 30));
         return 0;
     }
@@ -251,7 +253,7 @@ int main(int argc, char** argv) {
 
     for (int lyr = l_start; lyr <= l_end; ++lyr) {
         char out_path[512]; snprintf(out_path, sizeof(out_path), "%s/layer_%02d.tffpw", out_dir.c_str(), lyr);
-        if (skip_existing) { struct stat cst{}; if (stat(out_path, &cst) == 0 && cst.st_size > 1000000000LL) continue; }
+        if (skip_existing && tfpw_layer_complete(out_path)) continue;
         auto t_lyr = std::chrono::steady_clock::now();
         std::vector<int> ranks(N_EXP);
         bool used_trace = false, used_router = false;
@@ -339,16 +341,19 @@ int main(int argc, char** argv) {
         hdr.off_meta = off_meta; hdr.off_scales = off_sc; hdr.off_weights = off_w;
         strncpy((char*)hdr.meta_tag, mode.c_str(), 31);
         std::vector<uint8_t> zeros(ALIGN_16K, 0);
-        FILE* fo = fopen(out_path, "wb");
-        fwrite(&hdr, 1, sizeof(hdr), fo);
-        fwrite(metas.data(), sizeof(PrismExpertMeta), metas.size(), fo);
-        if (off_sc > off_meta + metas.size() * sizeof(PrismExpertMeta)) fwrite(zeros.data(), 1, off_sc - (off_meta + metas.size() * sizeof(PrismExpertMeta)), fo);
-        fwrite(all_scales.data(), 2, all_scales.size(), fo);
-        if (off_w > off_sc + all_scales.size() * 2ULL) fwrite(zeros.data(), 1, off_w - (off_sc + all_scales.size() * 2ULL), fo);
-        fwrite(all_weights.data(), 4, all_weights.size(), fo);
+        std::string tmp = std::string(out_path) + ".tmp";
+        FILE* fo = fopen(tmp.c_str(), "wb");
+        if (!fo) { fprintf(stderr, "Cannot write %s\n", tmp.c_str()); return 1; }
+        write_all_or_exit(fo, &hdr, sizeof(hdr), tmp);
+        write_all_or_exit(fo, metas.data(), metas.size() * sizeof(PrismExpertMeta), tmp);
+        write_all_or_exit(fo, zeros.data(), off_sc - (off_meta + metas.size() * sizeof(PrismExpertMeta)), tmp);
+        write_all_or_exit(fo, all_scales.data(), all_scales.size() * 2ULL, tmp);
+        write_all_or_exit(fo, zeros.data(), off_w - (off_sc + all_scales.size() * 2ULL), tmp);
+        write_all_or_exit(fo, all_weights.data(), all_weights.size() * 4ULL, tmp);
         size_t endp = off_w + all_weights.size() * 4ULL, pade = align_up(endp, ALIGN_16K) - endp;
-        if (pade) fwrite(zeros.data(), 1, pade, fo);
-        fclose(fo);
+        write_all_or_exit(fo, zeros.data(), pade, tmp);
+        close_or_exit(fo, tmp);
+        rename_or_exit(tmp, out_path);
         cache.evict_all();
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_lyr).count();
         printf("L%02d -> %s (%.3f GiB) in %.1fs\n", lyr, out_path, (double)(endp + pade) / (double)(1ULL << 30), el);

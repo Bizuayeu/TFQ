@@ -58,11 +58,11 @@ static void write_safetensors(
     std::string tmp = path + ".tmp";
     FILE* fo = fopen(tmp.c_str(), "wb");
     if (!fo) { fprintf(stderr, "Cannot write %s\n", tmp.c_str()); exit(1); }
-    fwrite(&hlen, 8, 1, fo);
-    fwrite(hstr.data(), 1, hlen, fo);
-    for (size_t i = 0; i < names.size(); ++i) fwrite(ptrs[i], 1, lens[i], fo);
-    fclose(fo);
-    rename(tmp.c_str(), path.c_str());
+    write_all_or_exit(fo, &hlen, 8, tmp);
+    write_all_or_exit(fo, hstr.data(), hlen, tmp);
+    for (size_t i = 0; i < names.size(); ++i) write_all_or_exit(fo, ptrs[i], lens[i], tmp);
+    close_or_exit(fo, tmp);
+    rename_or_exit(tmp, path);
 }
 
 int main(int argc, char** argv) {
@@ -200,10 +200,7 @@ int main(int argc, char** argv) {
         char out_path[512];
         if (is_mtp) snprintf(out_path, sizeof(out_path), "%s/mtp_00.tffpw", out_dir.c_str());
         else        snprintf(out_path, sizeof(out_path), "%s/layer_%02d.tffpw", out_dir.c_str(), lyr);
-        if (skip_existing) {
-            struct stat cst{};
-            if (stat(out_path, &cst) == 0 && cst.st_size > 500000000LL) continue;
-        }
+        if (skip_existing && tfpw_layer_complete(out_path)) continue;
         auto t_lyr = std::chrono::steady_clock::now();
         const uint8_t *stacked_w[3], *stacked_s[3], *stacked_b[3];
         for (int p = 0; p < 3; ++p) {
@@ -292,16 +289,17 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> zeros(ALIGN_16K, 0);
         std::string tmp = std::string(out_path) + ".tmp";
         FILE* fo = fopen(tmp.c_str(), "wb");
-        fwrite(&hdr, 1, sizeof(hdr), fo);
-        fwrite(metas.data(), sizeof(PrismExpertMeta), metas.size(), fo);
-        if (off_sc > off_meta + metas.size() * sizeof(PrismExpertMeta)) fwrite(zeros.data(), 1, off_sc - (off_meta + metas.size() * sizeof(PrismExpertMeta)), fo);
-        fwrite(all_scales.data(), 2, all_scales.size(), fo);
-        if (off_w > off_sc + all_scales.size() * 2ULL) fwrite(zeros.data(), 1, off_w - (off_sc + all_scales.size() * 2ULL), fo);
-        fwrite(all_weights.data(), 4, all_weights.size(), fo);
+        if (!fo) { fprintf(stderr, "Cannot write %s\n", tmp.c_str()); return 1; }
+        write_all_or_exit(fo, &hdr, sizeof(hdr), tmp);
+        write_all_or_exit(fo, metas.data(), metas.size() * sizeof(PrismExpertMeta), tmp);
+        write_all_or_exit(fo, zeros.data(), off_sc - (off_meta + metas.size() * sizeof(PrismExpertMeta)), tmp);
+        write_all_or_exit(fo, all_scales.data(), all_scales.size() * 2ULL, tmp);
+        write_all_or_exit(fo, zeros.data(), off_w - (off_sc + all_scales.size() * 2ULL), tmp);
+        write_all_or_exit(fo, all_weights.data(), all_weights.size() * 4ULL, tmp);
         size_t endp = off_w + all_weights.size() * 4ULL, pade = align_up(endp, ALIGN_16K) - endp;
-        if (pade) fwrite(zeros.data(), 1, pade, fo);
-        fclose(fo);
-        rename(tmp.c_str(), out_path);
+        write_all_or_exit(fo, zeros.data(), pade, tmp);
+        close_or_exit(fo, tmp);
+        rename_or_exit(tmp, out_path);
         cache.evict_all();
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_lyr).count();
         printf("L%02d -> %s (%.3f GiB) in %.1fs | SNR 3b=%.2f 4b=%.2f 5b=%.2f dB\n",

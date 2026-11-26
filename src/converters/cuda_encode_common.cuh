@@ -90,6 +90,32 @@ struct PrismExpertMeta {
 };
 static_assert(sizeof(PrismExpertMeta) == 64, "PrismExpertMeta must be 64 bytes");
 
+// Output writes: a short write or failed close (e.g. disk full) must stop the converter with a nonzero exit.
+static inline void write_all_or_exit(FILE* f, const void* p, size_t n, const std::string& path) {
+    if (n && fwrite(p, 1, n, f) != n) { fprintf(stderr, "Write error on %s\n", path.c_str()); exit(1); }
+}
+
+static inline void close_or_exit(FILE* f, const std::string& path) {
+    if (fclose(f) != 0) { fprintf(stderr, "Write error on %s\n", path.c_str()); exit(1); }
+}
+
+static inline void rename_or_exit(const std::string& from, const std::string& to) {
+    if (rename(from.c_str(), to.c_str()) != 0) { fprintf(stderr, "Cannot rename %s to %s\n", from.c_str(), to.c_str()); exit(1); }
+}
+
+// --skip-existing: a TFPW layer file counts as done only if its size matches what its own header describes.
+static inline bool tfpw_layer_complete(const std::string& path) {
+    PrismLayerHeader h{};
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    bool ok = fread(&h, sizeof(h), 1, f) == 1;
+    fclose(f);
+    struct stat st{};
+    if (!ok || stat(path.c_str(), &st) != 0 || h.magic != MAGIC_TFPW || h.version != FORMAT_VER) return false;
+    if (h.stream_words > (UINT64_MAX - h.off_weights - ALIGN_16K) / 4ULL) return false;
+    return (uint64_t)st.st_size == align_up(h.off_weights + h.stream_words * 4ULL, ALIGN_16K);
+}
+
 struct MatParams { uint32_t R, C, b_bits; float shrink; uint32_t r_off, pad0; };
 struct EncParams { uint32_t R, C, b_bits, stream_off, n_streams; };
 struct PleParams { uint32_t rows, cols, dst_bits, pad; };

@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
 
     for (int lyr = l_start; lyr <= l_end; ++lyr) {
         char out_path[512]; snprintf(out_path, sizeof(out_path), "%s/layer_%02d.tffpw", out_dir.c_str(), lyr);
-        if (skip_existing) { struct stat cst{}; if (stat(out_path, &cst) == 0 && cst.st_size > 500000000LL) continue; }
+        if (skip_existing && tfpw_layer_complete(out_path)) continue;
         auto t_lyr = std::chrono::steady_clock::now();
         std::vector<PrismExpertMeta> metas(N_EXP);
         memset(metas.data(), 0, metas.size() * sizeof(PrismExpertMeta));
@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
         size_t endp = off_w + all_weights.size() * 4ULL, pade = align_up(endp, ALIGN_16K) - endp;
         if (pade) wrote += fwrite(zeros.data(), 1, pade, fo);
         if (fclose(fo) != 0 || wrote != endp + pade) { fprintf(stderr, "Short write %s (%zu of %zu)\n", tmp.c_str(), wrote, endp + pade); return 1; }
-        rename(tmp.c_str(), out_path);
+        rename_or_exit(tmp, out_path);
         cache.evict_all();
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_lyr).count();
         printf("L%02d -> %s (%.3f GiB) in %.1fs | SNR %db mean=%.2f min=%.2f dB\n",
