@@ -513,12 +513,12 @@ int main(int argc, char** argv) {
             id<MTLBuffer> buf_q8_b   = [dev newBufferWithLength:(MAX_E / 64) * 2 options:MTLResourceStorageModeShared];
             id<MTLBuffer> buf_w_tmp  = [dev newBufferWithLength:MAX_E * 4 options:MTLResourceStorageModePrivate];
             id<MTLBuffer> buf_w_rot  = [dev newBufferWithLength:MAX_E * 4 options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> buf_blk_ss = [dev newBufferWithLength:8192 * 4 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> buf_blk_ss = [dev newBufferWithLength:8192ULL * 128ULL * 4ULL options:MTLResourceStorageModeShared];
             id<MTLBuffer> buf_str    = [dev newBufferWithLength:MAX_E * 4 options:MTLResourceStorageModePrivate];
             id<MTLBuffer> buf_hist   = [dev newBufferWithLength:HIST_SLOTS * 512ULL * 4ULL options:MTLResourceStorageModePrivate];
             id<MTLBuffer> buf_pack   = [dev newBufferWithLength:MAX_E options:MTLResourceStorageModeShared]; // max 5b < 1B/elem
             id<MTLBuffer> buf_sc     = [dev newBufferWithLength:8192 * 2 options:MTLResourceStorageModeShared];
-            id<MTLBuffer> buf_se     = [dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> buf_se     = [dev newBufferWithLength:2048ULL * 2ULL * 4ULL options:MTLResourceStorageModeShared];
 
             std::vector<NonMoeTensorMeta> metas(tasks.size());
             uint64_t total_sc = 0, total_wd = 0;
@@ -556,8 +556,6 @@ int main(int argc, char** argv) {
                     memcpy([buf_q8_s contents], s_ptr + (size_t)r0 * (t.C / 64) * 2, (size_t)sr * (t.C / 64) * 2);
                     memcpy([buf_q8_b contents], b_ptr + (size_t)r0 * (t.C / 64) * 2, (size_t)sr * (t.C / 64) * 2);
                     size_t n_blks = (size_t)(sr / 128) * (t.C / 128);
-                    memset([buf_blk_ss contents], 0, n_blks * 4);
-                    memset([buf_se contents], 0, 8);
 
                     MatParams mp = {sr, t.C, t.bits, 1.0f};
                     uint32_t total_streams = (sr / 16) * 32;
@@ -607,7 +605,10 @@ int main(int argc, char** argv) {
                     [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
                     }
                     const float* se = (const float*)[buf_se contents];
-                    tot_sig += se[0]; tot_err += se[1];
+                    for (uint32_t si_s = 0; si_s < sr / 16u; ++si_s) {
+                        tot_sig += (double)se[si_s * 2u + 0u];
+                        tot_err += (double)se[si_s * 2u + 1u];
+                    }
                     size_t sc_off_chunk = (size_t)(r0 / 128) * (t.C / 128);
                     size_t wd_off_chunk = (size_t)(r0 / 16) * (t.C / 128) * (t.bits * 2u) * 32u;
                     size_t wd_cnt_chunk = (size_t)(sr / 16) * (t.C / 128) * (t.bits * 2u) * 32u;
@@ -688,12 +689,12 @@ int main(int argc, char** argv) {
         id<MTLBuffer> buf_sc_inv   = [dev newBufferWithLength:(size_t)N_SC * 4ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_w_tmp    = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_w_rot    = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> buf_blk_ss   = [dev newBufferWithLength:(size_t)N_SC * 4ULL options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_blk_ss   = [dev newBufferWithLength:(size_t)N_SC * 128ULL * 4ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_streams  = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_hist     = [dev newBufferWithLength:(size_t)BATCH_STREAMS * (size_t)(H / 4) * 256ULL * 4ULL options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_mat_pack = [dev newBufferWithLength:MAX_PACK_BYTES options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_mat_sc   = [dev newBufferWithLength:(size_t)N_SC * 2ULL options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_se_out   = [dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_se_out   = [dev newBufferWithLength:(size_t)(std::max(H, I) / 16) * 2ULL * 4ULL options:MTLResourceStorageModeShared];
 
         auto heat_ranks = load_heat_ranks(trace_path, N_EXP);
         const char* proj_names[3] = {"gate_proj", "up_proj", "down_proj"};
@@ -774,8 +775,6 @@ int main(int argc, char** argv) {
                     const uint8_t* s_ptr = cache.get_tensor(std::string(base) + ".weight_scale_inv", &ns);
                     memcpy([buf_fp8_in contents], w_ptr, nw);
                     memcpy([buf_sc_inv contents], s_ptr, ns);
-                    memset([buf_blk_ss contents], 0, (size_t)N_SC * 4ULL);
-                    memset([buf_se_out contents], 0, 8);
 
                     MatParams mp = {(uint32_t)R, (uint32_t)C, b, 1.0f};
                     int total_streams = (R / 16) * 32;
@@ -827,7 +826,12 @@ int main(int argc, char** argv) {
                     }
 
                     const float* se = (const float*)[buf_se_out contents];
-                    float snr = (float)(10.0 * log10((double)se[0] / std::max(1e-18, (double)se[1])));
+                    double s_sig = 0.0, s_err = 0.0;
+                    for (int si_s = 0; si_s < R / 16; ++si_s) {
+                        s_sig += (double)se[si_s * 2 + 0];
+                        s_err += (double)se[si_s * 2 + 1];
+                    }
+                    float snr = (float)(10.0 * log10(s_sig / std::max(1e-18, s_err)));
                     if (snr < 10.0f || std::isnan(snr)) {
                         fprintf(stderr, "FATAL: Bad SNR %.3f on L%d E%d %s!\n", snr, lyr, e, proj_names[p]);
                         return 2;

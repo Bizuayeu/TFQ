@@ -96,11 +96,10 @@ struct PleParams { uint32_t rows, cols, dst_bits, pad; };
 struct P2 { float x, y; };
 
 static inline uint16_t host_f32_to_f16(float f) {
-    __half h = __float2half(f);
-    uint16_t u; memcpy(&u, &h, 2); return u;
+    return __half_as_ushort(__float2half(f));
 }
 static inline float host_f16_to_f32(uint16_t u) {
-    __half h; memcpy(&h, &u, 2); return __half2float(h);
+    return __half2float(__ushort_as_half(u));
 }
 static inline uint32_t pack_h2(float x, float y) {
     return (uint32_t)host_f32_to_f16(x) | ((uint32_t)host_f32_to_f16(y) << 16);
@@ -491,7 +490,7 @@ __global__ void fp8_dequant_row_fwht_kernel(
     dst[lane +  0u] = v.x; dst[lane + 32u] = v.y; dst[lane + 64u] = v.z; dst[lane + 96u] = v.w;
 }
 
-__global__ void col_fwht_and_ss_kernel(const float* __restrict__ W_tmp, float* __restrict__ W_rot, float* __restrict__ blk_ss, MatParams P) {
+__global__ void col_fwht_and_ss_kernel(const float* __restrict__ W_tmp, float* __restrict__ W_rot, float* __restrict__ col_ss, MatParams P) {
     uint32_t c = blockIdx.x, br = blockIdx.y, r0 = br * 128u, rs = P.r_off + r0, lane = threadIdx.x;
     float4 v;
     v.x = W_tmp[static_cast<uint64_t>(r0 + lane +  0u) * P.C + c] * enc_sgn_bit(0x9E3779B9u, rs + lane +  0u);
@@ -504,15 +503,18 @@ __global__ void col_fwht_and_ss_kernel(const float* __restrict__ W_tmp, float* _
     W_rot[static_cast<uint64_t>(r0 + lane + 64u) * P.C + c] = v.z;
     W_rot[static_cast<uint64_t>(r0 + lane + 96u) * P.C + c] = v.w;
     float ss = enc_warp_sum(v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w);
-    if (lane == 0u) atomicAdd(&blk_ss[br * (P.C >> 7) + (c >> 7)], ss);
+    uint32_t bi = br * (P.C >> 7) + (c >> 7);
+    if (lane == 0u) col_ss[static_cast<uint64_t>(bi) * 128u + (c & 127u)] = ss;
 }
 
 __global__ void finalize_scales_and_pack_nax_kernel(
-    const float* __restrict__ W_rot, const float* __restrict__ blk_ss,
+    const float* __restrict__ W_rot, const float* __restrict__ col_ss,
     __half* __restrict__ scales_f16, float* __restrict__ W_streams, MatParams P
 ) {
     uint32_t strip = blockIdx.x, bc = blockIdx.y, br = strip >> 3, n_bc = P.C >> 7, bi = br * n_bc + bc, lane = threadIdx.x;
-    float rms = sqrtf(blk_ss[bi] * (1.0f / 16384.0f) + 1e-12f) * P.shrink;
+    const float* cs = col_ss + static_cast<uint64_t>(bi) * 128u;
+    float blk_sum = enc_warp_sum((cs[lane + 0u] + cs[lane + 32u]) + (cs[lane + 64u] + cs[lane + 96u]));
+    float rms = sqrtf(blk_sum * (1.0f / 16384.0f) + 1e-12f) * P.shrink;
     __half h_rms = __float2half(rms);
     if ((strip & 7u) == 0u && lane == 0u) scales_f16[bi] = h_rms;
     float inv_sc = 1.0f / __half2float(h_rms);
@@ -566,7 +568,7 @@ __global__ void prism_encode_v3_kernel(
     __shared__ uint32_t cur_state[256], nxt_state[256];
     __shared__ uint32_t cur_hprev[256], nxt_hprev[256];
     __shared__ float sg_min[4], sg_sum[4], cmin_tg, inv_step_tg;
-    __shared__ uint32_t bins[64], emit_lt, emit_eq, cut_bin_tg, lt_base_tg, eq_quota_tg;
+    __shared__ uint32_t bins[64], sg_scan[4], cut_bin_tg, lt_base_tg, eq_quota_tg;
 
     if (tid == 0u) {
         cur_cost[0]  = 0.0f;
@@ -704,11 +706,11 @@ __global__ void prism_encode_v3_kernel(
             float cmean = (sg_sum[0] + sg_sum[1] + sg_sum[2] + sg_sum[3]) / static_cast<float>(cur_n * K_KEEP);
             float span = fmaxf(1e-4f, (cmean - cmin) * 1.15f);
             cmin_tg = cmin; inv_step_tg = 63.0f / span;
-            emit_lt = 0u; emit_eq = 0u;
         }
         __syncthreads();
         float cmin = cmin_tg, inv_step = inv_step_tg;
 
+        uint8_t r_bi[2][K_KEEP];
         #pragma unroll
         for (uint32_t s = 0; s < 2u; ++s) {
             uint32_t pi = tid + s * 128u;
@@ -717,6 +719,7 @@ __global__ void prism_encode_v3_kernel(
                 #pragma unroll
                 for (uint32_t k = 0; k < K_KEEP; ++k) {
                     uint32_t bi = min(63u, static_cast<uint32_t>(fmaxf(0.0f, (bc + r_d[s][k]) * inv_step)));
+                    r_bi[s][k] = static_cast<uint8_t>(bi);
                     atomicAdd(&bins[bi], 1u);
                 }
             }
@@ -736,24 +739,56 @@ __global__ void prism_encode_v3_kernel(
         __syncthreads();
         uint32_t cut_bin = cut_bin_tg, lt_base = lt_base_tg, eq_quota = eq_quota_tg;
 
+        // Deterministic block-wide exclusive scan over (my_eq << 16 | my_lt) in fixed (tid, s, k) order.
+        uint32_t my_lt = 0u, my_eq = 0u;
         #pragma unroll
         for (uint32_t s = 0; s < 2u; ++s) {
             uint32_t pi = tid + s * 128u;
             if (pi < cur_n) {
-                float bc_raw = r_bc[s], bc = bc_raw - cmin;
+                #pragma unroll
+                for (uint32_t k = 0; k < K_KEEP; ++k) {
+                    uint32_t bi = r_bi[s][k];
+                    if (bi < cut_bin) my_lt++;
+                    else if (bi == cut_bin) my_eq++;
+                }
+            }
+        }
+        uint32_t packed = (my_eq << 16) | my_lt;
+        uint32_t incl = packed;
+        #pragma unroll
+        for (uint32_t d = 1u; d < 32u; d <<= 1u) {
+            uint32_t v = __shfl_up_sync(0xFFFFFFFFu, incl, d);
+            if (lane >= d) incl += v;
+        }
+        uint32_t excl = incl - packed;
+        if (lane == 31u) sg_scan[sg] = incl;
+        __syncthreads();
+        uint32_t w_base = 0u;
+        if (sg > 0u) w_base += sg_scan[0];
+        if (sg > 1u) w_base += sg_scan[1];
+        if (sg > 2u) w_base += sg_scan[2];
+        uint32_t base_packed = excl + w_base;
+        uint32_t pos_lt = base_packed & 0xFFFFu;
+        uint32_t pos_eq = base_packed >> 16;
+
+        #pragma unroll
+        for (uint32_t s = 0; s < 2u; ++s) {
+            uint32_t pi = tid + s * 128u;
+            if (pi < cur_n) {
+                float bc_raw = r_bc[s];
                 uint32_t st_sh = r_st_sh[s], next_hp = r_hp[s];
                 #pragma unroll
                 for (uint32_t k = 0; k < K_KEEP; ++k) {
-                    uint32_t bi = min(63u, static_cast<uint32_t>(fmaxf(0.0f, (bc + r_d[s][k]) * inv_step)));
+                    uint32_t bi = r_bi[s][k];
                     if (bi < cut_bin) {
-                        uint32_t pos = atomicAdd(&emit_lt, 1u);
+                        uint32_t pos = pos_lt++;
                         if (pos < lt_base) {
                             uint32_t sym = r_sym[s][k];
                             nxt_cost[pos] = bc_raw + r_d[s][k]; nxt_state[pos] = st_sh | sym; nxt_hprev[pos] = next_hp;
                             hist_ptr[static_cast<uint64_t>(pair) * 256ull + pos] = pi | (sym << 8);
                         }
                     } else if (bi == cut_bin) {
-                        uint32_t ep = atomicAdd(&emit_eq, 1u);
+                        uint32_t ep = pos_eq++;
                         if (ep < eq_quota) {
                             uint32_t pos = lt_base + ep;
                             uint32_t sym = r_sym[s][k];
@@ -884,7 +919,15 @@ __global__ void prism_verify_v3_snr_kernel(
         }
     }
     sig = enc_warp_sum(sig); err = enc_warp_sum(err);
-    if (lane == 0u) { atomicAdd(&out_se[0], sig); atomicAdd(&out_se[1], err); }
+    if (lane == 0u) { out_se[strip * 2u + 0u] = sig; out_se[strip * 2u + 1u] = err; }
+}
+
+static inline void cuda_read_se_det(const float* d_se, uint32_t n_strips, double& out_sig, double& out_err) {
+    std::vector<float> h(static_cast<size_t>(n_strips) * 2u);
+    TFQ_CUDA_CHECK(cudaMemcpy(h.data(), d_se, h.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    double s = 0.0, e = 0.0;
+    for (uint32_t i = 0; i < n_strips; ++i) { s += h[i * 2u + 0u]; e += h[i * 2u + 1u]; }
+    out_sig = s; out_err = e;
 }
 
 __global__ void requant_ple_q8_to_qb_kernel(

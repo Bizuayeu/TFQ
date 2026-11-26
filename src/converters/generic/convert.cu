@@ -108,11 +108,11 @@ int main(int argc, char** argv) {
     TFQ_CUDA_CHECK(cudaMalloc(&d_tmp,  MAX_ELEMS * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_rot,  MAX_ELEMS * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_str,  MAX_ELEMS * 4ULL));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_ss,   MAX_BLK * 4ULL));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_ss,   MAX_BLK * 128ULL * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_sc16, MAX_BLK * 2ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_hist, MAX_HIST));
     TFQ_CUDA_CHECK(cudaMalloc(&d_outw, MAX_OUTW));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_se,   8));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_se,   (MAX_CHUNK_R / 16u) * 2ULL * 4ULL));
 
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> host_chunk;
@@ -156,8 +156,6 @@ int main(int argc, char** argv) {
                 TFQ_CUDA_CHECK(cudaMemcpy(d_in, host_chunk.data(), host_chunk.size() * 4ULL, cudaMemcpyHostToDevice));
 
                 uint32_t n_blk = (rc / 128u) * (C / 128u);
-                TFQ_CUDA_CHECK(cudaMemset(d_ss, 0, n_blk * 4ULL));
-                TFQ_CUDA_CHECK(cudaMemset(d_se, 0, 8));
                 MatParams mp{rc, C, B, shrink, r0, 0};
 
                 f32_row_fwht_kernel<<<dim3(C / 128u, rc), 32>>>(d_in, d_tmp, mp);
@@ -173,9 +171,9 @@ int main(int argc, char** argv) {
                 prism_verify_v3_snr_kernel<<<rc / 16u, 32>>>(d_outw, d_sc16, d_lut[B], d_c64[B], d_rot, d_se, mp);
                 TFQ_CUDA_CHECK(cudaDeviceSynchronize());
 
-                float se[2] = {0.0f, 0.0f};
-                TFQ_CUDA_CHECK(cudaMemcpy(se, d_se, 8, cudaMemcpyDeviceToHost));
-                tot_sig += se[0]; tot_err += se[1];
+                double c_sig = 0.0, c_err = 0.0;
+                cuda_read_se_det(d_se, rc / 16u, c_sig, c_err);
+                tot_sig += c_sig; tot_err += c_err;
                 uint64_t cw = (uint64_t)(rc / 16u) * (C / 128u) * (B * 2u) * 32ULL;
                 TFQ_CUDA_CHECK(cudaMemcpy(all_sc.data() + m.sc_off + sc_cur, d_sc16, n_blk * 2ULL, cudaMemcpyDeviceToHost));
                 TFQ_CUDA_CHECK(cudaMemcpy(all_w.data() + m.word_off + w_cur, d_outw, cw * 4ULL, cudaMemcpyDeviceToHost));

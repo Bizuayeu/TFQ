@@ -94,10 +94,19 @@ kernel void q8_64_dequant_row_fwht(
     dst[lane +  0u] = v.x; dst[lane + 32u] = v.y; dst[lane + 64u] = v.z; dst[lane + 96u] = v.w;
 }
 
+static inline float det_simd_sum(float v) {
+    v += simd_shuffle_xor(v, 16);
+    v += simd_shuffle_xor(v, 8);
+    v += simd_shuffle_xor(v, 4);
+    v += simd_shuffle_xor(v, 2);
+    v += simd_shuffle_xor(v, 1);
+    return v;
+}
+
 kernel void col_fwht_and_ss(
     const device float* W_tmp   [[buffer(0)]],
     device float* W_rot         [[buffer(1)]],
-    device atomic_float* blk_ss [[buffer(2)]],
+    device float* col_ss        [[buffer(2)]],
     constant MatParams& P       [[buffer(3)]],
     uint2 gid                   [[threadgroup_position_in_grid]],
     ushort lane                 [[thread_index_in_simdgroup]]
@@ -113,13 +122,14 @@ kernel void col_fwht_and_ss(
     W_rot[ulong(r0 + lane + 32u) * P.C + c] = v.y;
     W_rot[ulong(r0 + lane + 64u) * P.C + c] = v.z;
     W_rot[ulong(r0 + lane + 96u) * P.C + c] = v.w;
-    float ss = simd_sum(dot(v, v));
-    if (lane == 0) atomic_fetch_add_explicit(&blk_ss[br * (P.C >> 7) + (c >> 7)], ss, memory_order_relaxed);
+    float ss = det_simd_sum(dot(v, v));
+    uint bi = br * (P.C >> 7) + (c >> 7);
+    if (lane == 0) col_ss[ulong(bi) * 128ul + (c & 127u)] = ss;
 }
 
 kernel void finalize_scales_and_pack_nax(
     const device float* W_rot   [[buffer(0)]],
-    const device float* blk_ss  [[buffer(1)]],
+    const device float* col_ss  [[buffer(1)]],
     device half* scales_f16     [[buffer(2)]],
     device float* W_streams     [[buffer(3)]],
     constant MatParams& P       [[buffer(4)]],
@@ -127,7 +137,9 @@ kernel void finalize_scales_and_pack_nax(
     ushort lane                 [[thread_index_in_simdgroup]]
 ) {
     uint strip = gid.x, bc = gid.y, br = strip >> 3, n_bc = P.C >> 7, bi = br * n_bc + bc;
-    float rms = sqrt(blk_ss[bi] * (1.0f / 16384.0f) + 1e-12f) * P.shrink;
+    const device float* cs = col_ss + ulong(bi) * 128ul;
+    float blk_sum = det_simd_sum((cs[lane + 0u] + cs[lane + 32u]) + (cs[lane + 64u] + cs[lane + 96u]));
+    float rms = sqrt(blk_sum * (1.0f / 16384.0f) + 1e-12f) * P.shrink;
     half h_rms = half(rms);
     if ((strip & 7u) == 0u && lane == 0) scales_f16[bi] = h_rms;
     float inv_sc = 1.0f / float(h_rms);
@@ -186,7 +198,8 @@ kernel void prism_encode_v3(
     threadgroup uint  cur_state[256], nxt_state[256];
     threadgroup uint  cur_hprev[256], nxt_hprev[256];
     threadgroup float sg_min[4], sg_sum[4], cmin_tg, inv_step_tg;
-    threadgroup atomic_uint bins[64], emit_lt, emit_eq;
+    threadgroup atomic_uint bins[64];
+    threadgroup uint sg_scan[4];
     threadgroup uint cut_bin_tg, lt_base_tg, eq_quota_tg;
 
     if (tid == 0) {
@@ -314,7 +327,7 @@ kernel void prism_encode_v3(
         }
 
         float smin = simd_min(my_min);
-        float ssum = simd_sum(my_sum);
+        float ssum = det_simd_sum(my_sum);
         if (lane == 0) { sg_min[sg] = smin; sg_sum[sg] = ssum; }
         if (tid < 64u) atomic_store_explicit(&bins[tid], 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -324,19 +337,19 @@ kernel void prism_encode_v3(
             float cmean = (sg_sum[0] + sg_sum[1] + sg_sum[2] + sg_sum[3]) / float(cur_n * K_KEEP);
             float span = max(1e-4f, (cmean - cmin) * 1.15f);
             cmin_tg = cmin; inv_step_tg = 63.0f / span;
-            atomic_store_explicit(&emit_lt, 0u, memory_order_relaxed);
-            atomic_store_explicit(&emit_eq, 0u, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float cmin = cmin_tg, inv_step = inv_step_tg;
 
+        uchar r_bi[2][K_KEEP];
         TF_UNROLL for (uint s = 0; s < 2u; ++s) {
             uint pi = uint(tid) + s * 128u;
             if (pi < cur_n) {
                 float bc = r_bc[s] - cmin;
                 TF_UNROLL for (uint k = 0; k < K_KEEP; ++k) {
                     uint bi = min(63u, uint(max(0.0f, (bc + r_d[s][k]) * inv_step)));
+                    r_bi[s][k] = uchar(bi);
                     atomic_fetch_add_explicit(&bins[bi], 1u, memory_order_relaxed);
                 }
             }
@@ -357,22 +370,50 @@ kernel void prism_encode_v3(
 
         uint cut_bin = cut_bin_tg, lt_base = lt_base_tg, eq_quota = eq_quota_tg;
 
+        uint my_lt = 0u, my_eq = 0u;
         TF_UNROLL for (uint s = 0; s < 2u; ++s) {
             uint pi = uint(tid) + s * 128u;
             if (pi < cur_n) {
-                float bc_raw = r_bc[s], bc = bc_raw - cmin;
+                TF_UNROLL for (uint k = 0; k < K_KEEP; ++k) {
+                    uint bi = uint(r_bi[s][k]);
+                    if (bi < cut_bin) my_lt++;
+                    else if (bi == cut_bin) my_eq++;
+                }
+            }
+        }
+        uint packed = (my_eq << 16) | my_lt;
+        uint incl = packed;
+        TF_UNROLL for (ushort d = 1; d < 32; d <<= 1) {
+            uint v = simd_shuffle_up(incl, d);
+            if (lane >= d) incl += v;
+        }
+        uint excl = incl - packed;
+        if (lane == 31) sg_scan[sg] = incl;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint w_base = 0u;
+        if (sg > 0) w_base += sg_scan[0];
+        if (sg > 1) w_base += sg_scan[1];
+        if (sg > 2) w_base += sg_scan[2];
+        uint base_packed = excl + w_base;
+        uint pos_lt = base_packed & 0xFFFFu;
+        uint pos_eq = base_packed >> 16;
+
+        TF_UNROLL for (uint s = 0; s < 2u; ++s) {
+            uint pi = uint(tid) + s * 128u;
+            if (pi < cur_n) {
+                float bc_raw = r_bc[s];
                 uint st_sh = r_st_sh[s], next_hp = r_hp[s];
                 TF_UNROLL for (uint k = 0; k < K_KEEP; ++k) {
-                    uint bi = min(63u, uint(max(0.0f, (bc + r_d[s][k]) * inv_step)));
+                    uint bi = uint(r_bi[s][k]);
                     if (bi < cut_bin) {
-                        uint pos = atomic_fetch_add_explicit(&emit_lt, 1u, memory_order_relaxed);
+                        uint pos = pos_lt++;
                         if (pos < lt_base) {
                             uint sym = uint(r_sym[s][k]);
                             nxt_cost[pos] = bc_raw + r_d[s][k]; nxt_state[pos] = st_sh | sym; nxt_hprev[pos] = next_hp;
                             hist_ptr[ulong(pair) * 256ul + pos] = pi | (sym << 8);
                         }
                     } else if (bi == cut_bin) {
-                        uint ep = atomic_fetch_add_explicit(&emit_eq, 1u, memory_order_relaxed);
+                        uint ep = pos_eq++;
                         if (ep < eq_quota) {
                             uint pos = lt_base + ep;
                             uint sym = uint(r_sym[s][k]);
@@ -438,7 +479,7 @@ kernel void prism_verify_v3_snr(
     constant uint* lut_u32       [[buffer(2)]],
     constant half4* c64          [[buffer(3)]],
     const device float* W_rot    [[buffer(4)]],
-    device atomic_float* out_se  [[buffer(5)]],
+    device float* out_se        [[buffer(5)]],
     constant MatParams& P        [[buffer(6)]],
     uint strip                   [[threadgroup_position_in_grid]],
     ushort lane                  [[thread_index_in_simdgroup]]
@@ -513,9 +554,9 @@ kernel void prism_verify_v3_snr(
             err += dot(d0, d0) + dot(d1, d1);
         }
     }
-    sig = simd_sum(sig); err = simd_sum(err);
+    sig = det_simd_sum(sig); err = det_simd_sum(err);
     if (lane == 0) {
-        atomic_fetch_add_explicit(&out_se[0], sig, memory_order_relaxed);
-        atomic_fetch_add_explicit(&out_se[1], err, memory_order_relaxed);
+        out_se[strip * 2u + 0u] = sig;
+        out_se[strip * 2u + 1u] = err;
     }
 }

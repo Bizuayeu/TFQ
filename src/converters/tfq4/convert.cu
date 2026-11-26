@@ -60,7 +60,7 @@ __global__ void f32_row_fwht_k(const float* __restrict__ W_in, float* __restrict
 
 __global__ void col_fwht_ss_k(
     const float* __restrict__ W_tmp, float* __restrict__ W_rot,
-    float* __restrict__ blk_ss, uint32_t R, uint32_t C, uint32_t r_off
+    float* __restrict__ col_ss, uint32_t R, uint32_t C, uint32_t r_off
 ) {
     uint32_t c = blockIdx.x, br = blockIdx.y, r0 = br * 128u, lane = threadIdx.x;
     if (c >= C || r0 >= R) return;
@@ -77,12 +77,18 @@ __global__ void col_fwht_ss_k(
     float ss = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     #pragma unroll
     for (int d = 16; d >= 1; d >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, d);
-    if (lane == 0) atomicAdd(&blk_ss[br * (C >> 7) + (c >> 7)], ss);
+    uint32_t bi = br * (C >> 7) + (c >> 7);
+    if (lane == 0) col_ss[(uint64_t)bi * 128u + (c & 127u)] = ss;
 }
 
-__global__ void finalize_scales_k(const float* __restrict__ blk_ss, __half* __restrict__ sc, uint32_t n_blk) {
-    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n_blk) sc[i] = __float2half(sqrtf(blk_ss[i] * (1.0f / 16384.0f) + 1e-12f));
+__global__ void finalize_scales_k(const float* __restrict__ col_ss, __half* __restrict__ sc, uint32_t n_blk) {
+    uint32_t bi = blockIdx.x, lane = threadIdx.x;
+    if (bi >= n_blk) return;
+    const float* cs = col_ss + (uint64_t)bi * 128u;
+    float s = (cs[lane + 0u] + cs[lane + 32u]) + (cs[lane + 64u] + cs[lane + 96u]);
+    #pragma unroll
+    for (int d = 16; d >= 1; d >>= 1) s += __shfl_xor_sync(0xFFFFFFFFu, s, d);
+    if (lane == 0) sc[bi] = __float2half(sqrtf(s * (1.0f / 16384.0f) + 1e-12f));
 }
 
 __global__ void tfq4_e8p_encode_k(
@@ -146,9 +152,18 @@ __global__ void tfq4_e8p_encode_k(
         my_sig += __shfl_xor_sync(0xFFFFFFFFu, my_sig, d);
         my_err += __shfl_xor_sync(0xFFFFFFFFu, my_err, d);
     }
+    __shared__ double sm_sig[8], sm_err[8];
     if ((tid & 31u) == 0u) {
-        atomicAdd(&metrics[0], my_sig);
-        atomicAdd(&metrics[1], my_err);
+        sm_sig[tid >> 5] = my_sig;
+        sm_err[tid >> 5] = my_err;
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        double bs = 0.0, be = 0.0;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) { bs += sm_sig[w]; be += sm_err[w]; }
+        metrics[(uint64_t)blockIdx.x * 2ull + 0ull] = bs;
+        metrics[(uint64_t)blockIdx.x * 2ull + 1ull] = be;
     }
 }
 
@@ -237,13 +252,14 @@ int main(int argc, char** argv) {
     float *d_in = nullptr, *d_tmp = nullptr, *d_rot = nullptr, *d_ss = nullptr;
     uint32_t* d_out = nullptr;
     double* d_met = nullptr;
+    const size_t MAX_MET_BLKS = (MAX_WORDS + 255ULL) / 256ULL;
     CUDA_CHECK(cudaMalloc((void**)&d_lut, sizeof(tbl.e8p_lut)));
     CUDA_CHECK(cudaMemcpy(d_lut, tbl.e8p_lut, sizeof(tbl.e8p_lut), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMalloc((void**)&d_met, 2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void**)&d_met, MAX_MET_BLKS * 2ULL * sizeof(double)));
     CUDA_CHECK(cudaMalloc((void**)&d_in,  MAX_ELEMS * 4ULL));
     CUDA_CHECK(cudaMalloc((void**)&d_tmp, MAX_ELEMS * 4ULL));
     CUDA_CHECK(cudaMalloc((void**)&d_rot, MAX_ELEMS * 4ULL));
-    CUDA_CHECK(cudaMalloc((void**)&d_ss,  MAX_BLK   * 4ULL));
+    CUDA_CHECK(cudaMalloc((void**)&d_ss,  MAX_BLK * 128ULL * 4ULL));
     CUDA_CHECK(cudaMalloc((void**)&d_sc,  MAX_BLK   * 2ULL));
     CUDA_CHECK(cudaMalloc((void**)&d_out, MAX_WORDS * 4ULL));
 
@@ -286,20 +302,21 @@ int main(int argc, char** argv) {
                 uint32_t n_br = rc / 128u, n_blk = n_br * n_bc;
                 uint64_t n_words = (uint64_t)rc * (C / 16u);
 
+                uint32_t n_mblk = (uint32_t)((n_words + 255ull) / 256ull);
                 CUDA_CHECK(cudaMemcpy(d_in, host_chunk.data(), host_chunk.size() * 4ULL, cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemset(d_ss, 0, (size_t)n_blk * 4ULL));
-                CUDA_CHECK(cudaMemset(d_met, 0, 2 * sizeof(double)));
 
                 f32_row_fwht_k<<<dim3(n_bc, rc), 32>>>(d_in, d_tmp, rc, C);
                 col_fwht_ss_k<<<dim3(C, n_br), 32>>>(d_tmp, d_rot, d_ss, rc, C, r0);
-                finalize_scales_k<<<(n_blk + 255u) / 256u, 256>>>(d_ss, d_sc, n_blk);
-                tfq4_e8p_encode_k<<<(uint32_t)((n_words + 255ull) / 256ull), 256>>>(d_rot, d_sc, d_lut, d_out, d_met, rc, C);
+                finalize_scales_k<<<n_blk, 32>>>(d_ss, d_sc, n_blk);
+                tfq4_e8p_encode_k<<<n_mblk, 256>>>(d_rot, d_sc, d_lut, d_out, d_met, rc, C);
                 CUDA_CHECK(cudaDeviceSynchronize());
 
-                double met[2];
-                CUDA_CHECK(cudaMemcpy(met, d_met, 2 * sizeof(double), cudaMemcpyDeviceToHost));
-                tot_sig += met[0];
-                tot_err += met[1];
+                std::vector<double> h_met((size_t)n_mblk * 2u);
+                CUDA_CHECK(cudaMemcpy(h_met.data(), d_met, h_met.size() * sizeof(double), cudaMemcpyDeviceToHost));
+                for (uint32_t mi = 0; mi < n_mblk; ++mi) {
+                    tot_sig += h_met[(size_t)mi * 2u + 0u];
+                    tot_err += h_met[(size_t)mi * 2u + 1u];
+                }
 
                 CUDA_CHECK(cudaMemcpy(all_scales.data() + m.sc_off + sc_cur, d_sc, (size_t)n_blk * 2ULL, cudaMemcpyDeviceToHost));
                 CUDA_CHECK(cudaMemcpy(all_words.data() + m.word_off + w_cur, d_out, (size_t)n_words * 4ULL, cudaMemcpyDeviceToHost));

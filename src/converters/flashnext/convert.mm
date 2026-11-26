@@ -533,12 +533,12 @@ int main(int argc, char** argv) {
         id<MTLBuffer> buf_q8_b   = [dev newBufferWithLength:(MAX_ELEMS / 32) * 2 options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_w_tmp  = [dev newBufferWithLength:MAX_ELEMS * 4 options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_w_rot  = [dev newBufferWithLength:MAX_ELEMS * 4 options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> buf_blk_ss = [dev newBufferWithLength:SC_PER_MAT * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_blk_ss = [dev newBufferWithLength:(size_t)SC_PER_MAT * 128ULL * 4ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_streams= [dev newBufferWithLength:MAX_ELEMS * 4 options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_hist   = [dev newBufferWithLength:HIST_SLOTS * 256ULL * 4ULL options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_pack   = [dev newBufferWithLength:(size_t)(I / 16) * (H / 128) * 10 * 32 * 4 options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_sc     = [dev newBufferWithLength:SC_PER_MAT * 2 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_se     = [dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_se     = [dev newBufferWithLength:(size_t)(std::max(H, I) / 16) * 2ULL * 4ULL options:MTLResourceStorageModeShared];
 
         auto heat_ranks = trace_path.empty() ? std::map<int, std::vector<int>>{} : load_heat_ranks(trace_path, N_EXP);
         const char* proj_names[3] = {"gate_proj", "up_proj", "down_proj"};
@@ -633,8 +633,6 @@ int main(int argc, char** argv) {
                     memcpy([buf_q8_w contents], stacked_w[p] + (size_t)e * exp_w_stride, exp_w_stride);
                     memcpy([buf_q8_s contents], stacked_s[p] + (size_t)e * exp_sb_stride, exp_sb_stride);
                     memcpy([buf_q8_b contents], stacked_b[p] + (size_t)e * exp_sb_stride, exp_sb_stride);
-                    memset([buf_blk_ss contents], 0, SC_PER_MAT * 4);
-                    memset([buf_se contents], 0, 8);
 
                     MatParams mp = {(uint32_t)R, (uint32_t)C, b, 1.0f};
                     uint32_t total_streams = (uint32_t)(R / 16) * 32u;
@@ -682,7 +680,12 @@ int main(int argc, char** argv) {
                     }
 
                     const float* se = (const float*)[buf_se contents];
-                    float snr = (float)(10.0 * log10((double)se[0] / std::max(1e-18, (double)se[1])));
+                    double s_sig = 0.0, s_err = 0.0;
+                    for (int si_s = 0; si_s < R / 16; ++si_s) {
+                        s_sig += (double)se[si_s * 2 + 0];
+                        s_err += (double)se[si_s * 2 + 1];
+                    }
+                    float snr = (float)(10.0 * log10(s_sig / std::max(1e-18, s_err)));
                     if (snr < 10.0f || std::isnan(snr)) {
                         fprintf(stderr, "FATAL: Bad SNR %.3f on L%d E%d %s!\n", snr, lyr, e, proj_names[p]);
                         return 2;

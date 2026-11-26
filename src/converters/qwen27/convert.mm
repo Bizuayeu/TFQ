@@ -499,12 +499,12 @@ int main(int argc, char** argv) {
         id<MTLBuffer> buf_q8_b   = [dev newBufferWithLength:(MAX_E / 64) * 2 options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_w_tmp  = [dev newBufferWithLength:MAX_E * 4 options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_w_rot  = [dev newBufferWithLength:MAX_E * 4 options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> buf_blk_ss = [dev newBufferWithLength:16384 * 4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_blk_ss = [dev newBufferWithLength:16384ULL * 128ULL * 4ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_str    = [dev newBufferWithLength:MAX_E * 4 options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_hist   = [dev newBufferWithLength:HIST_SLOTS * 256ULL * 4ULL options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_pack   = [dev newBufferWithLength:MAX_E options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_sc     = [dev newBufferWithLength:16384 * 2 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_se     = [dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_se     = [dev newBufferWithLength:2048ULL * 2ULL * 4ULL options:MTLResourceStorageModeShared];
 
         auto t0_all = std::chrono::high_resolution_clock::now();
         double snr_sum[6] = {}; int snr_cnt[6] = {};
@@ -551,8 +551,6 @@ int main(int argc, char** argv) {
                         memcpy([buf_q8_b contents], b_ptr + (size_t)r0 * (t.C / 64) * 2, (size_t)sr * (t.C / 64) * 2);
                     }
                     size_t n_blks = (size_t)(sr / 128) * (t.C / 128);
-                    memset([buf_blk_ss contents], 0, n_blks * 4);
-                    memset([buf_se contents], 0, 8);
 
                     MatParams mp = {sr, t.C, t.bits, 1.0f, r0, 0u};
                     uint32_t total_streams = (sr / 16) * 32;
@@ -611,7 +609,10 @@ int main(int argc, char** argv) {
                     [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
                     }
                     const float* se = (const float*)[buf_se contents];
-                    tot_sig += se[0]; tot_err += se[1];
+                    for (uint32_t si_s = 0; si_s < sr / 16u; ++si_s) {
+                        tot_sig += (double)se[si_s * 2u + 0u];
+                        tot_err += (double)se[si_s * 2u + 1u];
+                    }
                     size_t sc_off_chunk = (size_t)(r0 / 128) * (t.C / 128);
                     size_t wd_off_chunk = (size_t)(r0 / 16) * (t.C / 128) * (t.bits * 2u) * 32u;
                     size_t wd_cnt_chunk = (size_t)(sr / 16) * (t.C / 128) * (t.bits * 2u) * 32u;

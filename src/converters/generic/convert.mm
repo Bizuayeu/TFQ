@@ -300,11 +300,11 @@ int main(int argc, char** argv) {
         id<MTLBuffer> buf_tmp  = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_rot  = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_str  = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> buf_ss   = [dev newBufferWithLength:(size_t)(MAX_CHUNK_R / 128u) * (max_pad_C / 128u) * 4ULL options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_ss   = [dev newBufferWithLength:(size_t)(MAX_CHUNK_R / 128u) * (max_pad_C / 128u) * 128ULL * 4ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_sc16 = [dev newBufferWithLength:(size_t)(MAX_CHUNK_R / 128u) * (max_pad_C / 128u) * 2ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_hist = [dev newBufferWithLength:MAX_HIST options:MTLResourceStorageModePrivate];
         id<MTLBuffer> buf_outw = [dev newBufferWithLength:MAX_OUTW options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_se   = [dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_se   = [dev newBufferWithLength:(size_t)(MAX_CHUNK_R / 16u) * 2ULL * 4ULL options:MTLResourceStorageModeShared];
 
         auto t0 = std::chrono::steady_clock::now();
         std::vector<float> host_chunk;
@@ -348,8 +348,6 @@ int main(int argc, char** argv) {
                     memcpy([buf_in contents], host_chunk.data(), host_chunk.size() * 4ULL);
 
                     uint32_t n_blk = (rc / 128u) * (C / 128u);
-                    memset([buf_ss contents], 0, n_blk * 4ULL);
-                    memset([buf_se contents], 0, 8);
                     MatParams mp{rc, C, B, shrink, r0, 0};
 
                     @autoreleasepool {
@@ -396,7 +394,11 @@ int main(int argc, char** argv) {
                     }
 
                     const float* se = (const float*)[buf_se contents];
-                    tot_sig += se[0]; tot_err += se[1];
+                    uint32_t n_strips = rc / 16u;
+                    for (uint32_t si_s = 0; si_s < n_strips; ++si_s) {
+                        tot_sig += (double)se[si_s * 2u + 0u];
+                        tot_err += (double)se[si_s * 2u + 1u];
+                    }
                     uint64_t cw = (uint64_t)(rc / 16u) * (C / 128u) * (B * 2u) * 32ULL;
                     memcpy(all_sc.data() + m.sc_off + sc_cur, [buf_sc16 contents], n_blk * 2ULL);
                     memcpy(all_w.data() + m.word_off + w_cur, [buf_outw contents], cw * 4ULL);

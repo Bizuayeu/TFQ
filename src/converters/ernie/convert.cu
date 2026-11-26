@@ -64,12 +64,12 @@ int main(int argc, char** argv) {
     TFQ_CUDA_CHECK(cudaMalloc(&d_bf16, MAX_ELEMS * 2));
     TFQ_CUDA_CHECK(cudaMalloc(&d_tmp, MAX_ELEMS * 4));
     TFQ_CUDA_CHECK(cudaMalloc(&d_rot, MAX_ELEMS * 4));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_ss,  SC_PER_MAT * 4));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_ss,  (size_t)SC_PER_MAT * 128ULL * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_str, MAX_ELEMS * 4));
     TFQ_CUDA_CHECK(cudaMalloc(&d_hist, (size_t)CHUNK_STR * (std::max(H, I) / 4) * 256ULL * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_pack, (size_t)(I / 16) * (H / 128) * 10 * 32 * 4));
     TFQ_CUDA_CHECK(cudaMalloc(&d_sc,  SC_PER_MAT * 2));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_se,  8));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_se,  (size_t)(std::max(H, I) / 16) * 2ULL * 4ULL));
 
     const char* ckpt_names[3] = {"w1", "w3", "w2"};  // gate, up, down
     const int proj_R[3] = {I, I, H}, proj_C[3] = {H, H, I};
@@ -109,8 +109,6 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 TFQ_CUDA_CHECK(cudaMemcpy(d_bf16, wp, nbytes, cudaMemcpyHostToDevice));
-                TFQ_CUDA_CHECK(cudaMemset(d_ss, 0, SC_PER_MAT * 4));
-                TFQ_CUDA_CHECK(cudaMemset(d_se, 0, 8));
                 MatParams mp{R, C, b, 1.0f, 0u, 0u};
                 bf16_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_bf16, d_tmp, mp);
                 col_fwht_and_ss_kernel<<<dim3(C, R / 128u, 1), 32>>>(d_tmp, d_rot, d_ss, mp);
@@ -123,8 +121,9 @@ int main(int argc, char** argv) {
                 prism_verify_v3_snr_kernel<<<R / 16u, 32>>>(d_pack, d_sc, d_lut[b], d_c64[b], d_rot, d_se, mp);
                 TFQ_CUDA_CHECK(cudaGetLastError());
                 TFQ_CUDA_CHECK(cudaDeviceSynchronize());
-                float h_se[2]; TFQ_CUDA_CHECK(cudaMemcpy(h_se, d_se, 8, cudaMemcpyDeviceToHost));
-                float snr = (float)(10.0 * std::log10((double)h_se[0] / std::max((double)h_se[1], 1e-12)));
+                double c_sig = 0.0, c_err = 0.0;
+                cuda_read_se_det(d_se, R / 16u, c_sig, c_err);
+                float snr = (float)(10.0 * std::log10(c_sig / std::max(c_err, 1e-12)));
                 snr_sum += snr; snr_min = std::min(snr_min, (double)snr); snr_cnt++;
                 uint64_t w_off = (p == 0) ? metas[e].gate_word_off : (p == 1 ? metas[e].up_word_off : metas[e].down_word_off);
                 uint32_t s_off = (p == 0) ? metas[e].gate_sc_off   : (p == 1 ? metas[e].up_sc_off   : metas[e].down_sc_off);

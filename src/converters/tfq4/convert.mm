@@ -127,7 +127,6 @@ int main(int argc, char** argv) {
             tf.write(reinterpret_cast<const char*>(&tbl), sizeof(tbl));
         }
         id<MTLBuffer> b_lut = [dev newBufferWithBytes:tbl.e8p_lut length:sizeof(tbl.e8p_lut) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> b_met = [dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
 
         uint32_t max_pad_C = 128u;
         for (const auto& j : plan.jobs) max_pad_C = std::max(max_pad_C, j.pad_C);
@@ -135,11 +134,13 @@ int main(int argc, char** argv) {
         const size_t MAX_ELEMS = (size_t)MAX_CHUNK_R * max_pad_C;
         const size_t MAX_BLK   = (size_t)(MAX_CHUNK_R / 128u) * (max_pad_C / 128u);
         const size_t MAX_WORDS = (size_t)MAX_CHUNK_R * (max_pad_C / 16u);
+        const size_t MAX_MET_BLKS = (MAX_WORDS + 255ULL) / 256ULL;
 
+        id<MTLBuffer> b_met = [dev newBufferWithLength:MAX_MET_BLKS * 2ULL * 4ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> b_in  = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> b_tmp = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
         id<MTLBuffer> b_rot = [dev newBufferWithLength:MAX_ELEMS * 4ULL options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> b_ss  = [dev newBufferWithLength:MAX_BLK   * 4ULL options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_ss  = [dev newBufferWithLength:MAX_BLK * 128ULL * 4ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> b_sc  = [dev newBufferWithLength:MAX_BLK   * 2ULL options:MTLResourceStorageModeShared];
         id<MTLBuffer> b_out = [dev newBufferWithLength:MAX_WORDS * 4ULL options:MTLResourceStorageModeShared];
 
@@ -183,8 +184,7 @@ int main(int argc, char** argv) {
 
                     uint32_t n_br = rc / 128u, n_blk = n_br * n_bc;
                     uint64_t n_words = (uint64_t)rc * (C / 16u);
-                    memset([b_ss contents], 0, (size_t)n_blk * 4ULL);
-                    memset([b_met contents], 0, 8);
+                    uint32_t n_mblk = (uint32_t)((n_words + 255ull) / 256ull);
                     Tfq4MatParams mp{rc, C, r0, 0u};
 
                     @autoreleasepool {
@@ -203,19 +203,21 @@ int main(int argc, char** argv) {
                         [enc setComputePipelineState:p_fsc];
                         [enc setBuffer:b_ss offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
                         [enc setBytes:&n_blk length:sizeof(n_blk) atIndex:2];
-                        [enc dispatchThreadgroups:MTLSizeMake((n_blk + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [enc dispatchThreadgroups:MTLSizeMake(n_blk, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
                         [enc setComputePipelineState:p_enc];
                         [enc setBuffer:b_rot offset:0 atIndex:0]; [enc setBuffer:b_sc offset:0 atIndex:1];
                         [enc setBuffer:b_lut offset:0 atIndex:2]; [enc setBuffer:b_out offset:0 atIndex:3];
                         [enc setBuffer:b_met offset:0 atIndex:4]; [enc setBytes:&mp length:sizeof(mp) atIndex:5];
-                        [enc dispatchThreadgroups:MTLSizeMake((n_words + 255ull) / 256ull, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [enc dispatchThreadgroups:MTLSizeMake(n_mblk, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                         [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
                     }
 
-                    float met[2]; memcpy(met, [b_met contents], 8);
-                    tot_sig += (double)met[0];
-                    tot_err += (double)met[1];
+                    const float* met = (const float*)[b_met contents];
+                    for (uint32_t mi = 0; mi < n_mblk; ++mi) {
+                        tot_sig += (double)met[(size_t)mi * 2u + 0u];
+                        tot_err += (double)met[(size_t)mi * 2u + 1u];
+                    }
                     memcpy(all_scales.data() + m.sc_off + sc_cur, [b_sc contents], (size_t)n_blk * 2ULL);
                     memcpy(all_words.data() + m.word_off + w_cur, [b_out contents], (size_t)n_words * 4ULL);
                     sc_cur += n_blk;

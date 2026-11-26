@@ -178,12 +178,12 @@ int main(int argc, char** argv) {
     TFQ_CUDA_CHECK(cudaMalloc(&d_q8b, (MAX_ELEMS / 32) * 2));
     TFQ_CUDA_CHECK(cudaMalloc(&d_tmp, MAX_ELEMS * 4));
     TFQ_CUDA_CHECK(cudaMalloc(&d_rot, MAX_ELEMS * 4));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_ss,  SC_PER_MAT * 4));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_ss,  (size_t)SC_PER_MAT * 128ULL * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_str, MAX_ELEMS * 4));
     TFQ_CUDA_CHECK(cudaMalloc(&d_hist, (size_t)CHUNK_STR * (H / 4) * 256ULL * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_pack, (size_t)(I / 16) * (H / 128) * 10 * 32 * 4));
     TFQ_CUDA_CHECK(cudaMalloc(&d_sc,  SC_PER_MAT * 2));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_se,  8));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_se,  (size_t)(std::max(H, I) / 16) * 2ULL * 4ULL));
 
     auto heat_ranks = trace_path.empty() ? std::map<int, std::vector<int>>{} : load_heat_ranks(trace_path, N_EXP);
     const char* proj_names[3] = {"gate_proj", "up_proj", "down_proj"};
@@ -257,8 +257,6 @@ int main(int argc, char** argv) {
                 TFQ_CUDA_CHECK(cudaMemcpy(d_q8w, stacked_w[p] + (size_t)e * MAX_ELEMS, MAX_ELEMS, cudaMemcpyHostToDevice));
                 TFQ_CUDA_CHECK(cudaMemcpy(d_q8s, stacked_s[p] + (size_t)e * exp_sb, exp_sb, cudaMemcpyHostToDevice));
                 TFQ_CUDA_CHECK(cudaMemcpy(d_q8b, stacked_b[p] + (size_t)e * exp_sb, exp_sb, cudaMemcpyHostToDevice));
-                TFQ_CUDA_CHECK(cudaMemset(d_ss, 0, SC_PER_MAT * 4));
-                TFQ_CUDA_CHECK(cudaMemset(d_se, 0, 8));
                 MatParams mp{R, C, b, 1.0f, 0u, 0u};
                 q8_32_dequant_row_fwht_kernel<<<dim3(C / 128u, R, 1), 32>>>(d_q8w, d_q8s, d_q8b, d_tmp, mp);
                 col_fwht_and_ss_kernel<<<dim3(C, R / 128u, 1), 32>>>(d_tmp, d_rot, d_ss, mp);
@@ -270,8 +268,9 @@ int main(int argc, char** argv) {
                 }
                 prism_verify_v3_snr_kernel<<<R / 16u, 32>>>(d_pack, d_sc, d_lut[b], d_c64[b], d_rot, d_se, mp);
                 TFQ_CUDA_CHECK(cudaDeviceSynchronize());
-                float h_se[2]; TFQ_CUDA_CHECK(cudaMemcpy(h_se, d_se, 8, cudaMemcpyDeviceToHost));
-                float snr = (float)(10.0 * std::log10((double)h_se[0] / std::max((double)h_se[1], 1e-12)));
+                double c_sig = 0.0, c_err = 0.0;
+                cuda_read_se_det(d_se, R / 16u, c_sig, c_err);
+                float snr = (float)(10.0 * std::log10(c_sig / std::max(c_err, 1e-12)));
                 snr_sum[b] += snr; snr_cnt[b]++;
                 uint64_t w_off = (p == 0) ? metas[e].gate_word_off : (p == 1 ? metas[e].up_word_off : metas[e].down_word_off);
                 uint32_t s_off = (p == 0) ? metas[e].gate_sc_off   : (p == 1 ? metas[e].up_sc_off   : metas[e].down_sc_off);

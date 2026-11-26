@@ -327,6 +327,25 @@ def test_gpu_roundtrips(tfq3_cli: str, inspect_bin: str, model_dir: str, refs: d
         f"padded={snr4_pad:.2f} dB, chunk0={s0:.2f} dB, chunk1(r>=4096)={s1:.2f} dB"
     )
 
+    # 4. Bit-reproducibility check (Issue #2): repeated runs must produce byte-identical shards & manifests
+    def assert_dirs_byte_identical(dir_a: str, dir_b: str, label: str) -> None:
+        files_a = sorted(f for f in os.listdir(dir_a) if os.path.isfile(os.path.join(dir_a, f)))
+        files_b = sorted(f for f in os.listdir(dir_b) if os.path.isfile(os.path.join(dir_b, f)))
+        assert files_a == files_b, f"{label}: file list mismatch {files_a} vs {files_b}"
+        for fn in files_a:
+            ba = open(os.path.join(dir_a, fn), "rb").read()
+            bb = open(os.path.join(dir_b, fn), "rb").read()
+            assert ba == bb, f"{label}: non-deterministic bytes in {fn} ({len(ba)} vs {len(bb)} B)"
+
+    out_tfq3_4b_r2 = os.path.join(tmp, "out_tfq3_4b_r2")
+    run([tfq3_cli, model_dir, "--bits", "4", "--out", out_tfq3_4b_r2])
+    assert_dirs_byte_identical(os.path.join(tmp, "out_tfq3_4b"), out_tfq3_4b_r2, "TFQ3-4b")
+
+    out_tfq4_r2 = os.path.join(tmp, "out_tfq4_r2")
+    run([tfq3_cli, model_dir, "--bits", "2", "--max-shard-gib", "0.001", "--out", out_tfq4_r2])
+    assert_dirs_byte_identical(out_tfq4, out_tfq4_r2, "TFQ4-E8P")
+    print("PASS bit-reproducibility: TFQ3-4b and TFQ4-E8P repeated runs are 100% byte-identical")
+
 
 def test_moe_datafree_ranking(tmp: str) -> None:
     """Compile & run a C++17 unit test for src/converters/moe_heat_rank.hpp proving non-iota sensitivity ranking."""

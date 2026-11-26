@@ -175,11 +175,11 @@ int main(int argc, char** argv) {
     TFQ_CUDA_CHECK(cudaMalloc(&d_tmp,     MAX_ELEMS * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_rot,     MAX_ELEMS * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_streams, MAX_ELEMS * 4ULL));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_ss,      256ULL * 256ULL * 4ULL));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_ss,      256ULL * 256ULL * 128ULL * 4ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_sc16,    256ULL * 256ULL * 2ULL));
     TFQ_CUDA_CHECK(cudaMalloc(&d_hist,    MAX_HIST));
     TFQ_CUDA_CHECK(cudaMalloc(&d_outw,    MAX_OUTW));
-    TFQ_CUDA_CHECK(cudaMalloc(&d_se,      8));
+    TFQ_CUDA_CHECK(cudaMalloc(&d_se,      2048ULL * 2ULL * 4ULL));
 
     auto t_start = std::chrono::steady_clock::now();
     double snr_sum[6] = {};
@@ -229,9 +229,6 @@ int main(int argc, char** argv) {
                 size_t chunk_w  = (size_t)n_strips * n_bc * wpb * 32ULL;
                 MatParams mp{rc, C, B, shrink, r0, 0u};
 
-                TFQ_CUDA_CHECK(cudaMemset(d_ss, 0, chunk_sc * 4));
-                TFQ_CUDA_CHECK(cudaMemset(d_se, 0, 8));
-
                 if (src_is_bf16) {
                     TFQ_CUDA_CHECK(cudaMemcpy(d_in_w, src_w + (size_t)r0 * C * 2ULL, (size_t)rc * C * 2ULL, cudaMemcpyHostToDevice));
                     bf16_row_fwht_kernel<<<dim3(n_bc, rc, 1), 32>>>(reinterpret_cast<const uint16_t*>(d_in_w), d_tmp, mp);
@@ -254,9 +251,9 @@ int main(int argc, char** argv) {
                 prism_verify_v3_snr_kernel<<<n_strips, 32>>>(d_outw, d_sc16, d_lut[B], d_c64[B], d_rot, d_se, mp);
                 TFQ_CUDA_CHECK(cudaDeviceSynchronize());
 
-                float h_se[2];
-                TFQ_CUDA_CHECK(cudaMemcpy(h_se, d_se, 8, cudaMemcpyDeviceToHost));
-                sig_tot += h_se[0]; err_tot += h_se[1];
+                double c_sig = 0.0, c_err = 0.0;
+                cuda_read_se_det(d_se, n_strips, c_sig, c_err);
+                sig_tot += c_sig; err_tot += c_err;
 
                 size_t old_sc = all_scales.size(), old_w = all_weights.size();
                 all_scales.resize(old_sc + chunk_sc);

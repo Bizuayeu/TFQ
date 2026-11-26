@@ -45,10 +45,19 @@ kernel void f32_row_fwht(
     dst[lane +  0u] = v.x; dst[lane + 32u] = v.y; dst[lane + 64u] = v.z; dst[lane + 96u] = v.w;
 }
 
+static inline float det_simd_sum(float v) {
+    v += simd_shuffle_xor(v, 16);
+    v += simd_shuffle_xor(v, 8);
+    v += simd_shuffle_xor(v, 4);
+    v += simd_shuffle_xor(v, 2);
+    v += simd_shuffle_xor(v, 1);
+    return v;
+}
+
 kernel void col_fwht_and_ss(
     const device float* W_tmp   [[buffer(0)]],
     device float* W_rot         [[buffer(1)]],
-    device atomic_float* blk_ss [[buffer(2)]],
+    device float* col_ss        [[buffer(2)]],
     constant Tfq4MatParams& P   [[buffer(3)]],
     uint2 gid                   [[threadgroup_position_in_grid]],
     ushort lane                 [[thread_index_in_simdgroup]]
@@ -65,18 +74,22 @@ kernel void col_fwht_and_ss(
     W_rot[ulong(r0 + lane + 32u) * P.C + c] = v.y;
     W_rot[ulong(r0 + lane + 64u) * P.C + c] = v.z;
     W_rot[ulong(r0 + lane + 96u) * P.C + c] = v.w;
-    float ss = simd_sum(dot(v, v));
-    if (lane == 0) atomic_fetch_add_explicit(&blk_ss[br * (P.C >> 7) + (c >> 7)], ss, memory_order_relaxed);
+    float ss = det_simd_sum(dot(v, v));
+    uint bi = br * (P.C >> 7) + (c >> 7);
+    if (lane == 0) col_ss[ulong(bi) * 128ul + (c & 127u)] = ss;
 }
 
 kernel void finalize_scales(
-    const device float* blk_ss [[buffer(0)]],
+    const device float* col_ss [[buffer(0)]],
     device half* scales_f16    [[buffer(1)]],
     constant uint& n_blocks    [[buffer(2)]],
-    uint tid                   [[thread_position_in_grid]]
+    uint bi                    [[threadgroup_position_in_grid]],
+    ushort lane                [[thread_index_in_simdgroup]]
 ) {
-    if (tid >= n_blocks) return;
-    scales_f16[tid] = half(sqrt(blk_ss[tid] * (1.0f / 16384.0f) + 1e-12f));
+    if (bi >= n_blocks) return;
+    const device float* cs = col_ss + ulong(bi) * 128ul;
+    float s = det_simd_sum((cs[lane + 0u] + cs[lane + 32u]) + (cs[lane + 64u] + cs[lane + 96u]));
+    if (lane == 0) scales_f16[bi] = half(sqrt(s * (1.0f / 16384.0f) + 1e-12f));
 }
 
 // Exhaustive 256-entry positive-orthant 8D E8P encoder: 1 thread per uint32_t (16 weights = 2 x 8D).
@@ -86,11 +99,13 @@ kernel void tfq4_e8p_encode(
     const device half* scales   [[buffer(1)]],
     const device half* e8p_lut  [[buffer(2)]], // 256 * 8 halfs
     device uint* out_words      [[buffer(3)]],
-    device atomic_float* metrics [[buffer(4)]], // [0]=sig, [1]=err
+    device float* metrics       [[buffer(4)]], // [tg * 2 + 0]=sig, [tg * 2 + 1]=err
     constant Tfq4MatParams& P   [[buffer(5)]],
     uint gtid                   [[thread_position_in_grid]],
+    uint tgid                   [[threadgroup_position_in_grid]],
     ushort tid                  [[thread_index_in_threadgroup]],
-    ushort lane                 [[thread_index_in_simdgroup]]
+    ushort lane                 [[thread_index_in_simdgroup]],
+    ushort sg                   [[simdgroup_index_in_threadgroup]]
 ) {
     threadgroup float sm_lut[256][8];
     for (uint d = 0u; d < 8u; ++d) sm_lut[tid][d] = float(e8p_lut[uint(tid) * 8u + d]);
@@ -138,9 +153,17 @@ kernel void tfq4_e8p_encode(
         out_words[gtid] = codes[0] | (codes[1] << 16);
     }
 
-    float sg_sig = simd_sum(my_sig), sg_err = simd_sum(my_err);
+    float sg_sig = det_simd_sum(my_sig), sg_err = det_simd_sum(my_err);
+    threadgroup float sm_sig[8], sm_err[8];
     if (lane == 0) {
-        atomic_fetch_add_explicit(&metrics[0], sg_sig, memory_order_relaxed);
-        atomic_fetch_add_explicit(&metrics[1], sg_err, memory_order_relaxed);
+        sm_sig[sg] = sg_sig;
+        sm_err[sg] = sg_err;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float bs = 0.0f, be = 0.0f;
+        for (uint w = 0u; w < 8u; ++w) { bs += sm_sig[w]; be += sm_err[w]; }
+        metrics[tgid * 2u + 0u] = bs;
+        metrics[tgid * 2u + 1u] = be;
     }
 }
