@@ -9,10 +9,15 @@ set -euo pipefail
 #   PREFIX        Install prefix (default: $HOME/.local -> installs $PREFIX/bin/tfq3)
 #   CUDA_ARCH     CUDA target arch on Linux (default: auto-detected via nvidia-smi or 'native')
 #   TFQ3_SRC_DIR  Source checkout path (default: $HOME/.local/share/tfq3/src)
-#   TFQ3_REF      Git branch or tag to install (default: main)
+#   TFQ3_REF      Git branch, tag or commit SHA to install (default: main)
+#   TFQ3_COMMIT   Optional full commit SHA; the install stops unless the checkout is exactly this commit
+#
+# Pinned install:
+#   curl -fsSL https://raw.githubusercontent.com/ashhart/TFQ/<sha>/install.sh | TFQ3_REF=<sha> TFQ3_COMMIT=<sha> bash
 
 REPO="${TFQ3_REPO:-https://github.com/ashhart/TFQ.git}"
 REF="${TFQ3_REF:-main}"
+COMMIT="${TFQ3_COMMIT:-}"
 PREFIX="${PREFIX:-$HOME/.local}"
 SRC_DIR="${TFQ3_SRC_DIR:-$HOME/.local/share/tfq3/src}"
 
@@ -25,6 +30,8 @@ need_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "missing required tool '$1'"
 }
 
+# Everything below runs from main() on the last line, so a truncated download (curl | bash) executes nothing.
+main() {
 need_cmd git
 need_cmd make
 need_cmd python3
@@ -42,10 +49,10 @@ elif [ "$OS" = "Linux" ]; then
     need_cmd g++
     if [ -z "${CUDA_ARCH:-}" ]; then
         if command -v nvidia-smi >/dev/null 2>&1; then
-            CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d ' .\r\n')"
-            if [[ "$CC" =~ ^[0-9]{2,3}$ ]]; then
+            if CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d ' .\r\n')" && [[ "$CC" =~ ^[0-9]{2,3}$ ]]; then
                 CUDA_ARCH="sm_${CC}"
             else
+                echo "install.sh: warning: nvidia-smi could not report a compute capability; building for -arch=native (set CUDA_ARCH=sm_XX if this host has no usable GPU)" >&2
                 CUDA_ARCH="native"
             fi
         else
@@ -61,11 +68,17 @@ fi
 mkdir -p "$(dirname "$SRC_DIR")"
 if [ -d "$SRC_DIR/.git" ]; then
     echo "==> Updating TFQ in ${SRC_DIR} (${REF})..."
-    git -C "$SRC_DIR" fetch --depth 1 origin "$REF"
-    git -C "$SRC_DIR" checkout -q FETCH_HEAD
 else
-    echo "==> Cloning TFQ into ${SRC_DIR}..."
-    git clone --depth 1 --branch "$REF" "$REPO" "$SRC_DIR"
+    echo "==> Cloning TFQ into ${SRC_DIR} (${REF})..."
+    git init -q "$SRC_DIR"
+    git -C "$SRC_DIR" remote add origin "$REPO"
+fi
+git -C "$SRC_DIR" fetch --depth 1 origin "$REF"
+git -C "$SRC_DIR" checkout -q FETCH_HEAD
+if [ -n "$COMMIT" ]; then
+    HEAD_SHA="$(git -C "$SRC_DIR" rev-parse HEAD)"
+    [ "$HEAD_SHA" = "$COMMIT" ] || die "checked out ${HEAD_SHA} for '${REF}', expected commit ${COMMIT}"
+    echo "==> Verified commit ${COMMIT}"
 fi
 
 echo "==> Building TFQ3 GPU converters and tools..."
@@ -90,3 +103,6 @@ echo ""
 echo "Get started:"
 echo "  tfq3 Qwen/Qwen3.8-27B"
 echo "  tfq3 Qwen/Qwen2.5-1.5B --bits 2 --quantize-embed"
+}
+
+main "$@"
