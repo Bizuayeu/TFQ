@@ -356,6 +356,77 @@ def test_cli_ernie(tfq3_cli: str, tmp: str) -> None:
     print("PASS CLI ERNIE (detection, --profile widths, BF16-only and --bits refusals)")
 
 
+def fp8_e4m3_to_f32(codes: np.ndarray) -> np.ndarray:
+    """The converters' fp8_e4m3_to_f32 (cuda_encode_common.cuh): E4M3 bytes to float32, 0x7F/0xFF to 0."""
+    c = codes.astype(np.int32)
+    s, e, m = (c >> 7) & 1, (c >> 3) & 15, c & 7
+    v = np.where(e == 0, np.ldexp(m.astype(np.float64), -9), np.ldexp(1.0 + m / 8.0, e - 7))
+    v = np.where((e == 15) & (m == 7), 0.0, v)
+    return np.where(s == 1, -v, v).astype(np.float32)
+
+
+def write_safetensors(path: str, tensors: list[tuple[str, str, list[int], bytes]]) -> None:
+    header, payload = {}, bytearray()
+    for name, dtype, shape, raw in tensors:
+        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [len(payload), len(payload) + len(raw)]}
+        payload.extend(raw)
+    hdr_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(hdr_bytes)))
+        f.write(hdr_bytes)
+        f.write(payload)
+
+
+def test_glm_bf16_source(inspect_bin: str, tmp: str) -> None:
+    """The GLM CUDA converter reads BF16 routed experts: the same values as FP8 (power-of-two block scales,
+    so every product is exact in BF16) give byte-identical layer shards; a wrong BF16 shape is refused."""
+    conv = os.path.join(REPO_ROOT, "build", "tfq3-glm-convert-cuda")
+    if platform.system() != "Linux" or not os.path.isfile(conv):
+        print("SKIP GLM BF16 source (needs Linux and build/tfq3-glm-convert-cuda)")
+        return
+    rng = np.random.default_rng(53)
+    n_exp, H, I = 4, 256, 128
+    prefix = "model.language_model.layers.3.mlp.experts"
+    fp8_t, bf16_t = [], []
+    for e in range(n_exp):
+        for proj, (R, C) in (("gate_proj", (I, H)), ("up_proj", (I, H)), ("down_proj", (H, I))):
+            codes = rng.integers(0, 256, size=(R, C), dtype=np.uint8)
+            codes[(codes & 0x7F) == 0x7F] = 0x38  # no NaN codes: both sides would read them as 0
+            scale = np.ldexp(1.0, -rng.integers(6, 10, size=(R // 128, C // 128))).astype(np.float32)
+            value = fp8_e4m3_to_f32(codes) * np.kron(scale, np.ones((128, 128), dtype=np.float32))
+            u32 = value.view(np.uint32)
+            assert not np.any(u32 & np.uint32(0xFFFF)), "the FP8 x scale values must be exact in BF16"
+            name = f"{prefix}.{e}.{proj}.weight"
+            fp8_t.append((name, "F8_E4M3", [R, C], codes.tobytes()))
+            fp8_t.append((f"{prefix}.{e}.{proj}.weight_scale_inv", "F32", [R // 128, C // 128], scale.tobytes()))
+            bf16_t.append((name, "BF16", [R, C], (u32 >> np.uint32(16)).astype(np.uint16).tobytes()))
+    trace = os.path.join(tmp, "glm_trace.txt")
+    with open(trace, "w", encoding="utf-8") as f:
+        f.writelines(f"LAYER 3 E{e} {10 * (e + 1)}\n" for e in range(n_exp))
+    outs = {}
+    for label, tensors in (("fp8", fp8_t), ("bf16", bf16_t)):
+        src = os.path.join(tmp, f"glm_{label}")
+        os.makedirs(src)
+        write_safetensors(os.path.join(src, "model.safetensors"), tensors)
+        out = os.path.join(tmp, f"glm_{label}_out")
+        log = run([conv, "--model", src, "--out", out, "--mode", "uniform4", "--layers", "3", "3", "--trace", trace]).stdout
+        assert f"src={'BF16' if label == 'bf16' else 'F8_E4M3'}" in log, log
+        run([inspect_bin, "-v", out])
+        outs[label] = out
+    for fn in ("layer_03.tffpw", "pw_v3_tables.bin"):
+        a = open(os.path.join(outs["fp8"], fn), "rb").read()
+        b = open(os.path.join(outs["bf16"], fn), "rb").read()
+        assert a == b, f"GLM BF16 source: {fn} differs from the FP8 source's ({len(a)} vs {len(b)} B)"
+    bad = os.path.join(tmp, "glm_bf16_bad")
+    os.makedirs(bad)
+    # expert 0's down_proj declared [I, H] instead of [H, I]: the same bytes, the wrong shape
+    write_safetensors(os.path.join(bad, "model.safetensors"),
+                      bf16_t[:2] + [(bf16_t[2][0], "BF16", [I, H], bf16_t[2][3])] + bf16_t[3:])
+    run([conv, "--model", bad, "--out", os.path.join(tmp, "glm_bf16_bad_out"), "--mode", "uniform4",
+         "--layers", "3", "3", "--trace", trace], expect_ok=False)
+    print("PASS GLM BF16 source: byte-identical to the FP8 source, wrong BF16 shape refused")
+
+
 def find_shard_for_tensor(out_dir: str, ext: str, tensor_name: str) -> str:
     for fp in sorted(glob.glob(os.path.join(out_dir, f"*{ext}"))):
         with open(fp, "rb") as f:
@@ -965,6 +1036,7 @@ def main() -> None:
         test_install_script(tmp)
         if not args.no_gpu:
             test_gpu_roundtrips(tfq3_cli, inspect_bin, model_dir, refs, tmp)
+            test_glm_bf16_source(inspect_bin, tmp)
         test_cli_ernie(tfq3_cli, tmp)
 
     print("ALL E2E TESTS PASSED")
