@@ -6,7 +6,7 @@ Verifies:
   1. Pure-Python reference codecs (`tfq3_reference.py`, `tfq4_lattice.py`)
   2. Strict `tfq3-inspect` validation on valid + corrupted PWV3 / PWV4 / TFPN / TFP4 files
      (bad magic, truncation, 16 KiB misalignment, section overlap, NaN/negative LUTs, duplicate names)
-  3. CLI behavior (`bin/tfq3 --version`, `--help`, `doctor`, invalid `--bits` rejection, `--dry-run`)
+  3. CLI behavior (`bin/tfq3 --version`, `--help`, `doctor`, invalid `--bits` rejection, `--dry-run`, ERNIE detection)
   4. Full GPU converter round-trips (Metal on macOS / CUDA on Linux):
      - Multi-dtype Safetensors input (BF16, F16, F32 + 1D residuals)
      - Non-128-multiple zero-padding (`[192, 256]` -> `[256, 256]`)
@@ -306,6 +306,37 @@ def test_cli_basics(tfq3_cli: str, model_dir: str) -> None:
     # Reject invalid --bits
     run([tfq3_cli, model_dir, "--bits", "9", "--dry-run"], expect_ok=False)
     print("PASS CLI basics (--version, --help, doctor, invalid --bits rejection)")
+
+
+def test_cli_ernie(tfq3_cli: str, tmp: str) -> None:
+    # ERNIE detection and plan, against stub binaries (the converter is CUDA-only and not built here)
+    src = os.path.join(tmp, "ernie_bf16")
+    lib = os.path.join(tmp, "ernie_lib")
+    os.makedirs(src)
+    os.makedirs(lib)
+    cfg = {"model_type": "ernie5_5_moe", "num_hidden_layers": 43}
+    with open(os.path.join(src, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    for name in ("tfq3-ernie-convert-cuda", "tfq3-inspect"):
+        p = os.path.join(lib, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(p, 0o755)
+    env = dict(os.environ, TFQ3_LIB_DIR=lib)
+    if platform.system() == "Darwin":
+        run([tfq3_cli, src, "--dry-run"], expect_ok=False, env=env)
+        print("PASS CLI ERNIE (refused on Metal)")
+        return
+    out = run([tfq3_cli, src, "--dry-run"], env=env).stdout
+    assert "family:   ernie" in out and "--layers 1 42 --bits 4" in out, out
+    assert "--layers 1 42 --bits 3" in run([tfq3_cli, src, "--profile", "3b", "--dry-run"], env=env).stdout
+    run([tfq3_cli, src, "--profile", "3.5b", "--dry-run"], expect_ok=False, env=env)
+    run([tfq3_cli, src, "--family", "ernie", "--bits", "4", "--dry-run"], expect_ok=False, env=env)
+    cfg["quantization_config"] = {"quant_method": "fp8", "expert_dtype": "mxfp4"}
+    with open(os.path.join(src, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    run([tfq3_cli, src, "--dry-run"], expect_ok=False, env=env)
+    print("PASS CLI ERNIE (detection, --profile widths, BF16-only and --bits refusals)")
 
 
 def find_shard_for_tensor(out_dir: str, ext: str, tensor_name: str) -> str:
@@ -688,6 +719,7 @@ def main() -> None:
         test_planner_write_errors(model_dir, tmp)
         if not args.no_gpu:
             test_gpu_roundtrips(tfq3_cli, inspect_bin, model_dir, refs, tmp)
+        test_cli_ernie(tfq3_cli, tmp)
 
     print("ALL E2E TESTS PASSED")
 
