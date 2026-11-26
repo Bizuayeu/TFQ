@@ -71,8 +71,8 @@ static_assert(sizeof(NonMoeTensorMeta) == 128, "NonMoeTensorMeta must be 128 byt
 struct MatParams { uint32_t R, C, b_bits; float shrink; uint32_t r_off, pad0; };
 struct EncParams { uint32_t R, C, b_bits, stream_off, n_streams; };
 
-static inline void load_or_generate_tables(const std::string& path, PwV3TablesFile& tbl) {
-    tfq_tables::load_or_write_pwv3_tables(path, tbl, false);
+static inline void load_or_generate_tables(const std::string& path, PwV3TablesFile& tbl, bool explicit_tables = false) {
+    tfq_tables::load_or_write_pwv3_tables(path, tbl, explicit_tables);
 }
 
 static inline std::vector<uint16_t> build_grid(const uint32_t* lut_u32, int lut_size, int N_sym, int C_shift, int G, int KC) {
@@ -249,11 +249,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     mkdir(out_dir.c_str(), 0755);
+    const bool explicit_tables = !tables_path.empty();
     std::string dst_tables = out_dir + "/pw_v3_tables.bin";
-    if (tables_path.empty()) tables_path = dst_tables;
+    if (!explicit_tables) tables_path = dst_tables;
 
     PwV3TablesFile tbl;
-    load_or_generate_tables(tables_path, tbl);
+    load_or_generate_tables(tables_path, tbl, explicit_tables);
     if (tables_path != dst_tables) {
         FILE* fo = fopen(dst_tables.c_str(), "wb");
         if (!fo) { fprintf(stderr, "Cannot write %s\n", dst_tables.c_str()); return 1; }

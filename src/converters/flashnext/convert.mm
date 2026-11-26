@@ -79,8 +79,8 @@ struct MatParams { uint32_t R, C, b_bits; float shrink; uint32_t r_off, pad0; };
 struct EncParams { uint32_t R, C, b_bits, stream_off, n_streams; };
 struct PleParams { uint32_t rows, cols, dst_bits, pad; };
 
-static inline void load_or_generate_tables(const std::string& path, PwV3TablesFile& tbl) {
-    tfq_tables::load_or_write_pwv3_tables(path, tbl, false);
+static inline void load_or_generate_tables(const std::string& path, PwV3TablesFile& tbl, bool explicit_tables = false) {
+    tfq_tables::load_or_write_pwv3_tables(path, tbl, explicit_tables);
 }
 
 static inline std::vector<uint16_t> build_grid(const uint32_t* lut_u32, int lut_size, int N_sym, int C_shift, int G, int KC) {
@@ -368,9 +368,10 @@ int main(int argc, char** argv) {
         // ====================================================================
         // MODE 2: MOE LAYER CONVERSION (H=2560, I=640, E=512 -> layer_XX.tffpw / mtp_00.tffpw)
         // ====================================================================
-        if (tables_path.empty()) tables_path = out_dir + "/pw_v3_tables.bin";
+        const bool explicit_tables = !tables_path.empty();
+        if (!explicit_tables) tables_path = out_dir + "/pw_v3_tables.bin";
         PwV3TablesFile tbl;
-        load_or_generate_tables(tables_path, tbl);
+        load_or_generate_tables(tables_path, tbl, explicit_tables);
 
         auto grid3 = build_grid(tbl.lut3_u32,  256,   64, 2, 16,  8);
         auto grid4 = build_grid(tbl.lut4_u32, 1024,  256, 2, 16, 10);

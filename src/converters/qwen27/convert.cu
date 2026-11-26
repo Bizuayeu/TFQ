@@ -66,11 +66,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     mkdir(out_dir.c_str(), 0755);
+    const bool explicit_tables = !tables_path.empty();
     std::string dst_tables = out_dir + "/pw_v3_tables.bin";
-    if (tables_path.empty()) tables_path = dst_tables;
+    if (!explicit_tables) tables_path = dst_tables;
 
     PwV3TablesFile tbl;
-    load_or_generate_tables(tables_path, tbl);
+    load_or_generate_tables(tables_path, tbl, explicit_tables);
     if (tables_path != dst_tables) {
         FILE* fo = fopen(dst_tables.c_str(), "wb");
         if (!fo) { fprintf(stderr, "Cannot write %s\n", dst_tables.c_str()); return 1; }

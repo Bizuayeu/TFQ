@@ -68,10 +68,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     mkdir(out_dir.c_str(), 0755);
-    if (tables_path.empty()) tables_path = out_dir + "/pw_v3_tables.bin";
+    const bool explicit_tables = !tables_path.empty();
+    if (!explicit_tables) tables_path = out_dir + "/pw_v3_tables.bin";
 
     PwV3TablesFile tbl;
-    load_or_generate_tables(tables_path, tbl);
+    load_or_generate_tables(tables_path, tbl, explicit_tables);
     auto grid3 = build_grid(tbl.lut3_u32,  256,   64, 2, 16,  8);
     auto grid4 = build_grid(tbl.lut4_u32, 1024,  256, 2, 16, 10);
     auto grid5 = build_grid(tbl.lut5_u32, 1024, 1024, 0, 32, 12);
