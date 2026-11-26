@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 *.tffpw
 pw_v3_tables.bin
+!reference/tables/pw_v3_tables.bin
