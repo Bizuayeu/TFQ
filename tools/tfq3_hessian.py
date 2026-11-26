@@ -502,7 +502,12 @@ def quantize_tfq3_matrix(
         if H_inv is not None and (c_blk + 128) < C:
             sc_rows = scales[:, cb].repeat_interleave(128)[:, None]
             E_blk = W_rot[:, c_blk : c_blk + 128] - Q_unit[:, c_blk : c_blk + 128] * sc_rows
-            W_rot[:, c_blk + 128 :] -= E_blk @ ldlq_gain(U_inv, c_blk, c_blk + 128, out_device=device)
+            if device.type == "mps":
+                # Avoid compiling dozens of shrinking-width MPSGraph matmuls (MLIR StorageUniquer crash).
+                gain = ldlq_gain(U_inv, c_blk, c_blk + 128).to(torch.float32)
+                W_rot[:, c_blk + 128 :] -= (E_blk.detach().cpu() @ gain).to(device)
+            else:
+                W_rot[:, c_blk + 128 :] -= E_blk @ ldlq_gain(U_inv, c_blk, c_blk + 128, out_device=device)
 
     # Optional closed-form per-128x128-tile Hessian scale refinement (exact same single fp16 scale!)
     if refine_scales:
@@ -563,8 +568,12 @@ def quantize_tfq4_matrix(
     Quantize a 2D weight matrix W [R, C] into exact TFQ4-E8P (`TFP4` v4, 2.001 bpw) packed words & fp16 scales.
     Supports both 100% data-free (H=None) and Hessian-LDLQ (H=[C, C] with 8-col subtile error feedback).
     """
-    device = W_orig.device
-    W_pad, orig_R, orig_C = pad_weight_128(W_orig)
+    orig_device = W_orig.device
+    # On Apple MPS, the 8-column LDLQ loop creates C/8 (~1,120) distinct shrinking matmul shapes,
+    # triggering Apple MPSGraph MLIR StorageUniquer crashes; CPU Accelerate BLAS is both faster and crash-free.
+    device = torch.device("cpu") if orig_device.type == "mps" else orig_device
+    W_work = W_orig.detach().to(device=device, dtype=torch.float32)
+    W_pad, orig_R, orig_C = pad_weight_128(W_work)
     R, C = W_pad.shape
     n_br, n_bc = R // 128, C // 128
 
@@ -576,7 +585,7 @@ def quantize_tfq4_matrix(
     if precomputed_h is not None:
         H_rot, H_inv = precomputed_h[0].to(device), precomputed_h[1].to(device)
     elif H is not None:
-        H_pad = pad_hessian_128(H, C)
+        H_pad = pad_hessian_128(H.to(device), C)
         H_rot = rotate_hessian_torch(H_pad)
         H_inv = compute_h_inv_cholesky(H_rot, damp=damp)
     U_inv = ldlq_upper_factor(H_inv) if H_inv is not None else None
@@ -654,7 +663,7 @@ def quantize_tfq4_matrix(
         )
 
     return {
-        "W_hat": W_hat,
+        "W_hat": W_hat.to(orig_device),
         "scales": scales_f16.detach().cpu().numpy(),
         "words": words,
         "weight_snr_db": w_snr,
