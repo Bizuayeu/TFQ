@@ -222,7 +222,8 @@ static inline uint64_t write_tfp4_shard(
     if (!words.empty()) ofs.write(reinterpret_cast<const char*>(words.data()), (std::streamsize)(words.size() * 4ull));
     pos = off_wt + (uint64_t)words.size() * 4ull;
     if (tot_sz > pos) ofs.write(zeros.data(), (std::streamsize)(tot_sz - pos));
-    if (!ofs.good()) {
+    ofs.close();
+    if (ofs.fail()) {
         fprintf(stderr, "Write error on TFP4 shard: %s\n", path.c_str());
         std::exit(1);
     }

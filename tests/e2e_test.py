@@ -291,6 +291,17 @@ def test_gpu_roundtrips(tfq3_cli: str, inspect_bin: str, model_dir: str, refs: d
         )
         print(f"PASS TFQ3 {bits}b GPU round-trip: padded={snr_valid:.2f} dB, chunk0={snr_chunk0:.2f} dB, chunk1(r>=4096)={snr_chunk1:.2f} dB")
 
+    # 1b. A shard write on a full disk must fail the conversion
+    if os.path.exists("/dev/full"):
+        for conv, shard, extra in ((gen_bin, "tfq3-00001-of-00001.tffpw", ["--bits", "4"]),
+                                   (tfq4_bin, "tfq4-00001-of-00002.tffp4", ["--max-shard-gib", "0.001"])):
+            out_full = os.path.join(tmp, "out_full_" + shard.split("-")[0])
+            os.makedirs(out_full)
+            os.symlink("/dev/full", os.path.join(out_full, shard))
+            proc = run([conv, "--model", model_dir, "--out", out_full] + extra, expect_ok=False)
+            assert "Write error" in proc.stderr, proc.stderr
+        print("PASS shard write on a full disk fails the TFQ3 and TFQ4 conversions")
+
     # 2. TFQ3 --target-gib dry-run plan check
     dry = run([tfq3_cli, model_dir, "--target-gib", "0.01", "--dry-run"])
     assert "TFQ3 Generic Plan" in dry.stdout
@@ -537,6 +548,43 @@ def test_planner_budget_minimum(tmp: str) -> None:
     print("PASS planner refuses a --target-gib below the 3-bit minimum: " + low.stderr.strip())
 
 
+def test_planner_write_errors(model_dir: str, tmp: str) -> None:
+    """A failed residual/manifest write (disk full) must end with a nonzero exit, not a silent success."""
+    if not os.path.exists("/dev/full"):
+        print("SKIP planner write-error test (no /dev/full)")
+        return
+    cxx = "clang++" if platform.system() == "Darwin" else "g++"
+    src = os.path.join(tmp, "test_planner_write.cpp")
+    exe = os.path.join(tmp, "test_planner_write")
+    hdr = os.path.join(REPO_ROOT, "src", "converters", "generic", "planner.hpp")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(
+            f'#include "{hdr}"\n'
+            'int main(int, char** argv) {\n'
+            '    using namespace tfq_generic;\n'
+            '    SafetensorsDir st;\n'
+            '    st.init(argv[1]);\n'
+            '    GenericOptions opt;\n'
+            '    opt.model_dir = argv[1];\n'
+            '    opt.out_dir = argv[2];\n'
+            '    ConversionPlan plan = build_plan(st, opt);\n'
+            '    package_residuals_and_manifest(st, opt, plan, {"tfq3-00001-of-00001.tffpw"});\n'
+            '    return 0;\n'
+            '}\n'
+        )
+    run([cxx, "-O2", "-std=c++17", "-Wall", "-Wextra", "-Werror", src, "-o", exe])
+    ok_dir = os.path.join(tmp, "write_ok")
+    os.makedirs(ok_dir)
+    run([exe, model_dir, ok_dir])
+    for target in ("residual.safetensors", "tfq3_manifest.json", "config.json"):
+        out_dir = os.path.join(tmp, "write_full_" + target.split(".")[0])
+        os.makedirs(out_dir)
+        os.symlink("/dev/full", os.path.join(out_dir, target))
+        proc = run([exe, model_dir, out_dir], expect_ok=False)
+        assert "Write error" in proc.stderr, proc.stderr
+    print("PASS planner write errors (residual, manifest, config copy on a full disk) exit nonzero")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-gpu", action="store_true", help="Skip GPU converter round-trips (for headless CI runners)")
@@ -559,6 +607,7 @@ def main() -> None:
         test_planner_budget_minimum(tmp)
         test_inspector_negative_controls(inspect_bin, tmp)
         test_cli_basics(tfq3_cli, model_dir)
+        test_planner_write_errors(model_dir, tmp)
         if not args.no_gpu:
             test_gpu_roundtrips(tfq3_cli, inspect_bin, model_dir, refs, tmp)
 

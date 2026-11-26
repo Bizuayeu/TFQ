@@ -626,11 +626,26 @@ static inline void decode_chunk_to_f32(
     }
 }
 
+// Output writes: a short write or failed close (e.g. disk full) must stop the conversion with a nonzero exit.
+static inline void fwrite_or_die(const void* p, size_t n, FILE* f, const std::string& path) {
+    if (n && fwrite(p, 1, n, f) != n) { fprintf(stderr, "Write error on %s\n", path.c_str()); exit(1); }
+}
+
+static inline void fclose_or_die(FILE* f, const std::string& path) {
+    if (fclose(f) != 0) { fprintf(stderr, "Write error on %s\n", path.c_str()); exit(1); }
+}
+
+static inline void close_or_die(std::ofstream& f, const std::string& path) {
+    f.close();
+    if (f.fail()) { fprintf(stderr, "Write error on %s\n", path.c_str()); exit(1); }
+}
+
 static inline void copy_file_if_exists(const std::string& src, const std::string& dst) {
     std::ifstream in(src, std::ios::binary);
     if (!in.good()) return;
     std::ofstream out(dst, std::ios::binary);
-    out << in.rdbuf();
+    if (in.peek() != std::ifstream::traits_type::eof()) out << in.rdbuf();
+    close_or_die(out, dst);
 }
 
 // Package all residual tensors into residual.safetensors (sharded if > 3.4 GiB), copy config/tokenizer, write manifest.
@@ -689,23 +704,25 @@ static inline void package_residuals_and_manifest(
             std::string full = opt.out_dir + "/" + fn;
             FILE* fout = fopen(full.c_str(), "wb");
             if (!fout) { fprintf(stderr, "Cannot write %s\n", full.c_str()); exit(1); }
-            fwrite(&hlen, 8, 1, fout);
-            fwrite(hb.data(), 1, hb.size(), fout);
+            fwrite_or_die(&hlen, 8, fout, full);
+            fwrite_or_die(hb.data(), hb.size(), fout, full);
             for (const auto& name : groups[gi]) {
                 const auto& ti = st.tensors.at(name);
-                if (ti.len > 0) fwrite(st.data_ptr(ti), 1, ti.len, fout);
+                fwrite_or_die(st.data_ptr(ti), ti.len, fout, full);
             }
-            fclose(fout);
+            fclose_or_die(fout, full);
         }
 
         if (groups.size() > 1) {
-            std::ofstream idx(opt.out_dir + "/model.safetensors.index.json");
+            std::string idx_path = opt.out_dir + "/model.safetensors.index.json";
+            std::ofstream idx(idx_path);
             idx << "{\n  \"metadata\": {\"total_size\": " << plan.residual_bytes << "},\n  \"weight_map\": {\n";
             size_t k = 0;
             for (const auto& kv : weight_map) {
                 idx << "    \"" << kv.first << "\": \"" << kv.second << "\"" << (++k < weight_map.size() ? "," : "") << "\n";
             }
             idx << "  }\n}\n";
+            close_or_die(idx, idx_path);
         }
     }
 
@@ -720,7 +737,8 @@ static inline void package_residuals_and_manifest(
     }
 
     // 3. Write manifest JSON for cross-platform engines and tooling.
-    std::ofstream mf(opt.out_dir + "/" + manifest_file);
+    std::string mf_path = opt.out_dir + "/" + manifest_file;
+    std::ofstream mf(mf_path);
     mf << "{\n";
     mf << "  \"format\": \"" << format_name << "\",\n";
     mf << "  \"version\": " << format_version << ",\n";
@@ -750,6 +768,7 @@ static inline void package_residuals_and_manifest(
            << ",\"snr_db\":" << j.snr_db << "}" << (i + 1 < plan.jobs.size() ? "," : "") << "\n";
     }
     mf << "  ]\n}\n";
+    close_or_die(mf, mf_path);
 }
 
 static inline void print_plan_summary(const GenericOptions& opt, const ConversionPlan& plan) {

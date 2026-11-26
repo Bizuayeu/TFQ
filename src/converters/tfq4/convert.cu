@@ -237,8 +237,10 @@ int main(int argc, char** argv) {
     tfq4::PwV4E8Tables tbl;
     tfq4::build_e8p_tables(tbl);
     {
-        std::ofstream tf(fs::path(opt.out_dir) / "pw_v4_e8p_tables.bin", std::ios::binary);
+        std::string tf_path = (fs::path(opt.out_dir) / "pw_v4_e8p_tables.bin").string();
+        std::ofstream tf(tf_path, std::ios::binary);
         tf.write(reinterpret_cast<const char*>(&tbl), sizeof(tbl));
+        tfq_generic::close_or_die(tf, tf_path);
     }
 
     uint32_t max_pad_C = 128u;

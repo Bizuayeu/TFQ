@@ -23,18 +23,18 @@ static void write_tfpn_shard(const std::string& path, const std::vector<TfpnTens
     std::vector<uint8_t> zeros(ALIGN_16K, 0);
     FILE* fout = fopen(path.c_str(), "wb");
     if (!fout) { fprintf(stderr, "Cannot write %s\n", path.c_str()); exit(1); }
-    fwrite(&hdr, 1, sizeof(hdr), fout);
-    fwrite(metas.data(), sizeof(TfpnTensorMeta), metas.size(), fout);
+    fwrite_or_die(&hdr, sizeof(hdr), fout, path);
+    fwrite_or_die(metas.data(), metas.size() * sizeof(TfpnTensorMeta), fout, path);
     size_t p1 = off_scales - (off_meta + metas.size() * sizeof(TfpnTensorMeta));
-    if (p1) fwrite(zeros.data(), 1, p1, fout);
-    fwrite(scales.data(), 2, scales.size(), fout);
+    fwrite_or_die(zeros.data(), p1, fout, path);
+    fwrite_or_die(scales.data(), scales.size() * 2ULL, fout, path);
     size_t p2 = off_weights - (off_scales + scales.size() * 2ULL);
-    if (p2) fwrite(zeros.data(), 1, p2, fout);
-    fwrite(weights.data(), 4, weights.size(), fout);
+    fwrite_or_die(zeros.data(), p2, fout, path);
+    fwrite_or_die(weights.data(), weights.size() * 4ULL, fout, path);
     size_t end_pos = off_weights + weights.size() * 4ULL;
     size_t pe = (size_t)align16k(end_pos) - end_pos;
-    if (pe) fwrite(zeros.data(), 1, pe, fout);
-    fclose(fout);
+    fwrite_or_die(zeros.data(), pe, fout, path);
+    fclose_or_die(fout, path);
 }
 
 int main(int argc, char** argv) {
