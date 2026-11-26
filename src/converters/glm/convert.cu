@@ -17,6 +17,16 @@ static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_
                 if (!counts.count(lyr)) counts[lyr].assign(n_exp, 0);
                 if (eid >= 0 && eid < n_exp) counts[lyr][eid] += (int)cnt;
             }
+        } else {
+            // Also accept raw routing trace rows: "<tok_idx> <layer_idx> <e0> <e1> ... <ek>"
+            std::istringstream iss(line);
+            long long tok = 0; int lyr = -1, eid = -1;
+            if ((iss >> tok >> lyr) && lyr >= 0) {
+                while (iss >> eid) {
+                    if (!counts.count(lyr)) counts[lyr].assign(n_exp, 0);
+                    if (eid >= 0 && eid < n_exp) counts[lyr][eid] += 1;
+                }
+            }
         }
     }
     std::map<int, std::vector<int>> ranks;
@@ -35,7 +45,7 @@ static std::map<int, std::vector<int>> load_heat_ranks(const std::string& trace_
 int main(int argc, char** argv) {
     std::string model_dir = "", out_dir = "", trace_path = "", tables_path = "", mode = "heat43";
     int l_start = 3, l_end = 44;
-    bool skip_existing = false, shared_pw4 = true, fast4b = false, head_pw5 = false;
+    bool skip_existing = false, shared_pw4 = true, fast4b = false, head_pw5 = false, all_pw5 = false, skip_head = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -50,9 +60,11 @@ int main(int argc, char** argv) {
         else if (a == "--shared-pw5") shared_pw4 = false;
         else if (a == "--fast4b") fast4b = true;
         else if (a == "--head-pw5") head_pw5 = true;
+        else if (a == "--all-pw5") { all_pw5 = true; shared_pw4 = false; head_pw5 = true; }
+        else if (a == "--skip-head") skip_head = true;
     }
     if (model_dir.empty() || out_dir.empty()) {
-        fprintf(stderr, "Usage: %s --model <dir> --out <dir> [--mode heat543|heat43|heat443|uniform4|uniform3|nonmoe] [--layers S E] [--trace <file>] [--fast4b] [--shared-pw5] [--head-pw5] [--skip-existing] [--tables <path>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s --model <dir> --out <dir> [--mode heat543|heat43|heat443|uniform4|uniform3|nonmoe] [--layers S E] [--trace <file>] [--fast4b] [--shared-pw5] [--head-pw5] [--all-pw5] [--skip-head] [--skip-existing] [--tables <path>]\n", argv[0]);
         return 1;
     }
     mkdir(out_dir.c_str(), 0755);
@@ -87,22 +99,23 @@ int main(int argc, char** argv) {
     if (mode == "nonmoe") {
         struct Task { std::string name; uint32_t R, C, bits; };
         std::vector<Task> tasks;
-        const uint32_t nb_proj = fast4b ? 4u : 5u;
-        const uint32_t nb_head = (fast4b && !head_pw5) ? 4u : 5u;
+        const uint32_t nb_qkv  = all_pw5 ? 5u : 4u;
+        const uint32_t nb_proj = (fast4b && !all_pw5) ? 4u : 5u;
+        const uint32_t nb_head = (fast4b && !head_pw5 && !all_pw5) ? 4u : 5u;
         for (int l = 0; l < 45; ++l) {
             char p[160];
             snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.q_proj", l);
             if (cache.has_tensor(std::string(p) + ".weight")) {
                 for (const char* s : {"q_proj", "k_proj", "v_proj"}) {
                     snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.%s", l, s);
-                    tasks.push_back({p, 8192, 4096, 4});
+                    tasks.push_back({p, 8192, 4096, nb_qkv});
                 }
                 snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.o_proj", l);
                 tasks.push_back({p, 4096, 8192, nb_proj});
             } else {
                 snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.q_b_proj", l);
                 if (cache.has_tensor(std::string(p) + ".weight")) tasks.push_back({p, 16384, 1536, nb_proj});
-                if (fast4b) {
+                if (fast4b || all_pw5) {
                     snprintf(p, sizeof(p), "model.language_model.layers.%d.self_attn.indexer.wq_b", l);
                     if (cache.has_tensor(std::string(p) + ".weight")) tasks.push_back({p, 4096, 1536, nb_proj});
                 }
@@ -113,7 +126,7 @@ int main(int argc, char** argv) {
                 snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.gate_proj", l); tasks.push_back({p, 12288, 4096, nb_proj});
                 snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.up_proj",   l); tasks.push_back({p, 12288, 4096, nb_proj});
                 snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.down_proj", l); tasks.push_back({p, 4096, 12288, nb_proj});
-            } else if (fast4b && l >= 3 && l < 7) {
+            } else if ((fast4b || all_pw5) && l >= 3 && l < 7) {
                 snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", l); tasks.push_back({p, 2048, 4096, 5});
                 snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.shared_experts.up_proj",   l); tasks.push_back({p, 2048, 4096, 5});
                 snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.shared_experts.down_proj", l); tasks.push_back({p, 4096, 2048, 5});
@@ -124,7 +137,7 @@ int main(int argc, char** argv) {
                 snprintf(p, sizeof(p), "model.language_model.layers.%d.mlp.shared_experts.down_proj", l); tasks.push_back({p, 4096, 2048, sb});
             }
         }
-        tasks.push_back({"lm_head", 154880, 4096, nb_head});
+        if (!skip_head) tasks.push_back({"lm_head", 154880, 4096, nb_head});
 
         const size_t MAX_E = 16384ULL * 4096ULL;
         uint8_t *d_q8w; uint16_t *d_q8s, *d_q8b; float *d_tmp, *d_rot, *d_ss, *d_str, *d_se;
