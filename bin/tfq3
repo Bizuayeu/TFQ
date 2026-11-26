@@ -16,8 +16,8 @@ Usage:
 
 Options:
   -o, --out DIR              Output directory (default: <model>-TFQ3, or <model>-TFQ4 for --bits 2)
-  --family NAME              auto | generic | qwen27 | flashnext | glm (default: auto)
-  --profile PROFILE          Bit profile: 4b | 3.5b | 3b | 5b (default: 4b)
+  --family NAME              auto | generic | qwen27 | flashnext | glm | ernie (default: auto)
+  --profile PROFILE          Bit profile: 4b | 3.5b | 3b | 5b (default: 4b; ERNIE: 3b | 4b | 5b)
   --bits N                   Uniform bit width for generic converter: 2 (TFQ4-E8P) | 3 | 4 | 5
   --target-gib GB            Fit total checkpoint into GB via data-free sensitivity allocation
   --fit auto|GB              Auto-size to local GPU memory budget (or explicit GB)
@@ -221,7 +221,9 @@ elif mt == "qwen4_exp":
     family = "flashnext"
 elif mt in ("glm5_next", "glm_moe_dsa"):
     family = "glm"
-nl = tc.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0
+elif mt == "ernie5_5_moe":
+    family = "ernie"
+nl =tc.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0
 mtp = cfg.get("num_nextn_predict_layers") or 0
 if mt == "glm_moe_dsa":
     nl = int(nl) + int(mtp)
@@ -261,7 +263,10 @@ run_doctor() {
         fi
     fi
     echo "lib_dir:  ${lib_dir}"
-    for b in "tfq3-generic-convert${suffix}" "tfq4-convert${suffix}" "tfq3-qwen27-convert${suffix}" "tfq3-qwen27-package" "tfq3-flashnext-convert${suffix}" "tfq3-glm-convert${suffix}" "tfq3-inspect"; do
+    local bins=("tfq3-generic-convert${suffix}" "tfq4-convert${suffix}" "tfq3-qwen27-convert${suffix}" "tfq3-qwen27-package" "tfq3-flashnext-convert${suffix}" "tfq3-glm-convert${suffix}")
+    [ "$(uname -s)" = "Darwin" ] || bins+=("tfq3-ernie-convert-cuda")  # CUDA only, no Metal build
+    bins+=("tfq3-inspect")
+    for b in "${bins[@]}"; do
         if [ -x "$lib_dir/$b" ]; then
             if [ "$(uname -s)" = "Darwin" ] && [[ "$b" == *-convert ]] && [ ! -f "$lib_dir/${b}.metallib" ]; then
                 echo "  [warn]  $b (missing ${b}.metallib)"
@@ -539,16 +544,38 @@ run_convert() {
             fi
             run_cmd "$inspect_bin" "$out_dir"
             ;;
+        ernie)
+            [ "$(uname -s)" != "Darwin" ] || die "the ERNIE converter is CUDA-only (there is no Metal build)"
+            [ "$fmt_kind" != "fp8" ] || die "ERNIE needs the BF16 checkpoint (e.g. baidu/ERNIE-5.5-Flash-Preview-BF16); ${src_dir} is quantized"
+            [ -z "$bits_override" ] || die "for ERNIE, set the expert width with --profile 3b|4b|5b instead of --bits"
+            local ernie_bits
+            case "$profile" in 3b|4b|5b) ernie_bits="${profile%b}" ;; *) die "invalid --profile '${profile}' for ERNIE (expected 3b, 4b, or 5b)" ;; esac
+            local conv_bin
+            conv_bin="$(require_tool "$lib_dir" "tfq3-ernie-convert-cuda")"
+            local extra_flags=()
+            [ "$skip_existing" -eq 1 ] && extra_flags+=(--skip-existing)
+            echo "  profile:  ${profile} (uniform ${ernie_bits}-bit routed experts)"
+            echo ""
+            echo "=== [1/2] Quantizing routed MoE experts (L1-L42: uniform ${ernie_bits}-bit) ==="
+            run_cmd "$conv_bin" --model "$src_dir" --out "$out_dir" --layers 1 42 --bits "$ernie_bits" ${extra_flags[@]+"${extra_flags[@]}"}
+            echo "=== [2/2] Validating TFQ3 output ==="
+            run_cmd "$inspect_bin" "$out_dir"
+            ;;
         *)
-            die "unknown family '${family}' (expected auto, generic, qwen27, flashnext, or glm)"
+            die "unknown family '${family}' (expected auto, generic, qwen27, flashnext, glm, or ernie)"
             ;;
     esac
 
     if [ "$DRY_RUN" -eq 0 ]; then
         echo ""
-        echo "${fmt_tag} checkpoint ready: ${out_dir}"
-        echo "Serve on Mac (Metal) or NVIDIA GPU (CUDA) with TensorFold:"
-        echo "  tensorfold serve ${out_dir}"
+        if [ "$family" = "ernie" ]; then
+            echo "${fmt_tag} routed experts ready: ${out_dir}"
+            echo "Every other tensor stays in the source checkpoint."
+        else
+            echo "${fmt_tag} checkpoint ready: ${out_dir}"
+            echo "Serve on Mac (Metal) or NVIDIA GPU (CUDA) with TensorFold:"
+            echo "  tensorfold serve ${out_dir}"
+        fi
     fi
 }
 

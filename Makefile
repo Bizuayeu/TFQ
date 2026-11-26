@@ -167,7 +167,7 @@ ifeq ($(UNAME_S),Darwin)
 	@install -m 0755 $(BUILD)/tfq3-generic-convert $(BUILD)/tfq3-qwen27-convert $(BUILD)/tfq3-flashnext-convert $(BUILD)/tfq3-glm-convert $(BUILD)/tfq4-convert "$(LIBDIR)/"
 	@install -m 0644 $(BUILD)/tfq3-generic-convert.metallib $(BUILD)/tfq3-qwen27-convert.metallib $(BUILD)/tfq3-flashnext-convert.metallib $(BUILD)/tfq3-glm-convert.metallib $(BUILD)/tfq4-convert.metallib "$(LIBDIR)/"
 else
-	@install -m 0755 $(BUILD)/tfq3-generic-convert-cuda $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq4-convert-cuda $(BUILD)/tfq3-cuda-test "$(LIBDIR)/"
+	@install -m 0755 $(BUILD)/tfq3-generic-convert-cuda $(BUILD)/tfq3-qwen27-convert-cuda $(BUILD)/tfq3-flashnext-convert-cuda $(BUILD)/tfq3-glm-convert-cuda $(BUILD)/tfq3-ernie-convert-cuda $(BUILD)/tfq4-convert-cuda $(BUILD)/tfq3-cuda-test "$(LIBDIR)/"
 endif
 	@echo "Installed tfq3 -> $(BINDIR)/tfq3 (runtime binaries in $(LIBDIR))"
 
