@@ -29,18 +29,18 @@ static void write_tfpn_shard(
     std::vector<uint8_t> zeros(ALIGN_16K, 0);
     FILE* fout = fopen(path.c_str(), "wb");
     if (!fout) { fprintf(stderr, "Cannot write %s\n", path.c_str()); exit(1); }
-    fwrite(&hdr, 1, sizeof(hdr), fout);
-    fwrite(metas.data(), sizeof(TfpnTensorMeta), metas.size(), fout);
+    write_all_or_exit(fout, &hdr, sizeof(hdr), path);
+    write_all_or_exit(fout, metas.data(), metas.size() * sizeof(TfpnTensorMeta), path);
     size_t pad1 = off_scales - (off_meta + metas.size() * sizeof(TfpnTensorMeta));
-    if (pad1) fwrite(zeros.data(), 1, pad1, fout);
-    fwrite(all_scales.data(), 2, all_scales.size(), fout);
+    write_all_or_exit(fout, zeros.data(), pad1, path);
+    write_all_or_exit(fout, all_scales.data(), all_scales.size() * 2ULL, path);
     size_t pad2 = off_weights - (off_scales + all_scales.size() * 2ULL);
-    if (pad2) fwrite(zeros.data(), 1, pad2, fout);
-    fwrite(all_weights.data(), 4, all_weights.size(), fout);
+    write_all_or_exit(fout, zeros.data(), pad2, path);
+    write_all_or_exit(fout, all_weights.data(), all_weights.size() * 4ULL, path);
     size_t end_pos = off_weights + all_weights.size() * 4ULL;
     size_t pad_end = align_up(end_pos, ALIGN_16K) - end_pos;
-    if (pad_end) fwrite(zeros.data(), 1, pad_end, fout);
-    fclose(fout);
+    write_all_or_exit(fout, zeros.data(), pad_end, path);
+    close_or_exit(fout, path);
 }
 
 int main(int argc, char** argv) {
@@ -74,8 +74,8 @@ int main(int argc, char** argv) {
     if (tables_path != dst_tables) {
         FILE* fo = fopen(dst_tables.c_str(), "wb");
         if (!fo) { fprintf(stderr, "Cannot write %s\n", dst_tables.c_str()); return 1; }
-        fwrite(&tbl, 1, sizeof(tbl), fo);
-        fclose(fo);
+        write_all_or_exit(fo, &tbl, sizeof(tbl), dst_tables);
+        close_or_exit(fo, dst_tables);
     }
 
     auto grid3 = build_grid(tbl.lut3_u32,  256,   64, 2, 16,  8);
