@@ -114,7 +114,7 @@ struct NonMoeTensorMeta {
 };
 static_assert(sizeof(NonMoeTensorMeta) == 128, "NonMoeTensorMeta must be 128 bytes");
 
-struct MatParams { uint32_t R, C, b_bits; float shrink; };
+struct MatParams { uint32_t R, C, b_bits; float shrink; uint32_t r_off, pad0; };  // r_off: the chunk's first absolute row (TFQ3 row signs are absolute)
 struct EncParams { uint32_t R, C, b_bits, stream_off, n_streams; };
 struct P2 { float x, y; };
 
@@ -557,7 +557,7 @@ int main(int argc, char** argv) {
                     memcpy([buf_q8_b contents], b_ptr + (size_t)r0 * (t.C / 64) * 2, (size_t)sr * (t.C / 64) * 2);
                     size_t n_blks = (size_t)(sr / 128) * (t.C / 128);
 
-                    MatParams mp = {sr, t.C, t.bits, 1.0f};
+                    MatParams mp = {sr, t.C, t.bits, 1.0f, r0, 0u};
                     uint32_t total_streams = (sr / 16) * 32;
                     uint32_t n_pairs = t.C / 4;
                     uint32_t batch_sz = (uint32_t)std::max<size_t>(1, HIST_SLOTS / n_pairs);
@@ -776,7 +776,7 @@ int main(int argc, char** argv) {
                     memcpy([buf_fp8_in contents], w_ptr, nw);
                     memcpy([buf_sc_inv contents], s_ptr, ns);
 
-                    MatParams mp = {(uint32_t)R, (uint32_t)C, b, 1.0f};
+                    MatParams mp = {(uint32_t)R, (uint32_t)C, b, 1.0f, 0u, 0u};
                     int total_streams = (R / 16) * 32;
                     int batch_sz = (C < H) ? (BATCH_STREAMS * (H / C)) : BATCH_STREAMS;
 
