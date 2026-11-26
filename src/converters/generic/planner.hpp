@@ -589,6 +589,7 @@ static inline void decode_chunk_to_f32(
                 float sc = 1.0f;
                 if (sptr) {
                     if (sR == 1u && sC == 1u) sc = read_elem_f32(sptr, sdt, 0);
+                    else if (sR == job.orig_R && sC == 1u) sc = read_elem_f32(sptr, sdt, gr); // per-channel [R,1] / [R]
                     else {
                         uint32_t sr = std::min(sR - 1u, gr >> 7);
                         uint32_t sc_i = std::min(sC - 1u, c >> 7);

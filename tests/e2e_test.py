@@ -438,6 +438,67 @@ def test_planner_shape_whitespace(tmp: str) -> None:
     print(out.stdout.strip())
 
 
+def test_planner_fp8_scales(tmp: str) -> None:
+    """FP8 weights with per-channel ([R,1] / [R]) and 128x128 block scales must decode with the right scale per row."""
+    cxx = "clang++" if platform.system() == "Darwin" else "g++"
+    model_dir = os.path.join(tmp, "fp8_model")
+    os.makedirs(model_dir, exist_ok=True)
+    R, C = 256, 128
+    w = bytes([0x38]) * (R * C)  # F8_E4M3 1.0
+    per_row = (np.arange(R, dtype=np.float32) + 1.0).tobytes()
+    per_blk = np.array([[3.0], [5.0]], dtype=np.float32).tobytes()
+    tensors = [
+        ("a.weight", "F8_E4M3", [R, C], w),
+        ("a.weight_scale", "F32", [R, 1], per_row),
+        ("b.weight", "F8_E4M3", [R, C], w),
+        ("b.weight_scale", "F32", [R], per_row),
+        ("c.weight", "F8_E4M3", [R, C], w),
+        ("c.weight_scale_inv", "F32", [2, 1], per_blk),
+    ]
+    header, payload = {}, bytearray()
+    for name, dtype, shape, raw in tensors:
+        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [len(payload), len(payload) + len(raw)]}
+        payload.extend(raw)
+    hdr_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    with open(os.path.join(model_dir, "model.safetensors"), "wb") as f:
+        f.write(struct.pack("<Q", len(hdr_bytes)))
+        f.write(hdr_bytes)
+        f.write(payload)
+    src = os.path.join(tmp, "test_planner_fp8.cpp")
+    exe = os.path.join(tmp, "test_planner_fp8")
+    hdr = os.path.join(REPO_ROOT, "src", "converters", "generic", "planner.hpp")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(
+            f'#include "{hdr}"\n'
+            'int main(int, char** argv) {\n'
+            '    using namespace tfq_generic;\n'
+            '    SafetensorsDir st;\n'
+            '    st.init(argv[1]);\n'
+            '    GenericOptions opt;\n'
+            '    opt.model_dir = argv[1];\n'
+            '    ConversionPlan plan = build_plan(st, opt);\n'
+            '    int bad = 0;\n'
+            '    for (const auto& j : plan.jobs) {\n'
+            '        std::vector<float> out;\n'
+            '        decode_chunk_to_f32(st, j, 0, j.orig_R, out);\n'
+            '        for (uint32_t r = 0; r < j.orig_R; ++r) {\n'
+            '            float want = (j.tfpn_name == "c") ? ((r < 128) ? 3.0f : 5.0f) : (float)(r + 1);\n'
+            '            float got = out[(size_t)r * j.pad_C + 5];\n'
+            '            if (got != want) {\n'
+            '                if (bad++ < 4) std::printf("%s row %u: got %g, want %g\\n", j.tfpn_name.c_str(), r, got, want);\n'
+            '            }\n'
+            '        }\n'
+            '    }\n'
+            '    if (plan.jobs.size() != 3 || bad) { std::printf("FAIL jobs=%zu bad_rows=%d\\n", plan.jobs.size(), bad); return 1; }\n'
+            '    std::printf("PASS planner FP8 per-channel [R,1]/[R] and 128x128 block scales decode per row\\n");\n'
+            '    return 0;\n'
+            '}\n'
+        )
+    run([cxx, "-O2", "-std=c++17", "-Wall", "-Wextra", "-Werror", src, "-o", exe])
+    out = run([exe, model_dir])
+    print(out.stdout.strip())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-gpu", action="store_true", help="Skip GPU converter round-trips (for headless CI runners)")
@@ -456,6 +517,7 @@ def main() -> None:
         refs = write_synthetic_model(model_dir)
         test_moe_datafree_ranking(tmp)
         test_planner_shape_whitespace(tmp)
+        test_planner_fp8_scales(tmp)
         test_inspector_negative_controls(inspect_bin, tmp)
         test_cli_basics(tfq3_cli, model_dir)
         if not args.no_gpu:
