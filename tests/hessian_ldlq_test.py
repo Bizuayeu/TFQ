@@ -44,13 +44,58 @@ def _setup(R: int, C: int, seed: int):
     return W, H, H_eff, W_rot0
 
 
-def test_gain_three_correlated_coordinates() -> None:
-    # H^-1 with unit diagonal and 0.5 off-diagonal: after coordinate 0 is fixed, the gain 1 -> 2 is 1/3 (the full H^-1 gives 1/2).
+def _synthetic_tables(seed: int) -> dict:
+    rng = np.random.default_rng(seed)
+    return {
+        "lut": {4: rng.standard_normal((1024, 2)).astype(np.float16)},
+        "c64": {4: rng.standard_normal((64, 4)).astype(np.float16)},
+    }
+
+
+def _tfq3_with_block_targets(W: torch.Tensor, **kwargs) -> tuple[dict, dict[int, torch.Tensor]]:
+    """Run quantize_tfq3_matrix and record the W_rot columns each 128-column block is encoded against."""
+    seen: dict[int, torch.Tensor] = {}
+    encode = tfq3_h._encode_block_viterbi
+
+    def recording_encode(*args, **kw):
+        caller = sys._getframe(1).f_locals
+        cb = caller["cb"]
+        seen[cb] = caller["W_rot"][:, cb * 128 : (cb + 1) * 128].detach().to(torch.float64).clone()
+        return encode(*args, **kw)
+
+    tfq3_h._encode_block_viterbi = recording_encode
+    try:
+        res = tfq3_h.quantize_tfq3_matrix(W, 4, _synthetic_tables(4), beam=4, topk=4, refine_scales=False, **kwargs)
+    finally:
+        tfq3_h._encode_block_viterbi = encode
+    return res, seen
+
+
+def test_tfq3_gain_three_correlated_coordinates() -> None:
+    # One coordinate per block (0, 128, 256) with H^-1 diagonal 1, off-diagonal 0.5, all else independent.
+    # After block 0 is fixed, a unit error in block 1 must move block 2 by -1/3 (the full H^-1 gives -1/2).
+    C = 384
+    H_inv = torch.eye(C, dtype=torch.float64)
+    idx = torch.tensor([0, 128, 256])
+    H_inv[idx[:, None], idx[None, :]] = 0.5
+    H_inv[idx, idx] = 1.0
+    H_rot = torch.linalg.inv(H_inv).to(torch.float32)
+    W = torch.randn(256, C, generator=torch.Generator().manual_seed(5)) * 0.02
+    res, seen = _tfq3_with_block_targets(W, precomputed_h=(H_rot, H_inv.to(torch.float32)))
+    W_rot0 = tfq3_h.rotate_2d_torch(W).to(torch.float64)
+    W_rot_hat = tfq3_h.rotate_2d_torch(res["W_hat"]).to(torch.float64)
+    e0 = W_rot0[:, 0] - W_rot_hat[:, 0]
+    e1 = seen[1][:, 0] - W_rot_hat[:, 128]
+    shift = seen[2][:, 0] - W_rot0[:, 256] + 0.5 * e0  # block 0's -e0/2 is the same on main and here
+    gain = -float(torch.dot(shift, e1) / torch.dot(e1, e1))
+    assert abs(gain - 1.0 / 3.0) < 1e-3, f"block 2 moved by {-gain:.4f} per unit error in block 1, expected -1/3"
+
+
+def test_ldlq_gain_helper() -> None:
     H_inv = torch.full((3, 3), 0.5, dtype=torch.float64) + 0.5 * torch.eye(3, dtype=torch.float64)
     U = tfq3_h.ldlq_upper_factor(H_inv).to(torch.float64)
     assert abs(float(tfq3_h.ldlq_gain(U, 0, 1)[0, 0]) - 0.5) < 1e-6
-    gain = float(tfq3_h.ldlq_gain(U, 1, 2)[0, 0])
-    assert abs(gain - 1.0 / 3.0) < 1e-6, f"gain {gain}, expected 1/3"
+    assert abs(float(tfq3_h.ldlq_gain(U, 1, 2)[0, 0]) - 1.0 / 3.0) < 1e-6
 
 
 def test_tfq4_feedback_is_sequential_conditional() -> None:
@@ -76,25 +121,7 @@ def test_tfq4_feedback_is_sequential_conditional() -> None:
 def test_tfq3_feedback_is_sequential_conditional() -> None:
     R, C = 128, 384
     W, H, H_eff, W_rot0 = _setup(R, C, seed=3)
-    rng = np.random.default_rng(4)
-    tables = {
-        "lut": {4: rng.standard_normal((1024, 2)).astype(np.float16)},
-        "c64": {4: rng.standard_normal((64, 4)).astype(np.float16)},
-    }
-    seen: dict[int, torch.Tensor] = {}
-    encode = tfq3_h._encode_block_viterbi
-
-    def recording_encode(*args, **kwargs):
-        caller = sys._getframe(1).f_locals
-        cb = caller["cb"]
-        seen[cb] = caller["W_rot"][:, cb * 128 : (cb + 1) * 128].detach().to(torch.float64).clone()
-        return encode(*args, **kwargs)
-
-    tfq3_h._encode_block_viterbi = recording_encode
-    try:
-        res = tfq3_h.quantize_tfq3_matrix(W, 4, tables, H=H, beam=4, topk=4, refine_scales=False)
-    finally:
-        tfq3_h._encode_block_viterbi = encode
+    res, seen = _tfq3_with_block_targets(W, H=H)
     W_rot_hat = tfq3_h.rotate_2d_torch(res["W_hat"]).to(torch.float64)
     rms = float(torch.sqrt(torch.mean(W_rot0 * W_rot0)))
     for cb in range(C // 128):
