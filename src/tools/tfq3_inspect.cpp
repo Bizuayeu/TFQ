@@ -78,6 +78,18 @@ static bool check_range(uint64_t off, uint64_t len, uint64_t total) {
     return off <= total && len <= total - off;
 }
 
+// Element count -> byte count; false if the product does not fit in 64 bits.
+static bool checked_bytes(uint64_t count, uint64_t elem, uint64_t& out) {
+    if (count > UINT64_MAX / elem) return false;
+    out = count * elem;
+    return true;
+}
+
+// pad[0]/pad[1] hold orig_R/orig_C (0 = unpadded); padding is to the next multiple of 128.
+static bool check_orig_dim(uint32_t orig, uint32_t padded) {
+    return orig == 0 || (orig <= padded && padded - orig < 128u);
+}
+
 static bool extract_tensor_name(const char raw[80], std::string& out) {
     size_t len = 0;
     while (len < 80 && raw[len] != '\0') ++len;
@@ -142,13 +154,13 @@ static bool inspect_tfpn(const std::string& path, bool verbose, std::unordered_s
     if (h.magic != MAGIC_TFPN || h.version != FORMAT_VER) {
         fclose(f); fprintf(stderr, "FAIL %s: bad magic/version\n", path.c_str()); return false;
     }
-    if ((h.off_scales % ALIGN_16K) != 0 || (h.off_weights % ALIGN_16K) != 0) {
-        fclose(f); fprintf(stderr, "FAIL %s: scales/weights not 16 KiB aligned\n", path.c_str()); return false;
+    if ((h.off_scales % ALIGN_16K) != 0 || (h.off_weights % ALIGN_16K) != 0 || (sz % ALIGN_16K) != 0) {
+        fclose(f); fprintf(stderr, "FAIL %s: scales/weights/file end not 16 KiB aligned\n", path.c_str()); return false;
     }
     uint64_t meta_bytes = (uint64_t)h.num_tensors * sizeof(TfpnTensorMeta);
-    uint64_t sc_bytes   = h.total_scale_halfs * 2ULL;
-    uint64_t w_bytes    = h.total_weight_words * 4ULL;
-    if (h.off_meta < sizeof(TfpnHeader) ||
+    uint64_t sc_bytes = 0, w_bytes = 0;
+    if (!checked_bytes(h.total_scale_halfs, 2ULL, sc_bytes) || !checked_bytes(h.total_weight_words, 4ULL, w_bytes) ||
+        h.off_meta < sizeof(TfpnHeader) ||
         !check_range(h.off_meta, meta_bytes, h.off_scales) ||
         !check_range(h.off_scales, sc_bytes, h.off_weights) ||
         !check_range(h.off_weights, w_bytes, sz)) {
@@ -175,7 +187,8 @@ static bool inspect_tfpn(const std::string& path, bool verbose, std::unordered_s
             fprintf(stderr, "FAIL %s: duplicate tensor name '%s'\n", path.c_str(), tname.c_str());
             return false;
         }
-        if ((m.b_bits != 3u && m.b_bits != 4u && m.b_bits != 5u) || m.R == 0 || m.C == 0 || (m.R % 128u) || (m.C % 128u)) {
+        if ((m.b_bits != 3u && m.b_bits != 4u && m.b_bits != 5u) || m.R == 0 || m.C == 0 || (m.R % 128u) || (m.C % 128u) ||
+            !check_orig_dim(m.pad[0], m.R) || !check_orig_dim(m.pad[1], m.C)) {
             fprintf(stderr, "FAIL %s: invalid tensor %s [%u,%u] %ub\n", path.c_str(), tname.c_str(), m.R, m.C, m.b_bits);
             return false;
         }
@@ -226,16 +239,19 @@ static bool inspect_tfpw(const std::string& path) {
     if (h.magic != MAGIC_TFPW || h.version != FORMAT_VER) {
         fclose(f); fprintf(stderr, "FAIL %s: bad magic/version\n", path.c_str()); return false;
     }
-    if ((h.off_scales % ALIGN_16K) != 0 || (h.off_weights % ALIGN_16K) != 0) {
-        fclose(f); fprintf(stderr, "FAIL %s: scales/weights not 16 KiB aligned\n", path.c_str()); return false;
+    if ((h.off_scales % ALIGN_16K) != 0 || (h.off_weights % ALIGN_16K) != 0 || (sz % ALIGN_16K) != 0) {
+        fclose(f); fprintf(stderr, "FAIL %s: scales/weights/file end not 16 KiB aligned\n", path.c_str()); return false;
+    }
+    if (h.num_tensors != 3ULL * h.num_experts) {
+        fclose(f); fprintf(stderr, "FAIL %s: num_tensors %u != 3 * num_experts %u\n", path.c_str(), h.num_tensors, h.num_experts); return false;
     }
     if (h.hidden_size == 0 || h.moe_inter == 0 || (h.hidden_size % 128u) || (h.moe_inter % 128u)) {
         fclose(f); fprintf(stderr, "FAIL %s: invalid MoE dims H=%u I=%u\n", path.c_str(), h.hidden_size, h.moe_inter); return false;
     }
     uint64_t meta_bytes = (uint64_t)h.num_experts * sizeof(TfpwExpertMeta);
-    uint64_t sc_bytes   = h.scale_halfs * 2ULL;
-    uint64_t w_bytes    = h.stream_words * 4ULL;
-    if (h.off_meta < sizeof(TfpwHeader) ||
+    uint64_t sc_bytes = 0, w_bytes = 0;
+    if (!checked_bytes(h.scale_halfs, 2ULL, sc_bytes) || !checked_bytes(h.stream_words, 4ULL, w_bytes) ||
+        h.off_meta < sizeof(TfpwHeader) ||
         !check_range(h.off_meta, meta_bytes, h.off_scales) ||
         !check_range(h.off_scales, sc_bytes, h.off_weights) ||
         !check_range(h.off_weights, w_bytes, sz)) {
@@ -330,9 +346,9 @@ static bool inspect_tfp4(const std::string& path, bool verbose, std::unordered_s
         return false;
     }
     uint64_t meta_bytes = (uint64_t)h.num_tensors * sizeof(TfpnTensorMeta);
-    uint64_t sc_bytes   = h.total_scale_halfs * 2ULL;
-    uint64_t w_bytes    = h.total_weight_words * 4ULL;
-    if (h.off_meta < sizeof(TfpnHeader) ||
+    uint64_t sc_bytes = 0, w_bytes = 0;
+    if (!checked_bytes(h.total_scale_halfs, 2ULL, sc_bytes) || !checked_bytes(h.total_weight_words, 4ULL, w_bytes) ||
+        h.off_meta < sizeof(TfpnHeader) ||
         !check_range(h.off_meta, meta_bytes, h.off_scales) ||
         !check_range(h.off_scales, sc_bytes, h.off_weights) ||
         !check_range(h.off_weights, w_bytes, sz)) {
@@ -368,6 +384,7 @@ static bool inspect_tfp4(const std::string& path, bool verbose, std::unordered_s
         }
         uint64_t exp_w = (uint64_t)m.R * (m.C / 16u), exp_s = (uint64_t)(m.R / 128u) * (m.C / 128u);
         if (m.b_bits != 2u || m.R == 0 || m.C == 0 || (m.R % 128u) || (m.C % 128u) || m.word_count != exp_w ||
+            !check_orig_dim(m.pad[0], m.R) || !check_orig_dim(m.pad[1], m.C) ||
             !check_range(m.word_off, m.word_count, h.total_weight_words) ||
             !check_range((uint64_t)m.sc_off, exp_s, h.total_scale_halfs)) {
             fprintf(stderr, "FAIL %s: invalid TFP4 tensor %s\n", path.c_str(), tname.c_str());
