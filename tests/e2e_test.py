@@ -40,14 +40,14 @@ def align16k(n: int) -> int:
     return (n + ALIGN_16K - 1) & ~(ALIGN_16K - 1)
 
 
-def run(cmd: list[str], expect_ok: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+def run(cmd: list[str], expect_ok: bool | None = True, env: dict | None = None) -> subprocess.CompletedProcess:
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     if expect_ok and proc.returncode != 0:
         raise AssertionError(
             f"Command failed (rc={proc.returncode}): {' '.join(cmd)}\n"
             f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
         )
-    if not expect_ok and proc.returncode == 0:
+    if expect_ok is False and proc.returncode == 0:
         raise AssertionError(f"Command unexpectedly succeeded: {' '.join(cmd)}\nstdout:\n{proc.stdout}")
     return proc
 
@@ -217,6 +217,83 @@ def test_inspector_negative_controls(inspect_bin: str, tmp: str) -> None:
     run([inspect_bin, dup_dir], expect_ok=False)
 
     print("PASS inspector strict validation & negative controls (9 cases)")
+
+
+def make_minimal_tfpn(path: str, R: int = 128, C: int = 128, orig: tuple[int, int] | None = None,
+                      words_extra: int = 0, pad_end: bool = True) -> None:
+    bits = 3
+    n_w = (R // 16) * (C // 128) * bits * 2 * 32
+    n_sc = (R // 128) * (C // 128)
+    off_meta, off_scales = 64, ALIGN_16K
+    off_weights = align16k(off_scales + n_sc * 2)
+    end = off_weights + n_w * 4
+    buf = bytearray(align16k(end) if pad_end else end)
+    struct.pack_into("<IIIIQQQQQQ", buf, 0, 0x4E504654, 3, 1, 0, off_meta, off_scales, off_weights, n_sc, n_w + words_extra, 0)
+    o_r, o_c = orig if orig else (R, C)
+    rec = bytearray(128)
+    rec[:5] = b"layer"
+    struct.pack_into("<IIIIQQfIII", rec, 80, R, C, bits, 0, 0, n_w, 20.0, o_r, o_c, 0)
+    buf[off_meta:off_meta + 128] = rec
+    with open(path, "wb") as f:
+        f.write(buf)
+
+
+def make_minimal_tfpw(path: str, num_tensors: int | None = None, words_extra: int = 0, pad_end: bool = True) -> None:
+    E, H, I, bits = 2, 128, 128, 3
+    per = (I // 16) * (H // 128) * bits * 2 * 32
+    n_w, n_sc = E * 3 * per, E * 3
+    off_meta, off_scales = 144, ALIGN_16K
+    off_weights = align16k(off_scales + n_sc * 2)
+    end = off_weights + n_w * 4
+    buf = bytearray(align16k(end) if pad_end else end)
+    struct.pack_into("<8I6Q", buf, 0, 0x57504654, 3, 0, E, 3 * E if num_tensors is None else num_tensors, H, I, 0,
+                     0, n_w + words_extra, n_sc, off_meta, off_scales, off_weights)
+    for e in range(E):
+        w0, s0 = e * 3 * per, e * 3
+        struct.pack_into("<IIQQQIIIfffII", buf, off_meta + e * 64, bits, e, w0, w0 + per, w0 + 2 * per,
+                         s0, s0 + 1, s0 + 2, 20.0, 20.0, 20.0, 0, 0)
+    with open(path, "wb") as f:
+        f.write(buf)
+
+
+def test_inspector_header_checks(inspect_bin: str, tmp: str) -> None:
+    """Inspector must reject wrapped 64-bit sizes, bad pad fields, a wrong TFPW tensor count and unaligned file ends."""
+    d = os.path.join(tmp, "hdr_checks")
+    os.makedirs(d, exist_ok=True)
+    wrap = 1 << 62  # x4 bytes wraps to 0 in 64 bits
+    good = {
+        "good.tffpw": lambda p: make_minimal_tfpn(p),
+        "good_padded.tffpw": lambda p: make_minimal_tfpn(p, R=256, orig=(129, 100)),
+        "good_moe.tffpw": lambda p: make_minimal_tfpw(p),
+    }
+    bad = {
+        "tfpn_words_wrap.tffpw": lambda p: make_minimal_tfpn(p, words_extra=wrap),
+        "tfpn_orig_r_over_r.tffpw": lambda p: make_minimal_tfpn(p, orig=(200, 128)),
+        "tfpn_orig_c_too_small.tffpw": lambda p: make_minimal_tfpn(p, C=256, orig=(128, 100)),
+        "tfpn_end_unaligned.tffpw": lambda p: make_minimal_tfpn(p, pad_end=False),
+        "tfpw_words_wrap.tffpw": lambda p: make_minimal_tfpw(p, words_extra=wrap),
+        "tfpw_num_tensors.tffpw": lambda p: make_minimal_tfpw(p, num_tensors=5),
+        "tfpw_end_unaligned.tffpw": lambda p: make_minimal_tfpw(p, pad_end=False),
+    }
+    for name, make in good.items():
+        make(os.path.join(d, name))
+        run([inspect_bin, os.path.join(d, name)], expect_ok=True)
+    tfp4_wrap = os.path.join(d, "tfp4_words_wrap.tffp4")
+    make_minimal_tfp4(tfp4_wrap, ["a"])
+    with open(tfp4_wrap, "r+b") as f:
+        f.seek(48)
+        n_w = struct.unpack("<Q", f.read(8))[0]
+        f.seek(48)
+        f.write(struct.pack("<Q", n_w + wrap))
+    accepted = []
+    for name, make in bad.items():
+        make(os.path.join(d, name))
+    for name in list(bad) + ["tfp4_words_wrap.tffp4"]:
+        if run([inspect_bin, os.path.join(d, name)], expect_ok=None).returncode == 0:
+            accepted.append(name)
+    if accepted:
+        raise AssertionError("tfq3-inspect accepted invalid shards: " + ", ".join(accepted))
+    print(f"PASS inspector header checks ({len(good)} valid, {len(bad) + 1} invalid)")
 
 
 def test_cli_basics(tfq3_cli: str, model_dir: str) -> None:
@@ -606,6 +683,7 @@ def main() -> None:
         test_planner_fp8_scales(tmp)
         test_planner_budget_minimum(tmp)
         test_inspector_negative_controls(inspect_bin, tmp)
+        test_inspector_header_checks(inspect_bin, tmp)
         test_cli_basics(tfq3_cli, model_dir)
         test_planner_write_errors(model_dir, tmp)
         if not args.no_gpu:
