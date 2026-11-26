@@ -23,9 +23,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-for p in (os.path.join(REPO_ROOT, "reference"), os.path.join(REPO_ROOT, "tools")):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+_REF_DIR = os.path.join(REPO_ROOT, "reference")
+if _REF_DIR not in sys.path:
+    sys.path.insert(0, _REF_DIR)
 
 import tfq3_reference as tfq3_ref
 import tfq4_lattice as tfq4_ref
@@ -49,8 +49,7 @@ def _get_cuda_ext():
 
 def _decode_tfpn_words_np(words_u32: np.ndarray, scales_f16: np.ndarray, pad_r: int, pad_c: int, bits: int, tbl: dict) -> np.ndarray:
     """Fast exact vectorized TFPN v3 decoder (matches reference/tfq3_reference.py bit-for-bit)."""
-    from bench_quantizers import decode_tfpn_fast_np
-    return decode_tfpn_fast_np(words_u32, scales_f16, pad_r, pad_c, bits, tbl)
+    return tfq3_ref.decode_tfpn_fast_np(words_u32, scales_f16, pad_r, pad_c, bits, tbl)
 
 
 class Tfq3Linear(nn.Module):
@@ -242,9 +241,14 @@ def load_tfq_into_hf(
     res_state: dict[str, torch.Tensor] = {}
     for sf in sorted(glob.glob(os.path.join(tfq_dir, "*.safetensors"))):
         res_state.update(_read_safetensors_dict(sf))
-    model.load_state_dict(res_state, strict=False, assign=True)
+    missing = set(model.load_state_dict(res_state, strict=False, assign=True).missing_keys)
     if getattr(cfg, "tie_word_embeddings", False) and hasattr(model, "tie_weights"):
         model.tie_weights()
+    # A missing key that now shares its tensor with a loaded one (tied embeddings) is loaded.
+    params = dict(model.named_parameters(remove_duplicate=False))
+    loaded_ids = {id(t) for n, t in params.items() if n not in missing}
+    missing = {k for k in missing if not (k in params and id(params[k]) in loaded_ids)}
+    skipped: list[str] = []
 
     mod_map = dict(model.named_modules())
 
@@ -259,6 +263,7 @@ def load_tfq_into_hf(
             with open(sp, "rb") as f:
                 hdr = struct.unpack("<IIIIQQQQQQ", f.read(64))
                 if hdr[0] != 0x4E504654:
+                    skipped.append(f"{os.path.basename(sp)}: magic 0x{hdr[0]:08X} is not TFPN (TFPW MoE expert shards are not supported)")
                     continue
                 nt, off_meta, off_scales, off_weights = hdr[2], hdr[4], hdr[5], hdr[6]
                 f.seek(off_meta)
@@ -266,7 +271,9 @@ def load_tfq_into_hf(
                 for rec in recs:
                     nm = rec[:80].split(b"\x00", 1)[0].decode("utf-8")
                     if nm not in mod_map or not isinstance(mod_map[nm], nn.Linear):
+                        skipped.append(f"{os.path.basename(sp)}: {nm} ({type(mod_map[nm]).__name__ if nm in mod_map else 'no such module'}, only nn.Linear is supported)")
                         continue
+                    missing.discard(f"{nm}.weight")
                     R, C, bits, sc_off, w_off, w_cnt, _, orig_r, orig_c, _ = struct.unpack("<IIIIQQfIII", rec[80:])
                     orig_r = orig_r or R
                     orig_c = orig_c or C
@@ -280,12 +287,15 @@ def load_tfq_into_hf(
                         model, nm,
                         Tfq3Linear(orig_c, orig_r, bits, wd, sc, tbl_bytes, tbl_dict, bias=bias, cache_decoded=cache_decoded),
                     )
+        skipped += [f"{os.path.basename(sp)}: TFQ4 shard in a TFQ3 directory (mixed TFQ3+TFQ4 is not supported)"
+                    for sp in sorted(glob.glob(os.path.join(tfq_dir, "*.tffp4")))]
     elif os.path.isfile(pw4):
         lut4 = tfq4_ref.load_pwv4_tables(pw4)
         for sp in sorted(glob.glob(os.path.join(tfq_dir, "*.tffp4"))):
             with open(sp, "rb") as f:
                 hdr = struct.unpack("<IIIIQQQQQQ", f.read(64))
                 if hdr[0] != 0x34504654:
+                    skipped.append(f"{os.path.basename(sp)}: magic 0x{hdr[0]:08X} is not TFP4")
                     continue
                 nt, off_meta, off_scales, off_weights = hdr[2], hdr[4], hdr[5], hdr[6]
                 f.seek(off_meta)
@@ -293,7 +303,9 @@ def load_tfq_into_hf(
                 for rec in recs:
                     nm = rec[:80].split(b"\x00", 1)[0].decode("utf-8")
                     if nm not in mod_map or not isinstance(mod_map[nm], nn.Linear):
+                        skipped.append(f"{os.path.basename(sp)}: {nm} ({type(mod_map[nm]).__name__ if nm in mod_map else 'no such module'}, only nn.Linear is supported)")
                         continue
+                    missing.discard(f"{nm}.weight")
                     R, C, _, sc_off, w_off, w_cnt, _, orig_r, orig_c, _ = struct.unpack("<IIIIQQfIII", rec[80:])
                     orig_r = orig_r or R
                     orig_c = orig_c or C
@@ -308,4 +320,11 @@ def load_tfq_into_hf(
                         Tfq4Linear(orig_c, orig_r, wd, sc, lut4, bias=bias, cache_decoded=cache_decoded),
                     )
 
+    if missing:
+        msg = [f"{tfq_dir}: {len(missing)} model tensors were not found in the checkpoint and would stay at random init:"]
+        msg += [f"  {k}" for k in sorted(missing)]
+        if skipped:
+            msg.append("Records this loader skipped:")
+            msg += [f"  {s}" for s in skipped]
+        raise RuntimeError("\n".join(msg))
     return model.to(device=device)
