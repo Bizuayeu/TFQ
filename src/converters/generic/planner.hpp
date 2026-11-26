@@ -478,6 +478,12 @@ static inline ConversionPlan build_plan(const SafetensorsDir& st, const GenericO
             j.bits = 3u;
             cur += tfpn_tensor_bytes(j.pad_R, j.pad_C, 3u);
         }
+        if (cur > budget) {
+            double min_gib = (double)(cur + plan.residual_bytes + overhead) / (double)(1ULL << 30);
+            fprintf(stderr, "Budget %.3f GiB is below the minimum for this model: %.3f GiB (all quantized tensors at 3 bits + residual)\n",
+                    opt.target_gib, min_gib);
+            exit(1);
+        }
         std::vector<size_t> idx(plan.jobs.size());
         std::iota(idx.begin(), idx.end(), 0);
         std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
