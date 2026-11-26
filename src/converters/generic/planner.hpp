@@ -267,6 +267,29 @@ static inline bool is_drafter_config(const std::string& model_dir) {
     return contains(low, "\"dflash") || contains(low, "\"dspine") || contains(low, "draft_layers") || contains(low, "target_layer_ids");
 }
 
+// Every "bits" value inside config.json's MLX "quantization" object (global and per-module overrides).
+static inline std::vector<int> mlx_config_bits(const std::string& model_dir) {
+    std::vector<int> bits;
+    std::ifstream f(model_dir + "/config.json");
+    if (!f.good()) return bits;
+    std::string txt((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    size_t q = txt.find("\"quantization\"");
+    if (q == std::string::npos) return bits;
+    size_t ob = txt.find('{', q);
+    if (ob == std::string::npos) return bits;
+    size_t end = ob;
+    for (int depth = 0; end < txt.size(); ++end) {
+        if (txt[end] == '{') ++depth;
+        else if (txt[end] == '}' && --depth == 0) break;
+    }
+    std::string obj = txt.substr(ob, end - ob);
+    for (size_t p = obj.find("\"bits\""); p != std::string::npos; p = obj.find("\"bits\"", p + 6)) {
+        size_t c = obj.find(':', p);
+        if (c != std::string::npos) bits.push_back(atoi(obj.c_str() + c + 1));
+    }
+    return bits;
+}
+
 static inline float read_elem_f32(const uint8_t* ptr, const std::string& dt, uint64_t idx) {
     if (dt == "BF16") {
         uint16_t u; memcpy(&u, ptr + idx * 2, 2);
@@ -345,6 +368,7 @@ static inline ConversionPlan build_plan(const SafetensorsDir& st, const GenericO
     ConversionPlan plan;
     plan.detected_drafter = opt.quantize_drafter || is_drafter_config(opt.model_dir);
 
+    const std::vector<int> mlx_bits = mlx_config_bits(opt.model_dir);
     std::set<std::string> consumed;
     for (const auto& name : st.tensor_order) {
         const auto& ti = st.tensors.at(name);
@@ -369,6 +393,13 @@ static inline ConversionPlan build_plan(const SafetensorsDir& st, const GenericO
             if (st.has(stem + ".weight_scale_inv")) scales_name = stem + ".weight_scale_inv";
             else if (st.has(stem + ".weight_scale")) scales_name = stem + ".weight_scale";
         } else if (ti.dtype == "U32" && st.has(stem + ".scales") && st.has(stem + ".biases")) {
+            for (int b : mlx_bits) {
+                if (b != 8) {
+                    fprintf(stderr, "MLX %d-bit weights (%s) are not supported: the generic converter reads MLX 8-bit only. "
+                            "Convert from the BF16/F16/FP8 source or an MLX 8-bit checkpoint.\n", b, name.c_str());
+                    exit(1);
+                }
+            }
             const auto& si = st.tensors.at(stem + ".scales");
             if (si.shape.size() == 2 && si.shape[0] == orig_R) {
                 uint32_t full_C = orig_C * 4u; // 8-bit MLX packs 4 bytes per U32
