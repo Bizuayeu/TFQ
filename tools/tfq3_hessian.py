@@ -31,6 +31,7 @@ import os
 import struct
 import sys
 import time
+import warnings
 import numpy as np
 import torch
 
@@ -137,7 +138,24 @@ def compute_h_inv_cholesky(H_rot: torch.Tensor, damp: float = 0.01) -> torch.Ten
             return H_inv.to(device=H_rot.device, dtype=torch.float32)
         except RuntimeError:
             H64.diagonal().add_(lam * mult)
+    warnings.warn(
+        f"compute_h_inv_cholesky: Cholesky failed for a {C}x{C} Hessian even with 111x damping; "
+        "using identity H^-1, so this matrix gets no Hessian weighting or LDLQ feedback",
+        RuntimeWarning,
+        stacklevel=2,
+    )
     return torch.eye(C, dtype=torch.float32, device=H_rot.device)
+
+
+def ldlq_upper_factor(H_inv: torch.Tensor) -> torch.Tensor:
+    """Upper Cholesky factor U of H^-1 (H^-1 = U^T U); trailing blocks of U give the conditional inverse once earlier columns are fixed."""
+    U = torch.linalg.cholesky(H_inv.detach().cpu().to(torch.float64), upper=True)
+    return U.to(device=H_inv.device, dtype=torch.float32)
+
+
+def ldlq_gain(U: torch.Tensor, c0: int, c1: int) -> torch.Tensor:
+    """LDLQ feedback gain from columns [c0, c1) to columns [c1, C) given columns [0, c0) are fixed: U_bb^-1 U_b,rest."""
+    return torch.linalg.solve_triangular(U[c0:c1, c0:c1], U[c0:c1, c1:], upper=True)
 
 
 def _lane_maps(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -340,6 +358,7 @@ def quantize_tfq3_matrix(
         H_inv = compute_h_inv_cholesky(H_rot, damp=damp)
         hd = torch.clamp(torch.diagonal(H_rot), min=1e-8)
         h_diag = hd / torch.mean(hd)
+    U_inv = ldlq_upper_factor(H_inv) if H_inv is not None else None
 
     shrink = {3: 0.92, 4: 0.94, 5: 0.96}[bits]
     blocks = W_rot0.reshape(n_br, 128, n_bc, 128).permute(0, 2, 1, 3)
@@ -471,10 +490,7 @@ def quantize_tfq3_matrix(
         if H_inv is not None and (c_blk + 128) < C:
             sc_rows = scales[:, cb].repeat_interleave(128)[:, None]
             E_blk = W_rot[:, c_blk : c_blk + 128] - Q_unit[:, c_blk : c_blk + 128] * sc_rows
-            H_bb = H_inv[c_blk : c_blk + 128, c_blk : c_blk + 128]
-            H_br = H_inv[c_blk : c_blk + 128, c_blk + 128 :]
-            gain = torch.linalg.solve(H_bb + 1e-6 * torch.eye(128, device=device), H_br)
-            W_rot[:, c_blk + 128 :] -= E_blk @ gain
+            W_rot[:, c_blk + 128 :] -= E_blk @ ldlq_gain(U_inv, c_blk, c_blk + 128)
 
     # Optional closed-form per-128x128-tile Hessian scale refinement (exact same single fp16 scale!)
     if refine_scales:
@@ -551,6 +567,7 @@ def quantize_tfq4_matrix(
         H_pad = pad_hessian_128(H, C)
         H_rot = rotate_hessian_torch(H_pad)
         H_inv = compute_h_inv_cholesky(H_rot, damp=damp)
+    U_inv = ldlq_upper_factor(H_inv) if H_inv is not None else None
 
     blocks = W_rot0.reshape(n_br, 128, n_bc, 128).permute(0, 2, 1, 3)
     scales_f16 = torch.sqrt(torch.mean(blocks * blocks, dim=(2, 3)) + 1e-12).to(torch.float16)
@@ -587,10 +604,7 @@ def quantize_tfq4_matrix(
 
         if H_inv is not None and (c0 + 8) < C:
             E_sub = W_rot[:, c0 : c0 + 8] - q_sub * sc_rows
-            H_bb = H_inv[c0 : c0 + 8, c0 : c0 + 8]
-            H_br = H_inv[c0 : c0 + 8, c0 + 8 :]
-            gain = torch.linalg.solve(H_bb + 1e-6 * torch.eye(8, device=device), H_br)
-            W_rot[:, c0 + 8 :] -= E_sub @ gain
+            W_rot[:, c0 + 8 :] -= E_sub @ ldlq_gain(U_inv, c0, c0 + 8)
 
     if refine_scales:
         for cb in range(n_bc):
