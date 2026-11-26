@@ -399,6 +399,44 @@ def test_moe_datafree_ranking(tmp: str) -> None:
     print(out.stdout.strip())
 
 
+def test_install_script(tmp: str) -> None:
+    """install.sh with stub tools: failing nvidia-smi falls back, TFQ3_COMMIT is enforced, a truncated download runs nothing."""
+    if platform.system() != "Linux":
+        print("SKIP install.sh test (Linux CUDA path only)")
+        return
+    d = os.path.join(tmp, "install")
+    stub = os.path.join(d, "bin")
+    os.makedirs(stub)
+    sha = "1" * 40
+    stubs = {
+        "nvidia-smi": "exit 9\n",
+        "nvcc": "exit 0\n",
+        "make": "exit 0\n",
+        "git": f'if [ "${{1:-}}" = "-C" ]; then shift 2; fi\n[ "${{1:-}}" = "rev-parse" ] && echo {sha}\nexit 0\n',
+    }
+    for name, body in stubs.items():
+        with open(os.path.join(stub, name), "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n" + body)
+        os.chmod(os.path.join(stub, name), 0o755)
+    env = dict(os.environ, PATH=stub + os.pathsep + os.environ.get("PATH", ""), NVCC=os.path.join(stub, "nvcc"),
+               PREFIX=os.path.join(d, "prefix"), TFQ3_SRC_DIR=os.path.join(d, "src"))
+    env.pop("CUDA_ARCH", None)
+    script = os.path.join(REPO_ROOT, "install.sh")
+
+    out = run(["bash", script], env=env)
+    assert "CUDA_ARCH=native" in out.stdout, out.stdout + out.stderr
+    run(["bash", script], env=dict(env, TFQ3_COMMIT=sha))
+    bad = run(["bash", script], expect_ok=False, env=dict(env, TFQ3_COMMIT="2" * 40))
+    assert "expected commit" in bad.stderr, bad.stderr
+
+    with open(script, "rb") as f:
+        body = f.read()
+    cut = body.index(b'echo "==> Installing')  # download cut off before the install step
+    trunc = subprocess.run(["bash"], input=body[:cut], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    assert trunc.returncode != 0 and b"==>" not in trunc.stdout, trunc.stdout.decode() + trunc.stderr.decode()
+    print("PASS install.sh: nvidia-smi failure falls back to native, TFQ3_COMMIT enforced, truncated script runs nothing")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-gpu", action="store_true", help="Skip GPU converter round-trips (for headless CI runners)")
@@ -418,6 +456,7 @@ def main() -> None:
         test_moe_datafree_ranking(tmp)
         test_inspector_negative_controls(inspect_bin, tmp)
         test_cli_basics(tfq3_cli, model_dir)
+        test_install_script(tmp)
         if not args.no_gpu:
             test_gpu_roundtrips(tfq3_cli, inspect_bin, model_dir, refs, tmp)
 
