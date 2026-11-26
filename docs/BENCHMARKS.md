@@ -9,51 +9,53 @@ Every section and claim in this document is explicitly tagged with its verificat
 
 ## 1. Controlled Head-to-Head Quantizer Comparison (`Qwen/Qwen2.5-1.5B`) `[MEASURED]`
 
-**Provenance receipt:** [`benchmarks/provenance_qwen25_1p5b.json`](../benchmarks/provenance_qwen25_1p5b.json) (`tools/bench_quantizers.py`)
+**Provenance receipt:** [`benchmarks/provenance_qwen25_1p5b.json`](../benchmarks/provenance_qwen25_1p5b.json) (`schema: tfq-provenance-v2`, `tools/bench_quantizers.py --seq-len 2048 --eval-seqs 0 --kl-seqs 0`)
+- **Clean commit & binary provenance:** Recorded from a clean working tree (`repo_commit: 5079156`, `git_dirty: false`) with SHA-256 hashes of `tools/bench_quantizers.py`, `tools/tfq3_hessian.py`, the compiled `tfq3-generic-convert` / `tfq4-convert` binaries, every generated `.tffpw`/`.tffp4` shard, table file, and manifest, plus raw per-sequence `seq_nlls`.
 - **Model:** `Qwen/Qwen2.5-1.5B` (HF snapshot `8faed761d45a263340a0528343f099c05c9a4323`), all **196** transformer linear layers quantized; `embed_tokens`, `lm_head`, RMSNorms, and biases kept **identical BF16** across every method.
 - **Disjoint splits (`Salesforce/wikitext`, `wikitext-2-raw-v1`):**
-  - Calibration (used **only** by calibrated methods): `32,768` tokens from `train` (`sha256: 43bb22dff75d332b...`).
-  - Evaluation: **`16,352` scored tokens** (`32 × 512`) from `test` (`sha256: f5c63f135fb8d2b9...`) with exact `fp64` NLL, bootstrap 95% CI, and exact `fp64` full-vocabulary (`151,936` logits) forward KL $D_{\text{KL}}(P_{\text{BF16}} \| P_q)$ over **`4,088` tokens**.
+  - Calibration (used **only** by calibrated methods): `32,768` tokens (`64 × 512`) from `train` (`sha256: 43bb22dff75d332b...`).
+  - Evaluation: full WikiText-2 test split at `seq_len = 2048` — **`296,815` scored tokens** (`145 × 2048`, `sha256: eb2f38d8154654e9...`) with exact `fp64` NLL, **paired per-sequence `ΔNLL` vs BF16 with 2,000-sample paired bootstrap 95% CI**, and exact `fp64`-accumulated full-vocabulary (`151,936` logits) forward KL $D_{\text{KL}}(P_{\text{BF16}} \| P_q)$ over **all `296,815` tokens**.
   - **Real-Activation Output SNR:** Mean across all 196 layers of $10 \log_{10}(\|W X_{\text{test}}^T\|_F^2 / \|(W - \hat{W}) X_{\text{test}}^T\|_F^2)$ using **held-out test activations**.
+- **Baseline scope:** Non-TFQ rows below are **in-house reference implementations** in `tools/bench_quantizers.py`: `GPTQ-LDLQ (in-house, no act-order, g128)` omits activation ordering and fixes min/max group scales before error feedback; `Scalar Lloyd-Max + LDLQ (in-house ref)` uses a 1D optimal Gaussian grid after 2D-FWHT (not EXL3's trellis codebook). External maintained baselines (GPTQModel, ExLlamaV3) are outside this script and can be compared against the committed token hashes and `seq_nlls` in `benchmarks/provenance_qwen25_1p5b.json` (and `bench_quantizers.py --dataset c4` supports a second corpus).
 - **Real binaries tested:** `TFQ3-4b Data-Free`, `TFQ3-3b Data-Free`, and `TFQ4-E8P 2b Data-Free` were quantized by the compiled Metal binaries (`tfq3-generic-convert` / `tfq4-convert`), validated by `tfq3-inspect`, and decoded directly from `.tffpw`/`.tffp4` shards.
 
-### 4-Bit Head-to-Head (`Gold BF16 PPL = 11.1726`, 95% CI `[9.6689, 12.6337]`)
+### 4-Bit Head-to-Head (`Gold BF16 PPL = 9.2198`, 95% CI `[8.8225, 9.6318]`, `NLL = 2.22136`)
 
-| Quantizer | Eff. bpw | Calib Data? | Weight SNR | Held-Out Out-SNR | WikiText-2 PPL (16,352 tok) | Mean KL (4,088 tok) | p99 KL | Same Top-1 | Conv Time |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
-| BF16 Reference (Gold) | 16.000 | No | — | — | **11.1726** | — | — | — | — |
-| RTN / MLX Affine 4b (`g64`) | 4.500 | No | 20.57 dB | 21.50 dB | 12.1522 | 0.13772 | 1.0543 | 82.68% | 4.2 s |
-| RTN / MLX Affine 4b (`g128`) | 4.250 | No | 19.52 dB | 20.45 dB | 12.7027 | 0.16566 | 1.1497 | 80.45% | 0.4 s |
-| AWQ Salient-Scale 4b (`g128`) | 4.250 | Yes | 17.64 dB | 22.38 dB | 12.0603 | 0.10383 | 0.9321 | 84.32% | 6.8 s |
-| GPTQ / LDLQ Scalar 4b (`g128`) | 4.250 | Yes | 17.25 dB | 23.96 dB | 11.8600 | 0.07855 | 0.8114 | 86.55% | 62.6 s |
-| **TFQ3-4b Data-Free (real `.tffpw`)** | **4.001** | **No** | **23.37 dB** | **24.29 dB** | **11.8615** | **0.07978** | **0.5299** | 85.15% | **26.2 s** |
-| **TFQ3-4b + Hessian-LDLQ (same `TFPN`)** | **4.001** | Yes | 20.40 dB | **24.66 dB** | **11.7776** | 0.08310 | 0.6385 | **86.74%** | 181.7 s |
-| EXL3/QTIP-ref 4b (2D-FWHT + per-col LDLQ) | 4.001 | Yes | 18.03 dB | **25.60 dB** | **11.5248** | **0.06385** | 0.6899 | **87.94%** | 93.6 s |
+| Quantizer | Eff. bpw | Calib? | Weight SNR | Held-Out Out-SNR | WikiText-2 PPL (296,815 tok) | Paired `ΔNLL` vs BF16 (95% CI) | Mean KL (all tok) | p99 KL | Same Top-1 | Conv Time |
+|---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|
+| BF16 Reference (Gold) | 16.000 | No | — | — | **9.2198** | `0.00000` | — | — | — | — |
+| RTN / Affine 4b (in-house, `g64`) | 4.500 | No | 20.57 dB | 21.61 dB | 9.9375 | `+0.07495 [+0.07266, +0.07735]` | 0.09606 | 0.6645 | 85.41% | 0.5 s |
+| RTN / Affine 4b (in-house, `g128`) | 4.250 | No | 19.52 dB | 20.56 dB | 10.2249 | `+0.10347 [+0.10046, +0.10652]` | 0.12230 | 0.8601 | 83.47% | 0.4 s |
+| AWQ-style Salient-Scale 4b (in-house, `g128`) | 4.250 | Yes | 17.64 dB | 22.42 dB | 9.8361 | `+0.06470 [+0.06281, +0.06658]` | 0.07645 | 0.6184 | 86.65% | 10.9 s |
+| GPTQ-LDLQ 4b (in-house, no act-order, `g128`) | 4.250 | Yes | 17.25 dB | 24.21 dB | 9.7188 | `+0.05270 [+0.05039, +0.05500]` | 0.05999 | 0.5435 | 88.42% | 62.2 s |
+| **TFQ3-4b Data-Free (real `.tffpw`)** | **4.001** | **No** | **23.37 dB** | **24.41 dB** | **9.6436** | **`+0.04494 [+0.04313, +0.04679]`** | **0.05507** | **0.3848** | **88.64%** | **29.9 s** |
+| **TFQ3-4b + Hessian-LDLQ (same `TFPN`)** | **4.001** | Yes | 19.77 dB | **25.99 dB** | **9.5979** | **`+0.04019 [+0.03790, +0.04249]`** | 0.05984 | 0.5213 | 88.39% | 241.4 s |
+| Scalar Lloyd-Max + LDLQ 4b (in-house ref) | 4.001 | Yes | 18.03 dB | 25.94 dB | **9.5577** | **`+0.03599 [+0.03400, +0.03786]`** | **0.04669** | 0.4300 | **89.66%** | 94.6 s |
 
-### 3-Bit Head-to-Head (`Gold BF16 PPL = 11.1726`)
+### 3-Bit Head-to-Head (`Gold BF16 PPL = 9.2198`)
 
-| Quantizer | Eff. bpw | Calib Data? | Weight SNR | Held-Out Out-SNR | WikiText-2 PPL (16,352 tok) | Mean KL (4,088 tok) | p99 KL | Same Top-1 | Conv Time |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
-| RTN / MLX Affine 3b (`g64`) | 3.500 | No | 13.95 dB | 14.86 dB | 17.8444 | 0.56950 | 3.4547 | 63.99% | 0.4 s |
-| AWQ Salient-Scale 3b (`g128`) | 3.250 | Yes | 11.01 dB | 15.76 dB | 17.2014 | 0.50336 | 3.7428 | 67.56% | 7.3 s |
-| GPTQ / LDLQ Scalar 3b (`g128`) | 3.250 | Yes | 10.53 dB | 17.22 dB | 15.5764 | 0.43779 | 3.8489 | 68.66% | 62.4 s |
-| **TFQ3-3b Data-Free (real `.tffpw`)** | **3.001** | **No** | **17.31 dB** | **18.20 dB** | **14.0925** | **0.32752** | **2.1367** | **72.36%** | **24.8 s** |
-| TFQ3-3b + Hessian-LDLQ (`beam=8`, `TFPN`) | 3.001 | Yes | 14.53 dB | **18.63 dB** | 14.7363 | 0.37929 | 2.9401 | 69.74% | 182.7 s |
-| EXL3/QTIP-ref 3b (2D-FWHT + per-col LDLQ) | 3.001 | Yes | 12.61 dB | **19.93 dB** | **13.0780** | **0.24721** | 2.3660 | **76.10%** | 95.1 s |
+| Quantizer | Eff. bpw | Calib? | Weight SNR | Held-Out Out-SNR | WikiText-2 PPL (296,815 tok) | Paired `ΔNLL` vs BF16 (95% CI) | Mean KL (all tok) | p99 KL | Same Top-1 | Conv Time |
+|---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|
+| RTN / Affine 3b (in-house, `g64`) | 3.500 | No | 13.95 dB | 14.97 dB | 14.5073 | `+0.45329 [+0.44546, +0.46163]` | 0.50406 | 3.0593 | 67.52% | 0.4 s |
+| AWQ-style Salient-Scale 3b (in-house, `g128`) | 3.250 | Yes | 11.01 dB | 15.80 dB | 13.6294 | `+0.39088 [+0.38220, +0.39925]` | 0.42469 | 3.0958 | 70.98% | 8.4 s |
+| GPTQ-LDLQ 3b (in-house, no act-order, `g128`) | 3.250 | Yes | 10.53 dB | 17.47 dB | 12.6126 | `+0.31334 [+0.30352, +0.32380]` | 0.34027 | 2.8809 | 74.27% | 62.7 s |
+| **TFQ3-3b Data-Free (real `.tffpw`)** | **3.001** | **No** | **17.31 dB** | **18.31 dB** | **11.2579** | **`+0.19971 [+0.19514, +0.20413]`** | **0.22068** | **1.5705** | **77.94%** | **22.8 s** |
+| TFQ3-3b + Hessian-LDLQ (`beam=8`, `TFPN`) | 3.001 | Yes | 13.93 dB | **19.83 dB** | 11.9019 | `+0.25534 [+0.24800, +0.26289]` | 0.29709 | 2.3129 | 75.25% | 226.5 s |
+| Scalar Lloyd-Max + LDLQ 3b (in-house ref) | 3.001 | Yes | 12.61 dB | **20.26 dB** | **10.9609** | **`+0.17298 [+0.16512, +0.18215]`** | **0.20569** | 1.7974 | **79.38%** | 99.8 s |
 
 ### 2-Bit Stress Test (`All 196 Layers Uniform 2-Bit on 1.5B Dense`)
 
-| Quantizer | Eff. bpw | Calib Data? | Weight SNR | Held-Out Out-SNR | WikiText-2 PPL (16,352 tok) | Mean KL (4,088 tok) | Same Top-1 | Conv Time |
-|---|---:|---|---:|---:|---:|---:|---:|---:|
-| RTN / MLX Affine 2b (`g64`) | 2.500 | No | 6.54 dB | 7.22 dB | 36,113.2 | 8.136 | 1.69% | 0.4 s |
-| GPTQ / LDLQ Scalar 2b (`g128`) | 2.250 | Yes | 2.40 dB | 8.88 dB | 695,363.0 | 11.235 | 0.29% | 64.6 s |
-| **TFQ4-E8P 2b Data-Free (real `.tffp4`)** | **2.001** | **No** | **10.10 dB** | **10.75 dB** | **250.17** | **3.037** | **25.86%** | **2.5 s** |
-| **TFQ4-E8P 2b + Hessian-LDLQ (same `TFP4`)** | **2.001** | Yes | 8.73 dB | **12.75 dB** | **210.09** | **3.015** | 25.56% | 142.4 s |
+| Quantizer | Eff. bpw | Calib? | Weight SNR | Held-Out Out-SNR | WikiText-2 PPL (296,815 tok) | Paired `ΔNLL` vs BF16 (95% CI) | Mean KL (all tok) | p99 KL | Same Top-1 | Conv Time |
+|---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|
+| RTN / Affine 2b (in-house, `g64`) | 2.500 | No | 6.54 dB | 7.34 dB | 44,228.2 | `+8.47576 [+8.40813, +8.54594]` | 8.49874 | 18.5430 | 1.91% | 0.3 s |
+| GPTQ-LDLQ 2b (in-house, no act-order, `g128`) | 2.250 | Yes | 2.40 dB | 9.10 dB | 772,872.3 | `+11.33651 [+11.28333, +11.39024]` | 11.37398 | 21.5028 | 0.33% | 66.4 s |
+| **TFQ4-E8P 2b Data-Free (real `.tffp4`)** | **2.001** | **No** | **10.09 dB** | **10.86 dB** | **344.19** | **`+3.61985 [+3.56894, +3.67487]`** | **3.65567** | **11.0220** | **22.46%** | **4.2 s** |
+| **TFQ4-E8P 2b + Hessian-LDLQ (same `TFP4`)** | **2.001** | Yes | 8.24 dB | **15.18 dB** | **33.62** | **`+1.29374 [+1.18321, +1.40998]`** | **1.34896** | **7.4729** | **52.38%** | 210.5 s |
 
 ### Honest Takeaways from the Controlled Comparison
-- **Where data-free TFQ3 wins:** At `4.001 bpw` and `3.001 bpw` with **zero calibration data** in ~25 seconds, TFQ3 beats RTN/MLX-Affine (`4.50`/`3.50 bpw`) and calibrated AWQ (`4.25`/`3.25 bpw`) on every metric, matches calibrated GPTQ at 4-bit (`-35%` lower p99 tail KL at `0.25` fewer bpw), and **beats calibrated GPTQ at 3-bit by `-1.48 PPL` / `-25%` KL / `-44%` p99 KL** at `0.25` fewer bpw.
-- **Where full per-column Hessian LDLQ (EXL3 / QTIP / EAQ) wins:** Full per-column Hessian error propagation after 2D-FWHT (`EXL3/QTIP-ref`) achieves lower PPL (`11.52 vs 11.86` at 4b; `13.08 vs 14.09` at 3b) and lower mean KL (`0.064 vs 0.080` at 4b; `0.247 vs 0.328` at 3b) because it optimizes exact activation output error column-by-column. Notice also that in our Python `beam=8` block-128 `TFQ3+Hessian-LDLQ` mode, single-layer held-out Output SNR improves across every bit width (`+0.37 dB` at 4b, `+0.43 dB` at 3b, `+2.00 dB` at 2b) and improves 4b/2b PPL (`11.78`, `210.1`), while at 3b the smaller Python `beam=8` gives up ~0.9 dB of 128-state GPU Viterbi coding gain vs `tfq3-generic-convert`.
-- **2-bit scope note:** Uniform 2-bit across *all* layers of a small 1.5B dense model degrades perplexity significantly (`210–250` vs `11.17` gold, though 150×–3,000× better than uniform 2b RTN/GPTQ). `TFQ4-E8P` is intended for **cold MoE experts** in large 100B–300B MoE models paired with 4-bit hot experts and full-precision non-MoE layers — not uniform 2-bit dense compression.
+- **Where data-free TFQ3 wins:** At `4.001 bpw` and `3.001 bpw` with **zero calibration data** in ~23–30 seconds, data-free TFQ3 beats our in-house RTN/Affine (`4.50`/`3.50 bpw`), AWQ-style (`4.25`/`3.25 bpw`), and no-act-order GPTQ-LDLQ (`4.25`/`3.25 bpw`) baselines with non-overlapping paired 95% ΔNLL CIs at both bit widths (`+0.04494` vs `+0.05270` nats at 4-bit, `-29%` p99 KL; `+0.19971` vs `+0.31334` nats at 3-bit, `-1.35 PPL`, `-35%` mean KL, `-45%` p99 KL).
+- **Where full per-column Hessian LDLQ wins:** Per-column Hessian error propagation after 2D-FWHT (`Scalar Lloyd-Max + LDLQ` in-house ref) achieves lower PPL (`9.56` vs `9.64` at 4b; `10.96` vs `11.26` at 3b) and lower mean KL (`0.0467` vs `0.0551` at 4b; `0.2057` vs `0.2207` at 3b), while data-free TFQ3 still has lower p99 tail KL (`0.3848` vs `0.4300` at 4b; `1.5705` vs `1.7974` at 3b) and zero calibration dependency. In our Python `beam=8` block-128 `TFQ3+Hessian-LDLQ` mode, single-layer held-out Output SNR improves across every bit width (`+1.58 dB` at 4b, `+1.52 dB` at 3b, `+4.32 dB` at 2b) and lowers 4b PPL (`9.60` vs `9.64`), while at 3b the smaller Python `beam=8` gives up coding gain relative to the compiled `beam=256` converter (`PPL 11.90` vs `11.26`).
+- **2-bit scope note:** At 2.001 bpw across all 196 layers of a 1.5B dense model, conditional Hessian-LDLQ (`TFQ4-E8P + Hessian-LDLQ`) cuts PPL by >10× vs data-free TFQ4 (`33.62` vs `344.19`, `+4.32 dB` Out-SNR, `52.4%` Top-1 agreement vs `22.5%`), though uniform 2-bit across *all* layers of a small 1.5B dense model still degrades perplexity substantially vs `9.22` BF16. `TFQ4-E8P` is intended for **cold MoE experts** in large 100B–300B MoE models paired with 4-bit hot experts and full-precision non-MoE layers — not uniform 2-bit dense compression.
 
 ---
 

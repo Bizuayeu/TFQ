@@ -80,23 +80,25 @@ See [`integrations/README.md`](integrations/README.md) for PyTorch, Hugging Face
 
 ## Controlled Head-to-Head Quality Benchmarks `[MEASURED]`
 
-Controlled comparison on **`Qwen/Qwen2.5-1.5B`** (all **196** transformer linear layers quantized; `embed_tokens` & `lm_head` kept BF16; **`16,352` held-out WikiText-2 test tokens**; **`4,088` full-vocab exact `fp64` KL tokens**; held-out real-activation Output SNR). Full SHA-256 provenance receipt: [`benchmarks/provenance_qwen25_1p5b.json`](benchmarks/provenance_qwen25_1p5b.json) (reproduce with `tools/bench_quantizers.py`).
+Controlled comparison on **`Qwen/Qwen2.5-1.5B`** (all **196** transformer linear layers quantized; `embed_tokens` & `lm_head` kept BF16; full WikiText-2 test split: **`145 × 2048 = 296,815` scored tokens**; full-vocabulary exact `fp64` KL across **all `296,815` tokens**; paired per-sequence `ΔNLL` vs BF16 with 2,000-sample paired bootstrap 95% CI). Full SHA-256 provenance receipt (`git_dirty: false`, pinning clean commit `5079156`, converter binary hashes, output shard hashes, and raw `seq_nlls`): [`benchmarks/provenance_qwen25_1p5b.json`](benchmarks/provenance_qwen25_1p5b.json) (reproduce with `tools/bench_quantizers.py --seq-len 2048 --eval-seqs 0 --kl-seqs 0`).
 
-| Method (`Gold BF16 PPL = 11.1726`) | Eff. bpw | Calib? | Held-Out Out-SNR | WikiText-2 PPL | Mean KL | p99 KL | Conv Time |
-|---|---:|---|---:|---:|---:|---:|---:|
-| RTN / MLX Affine 4b (`g64`) | 4.500 | No | 21.50 dB | 12.1522 | 0.13772 | 1.0543 | 4.2 s |
-| AWQ Salient-Scale 4b (`g128`) | 4.250 | Yes | 22.38 dB | 12.0603 | 0.10383 | 0.9321 | 6.8 s |
-| GPTQ / LDLQ Scalar 4b (`g128`) | 4.250 | Yes | 23.96 dB | 11.8600 | 0.07855 | 0.8114 | 62.6 s |
-| **TFQ3-4b Data-Free (real `.tffpw`)** | **4.001** | **No** | **24.29 dB** | **11.8615** | **0.07978** | **0.5299** | **26.2 s** |
-| **TFQ3-4b + Hessian-LDLQ (`TFPN`)** | **4.001** | Yes | **24.66 dB** | **11.7776** | 0.08310 | 0.6385 | 181.7 s |
-| EXL3/QTIP-ref 4b (per-col LDLQ) | 4.001 | Yes | **25.60 dB** | **11.5248** | **0.06385** | 0.6899 | 93.6 s |
-| RTN / MLX Affine 3b (`g64`) | 3.500 | No | 14.86 dB | 17.8444 | 0.56950 | 3.4547 | 0.4 s |
-| AWQ Salient-Scale 3b (`g128`) | 3.250 | Yes | 15.76 dB | 17.2014 | 0.50336 | 3.7428 | 7.3 s |
-| GPTQ / LDLQ Scalar 3b (`g128`) | 3.250 | Yes | 17.22 dB | 15.5764 | 0.43779 | 3.8489 | 62.4 s |
-| **TFQ3-3b Data-Free (real `.tffpw`)** | **3.001** | **No** | **18.20 dB** | **14.0925** | **0.32752** | **2.1367** | **24.8 s** |
-| EXL3/QTIP-ref 3b (per-col LDLQ) | 3.001 | Yes | **19.93 dB** | **13.0780** | **0.24721** | 2.3660 | 95.1 s |
+> *Baseline note: Non-TFQ baselines below are in-house reference implementations in `tools/bench_quantizers.py` (our `GPTQ-LDLQ` baseline omits act-order and fixes group min/max scales before feedback; `Scalar Lloyd-Max + LDLQ` uses a 1D optimal Gaussian grid after 2D-FWHT, not EXL3's trellis codebook).*
 
-**Trade-off summary:** Data-free TFQ3 converts in seconds with zero calibration data and beats RTN/MLX-Affine, calibrated AWQ, and calibrated GPTQ (especially at 3-bit: `-1.48 PPL` and `-44%` p99 KL vs GPTQ at `0.25` fewer bpw). Full per-column Hessian LDLQ (`EXL3/QTIP/EAQ`) still achieves lower PPL/KL when you can afford calibration data and slow conversion.
+| Method (`Gold BF16 PPL = 9.2198`) | Eff. bpw | Calib? | Held-Out Out-SNR | WikiText-2 PPL | Paired `ΔNLL` vs BF16 (95% CI) | Mean KL (all tok) | p99 KL | Conv Time |
+|---|---:|---|---:|---:|---|---:|---:|---:|
+| RTN / Affine 4b (in-house, `g64`) | 4.500 | No | 21.61 dB | 9.9375 | `+0.07495 [+0.07266, +0.07735]` | 0.09606 | 0.6645 | 0.5 s |
+| AWQ-style Salient-Scale 4b (in-house, `g128`) | 4.250 | Yes | 22.42 dB | 9.8361 | `+0.06470 [+0.06281, +0.06658]` | 0.07645 | 0.6184 | 10.9 s |
+| GPTQ-LDLQ 4b (in-house, no act-order, `g128`) | 4.250 | Yes | 24.21 dB | 9.7188 | `+0.05270 [+0.05039, +0.05500]` | 0.05999 | 0.5435 | 62.2 s |
+| **TFQ3-4b Data-Free (real `.tffpw`)** | **4.001** | **No** | **24.41 dB** | **9.6436** | **`+0.04494 [+0.04313, +0.04679]`** | **0.05507** | **0.3848** | **29.9 s** |
+| **TFQ3-4b + Hessian-LDLQ (same `TFPN`)** | **4.001** | Yes | **25.99 dB** | **9.5979** | **`+0.04019 [+0.03790, +0.04249]`** | 0.05984 | 0.5213 | 241.4 s |
+| Scalar Lloyd-Max + LDLQ 4b (in-house ref) | 4.001 | Yes | 25.94 dB | **9.5577** | **`+0.03599 [+0.03400, +0.03786]`** | **0.04669** | 0.4300 | 94.6 s |
+| RTN / Affine 3b (in-house, `g64`) | 3.500 | No | 14.97 dB | 14.5073 | `+0.45329 [+0.44546, +0.46163]` | 0.50406 | 3.0593 | 0.4 s |
+| AWQ-style Salient-Scale 3b (in-house, `g128`) | 3.250 | Yes | 15.80 dB | 13.6294 | `+0.39088 [+0.38220, +0.39925]` | 0.42469 | 3.0958 | 8.4 s |
+| GPTQ-LDLQ 3b (in-house, no act-order, `g128`) | 3.250 | Yes | 17.47 dB | 12.6126 | `+0.31334 [+0.30352, +0.32380]` | 0.34027 | 2.8809 | 62.7 s |
+| **TFQ3-3b Data-Free (real `.tffpw`)** | **3.001** | **No** | **18.31 dB** | **11.2579** | **`+0.19971 [+0.19514, +0.20413]`** | **0.22068** | **1.5705** | **22.8 s** |
+| Scalar Lloyd-Max + LDLQ 3b (in-house ref) | 3.001 | Yes | **20.26 dB** | **10.9609** | **`+0.17298 [+0.16512, +0.18215]`** | **0.20569** | 1.7974 | 99.8 s |
+
+**Trade-off summary:** With zero calibration data in ~23–30 seconds, data-free TFQ3 beats our in-house RTN/Affine, AWQ-style, and no-act-order GPTQ-LDLQ baselines at both 4-bit (`ΔNLL +0.0449` vs `+0.0527`, non-overlapping 95% CIs, `-29%` p99 KL at `0.25` fewer bpw) and 3-bit (`PPL 11.26` vs `12.61`, `-45%` p99 KL at `0.25` fewer bpw). Full per-column Hessian LDLQ after 2D-FWHT (`Scalar Lloyd-Max + LDLQ` ref, and external calibrated quantizers like EXL3/QTIP) still achieves lower PPL and mean KL when calibration data and slower conversion are acceptable.
 
 ### Flagship TensorFold Runtime Families `[MEASURED — TensorFold runner, no per-sequence JSON receipt in benchmarks/]`
 
