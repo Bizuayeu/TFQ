@@ -32,6 +32,7 @@ per-sequence NLL arrays.
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import hashlib
 import json
@@ -346,6 +347,8 @@ def evaluate_model_ppl_and_kl(
             kl_vals.append(kl.numpy())
             top1_match += int((lp_ref.argmax(dim=-1) == lp_q.argmax(dim=-1)).sum().item())
             top1_tot += int(lp_ref.shape[0])
+            del ref_logits, lp_ref, lp_q, p_ref, kl
+        del ids_dev, logits, targets, logp, tok_nll
 
     mean_nll = tot_nll / tot_tok
     ppl = math.exp(mean_nll)
@@ -430,7 +433,7 @@ def load_real_tfq3_binary_weights(model_dir: str, bits: int, tmp_dir: str) -> tu
                 sc = np.frombuffer(f.read((R // 128) * (C // 128) * 2), dtype=np.float16).reshape(R // 128, C // 128)
                 f.seek(off_weights + w_off * 4)
                 wd = np.frombuffer(f.read(w_cnt * 4), dtype=np.uint32)
-                W_dec = decode_tfpn_fast_np(wd, sc, R, C, b, tbl)[:orig_r, :orig_c]
+                W_dec = np.ascontiguousarray(decode_tfpn_fast_np(wd, sc, R, C, b, tbl)[:orig_r, :orig_c])
                 if not verified_ref:
                     W_ref = tfq3_ref.dequantize_tfpn_tensor(shard_path, tbl_path, nm, max_blocks=1)
                     err = float(np.max(np.abs(W_dec[:128, :128] - W_ref)))
@@ -478,7 +481,7 @@ def load_real_tfq4_binary_weights(model_dir: str, tmp_dir: str) -> tuple[dict[st
             R, C, _, _, _, _, _, orig_r, orig_c, _ = struct.unpack("<IIIIQQfIII", rec[80:])
             orig_r = orig_r or R
             orig_c = orig_c or C
-            weights[nm] = tfq4_ref.dequantize_tfp4_tensor(shard_path, tbl_path, nm)[:orig_r, :orig_c]
+            weights[nm] = np.ascontiguousarray(tfq4_ref.dequantize_tfp4_tensor(shard_path, tbl_path, nm)[:orig_r, :orig_c])
     prov = {
         "converter_binary": os.path.basename(conv_bin),
         "converter_binary_sha256": sha256_file(conv_bin),
@@ -580,8 +583,7 @@ def main() -> None:
             o_snrs.append(osnr)
             mod_map[nm].weight.data.copy_(W_hat.to(device=device, dtype=torch.bfloat16))
             del W_hat, W_orig
-        if device.type == "mps":
-            torch.mps.empty_cache()
+        gc.collect()
         conv_s = conv_sec_override if conv_sec_override is not None else quant_time
         ev = evaluate_model_ppl_and_kl(model, eval_batches, args.kl_seqs, ref_model, gold_seq_nlls, device)
         row = {
@@ -605,38 +607,51 @@ def main() -> None:
         )
         for nm in target_linears:
             mod_map[nm].weight.data.copy_(orig_weights[nm].to(device=device, dtype=torch.bfloat16))
+        if device.type == "mps":
+            torch.mps.synchronize()
+        elif device.type == "cuda":
+            torch.cuda.synchronize()
+        gc.collect()
 
-    # Precompute Cholesky factors ONCE per unique layer Hessian
+    # Precompute Cholesky factors ONCE per unique layer Hessian (deduplicating shared Q/K/V & gate/up inputs)
     t_ch = time.time()
     gptq_uinv: dict[str, torch.Tensor] = {}
     rot_h_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     rot_uinv_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    unique_ch: dict[tuple[tuple[int, ...], str], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
     for nm in target_linears:
         Hc = H_calib[nm]
-        pad_C = ((Hc.shape[0] + 127) // 128) * 128
-        H_inv_raw = tfq3_h.compute_h_inv_cholesky(Hc, damp=0.01)
-        gptq_uinv[nm] = torch.linalg.cholesky(H_inv_raw.to(torch.float64)).T.to(torch.float32)
+        h_key = (tuple(Hc.shape), sha256_bytes(Hc.contiguous().numpy().tobytes()))
+        if h_key not in unique_ch:
+            pad_C = ((Hc.shape[0] + 127) // 128) * 128
+            H_inv_raw = tfq3_h.compute_h_inv_cholesky(Hc, damp=0.01)
+            u_raw = torch.linalg.cholesky(H_inv_raw.to(torch.float64)).T.to(torch.float32)
 
-        H_pad = tfq3_h.pad_hessian_128(Hc.to(device), pad_C)
-        H_rot = tfq3_h.rotate_hessian_torch(H_pad).cpu()
-        H_rot_inv = tfq3_h.compute_h_inv_cholesky(H_rot, damp=0.01)
-        U_rot_inv = torch.linalg.cholesky(H_rot_inv.to(torch.float64)).T.to(torch.float32)
+            H_pad = tfq3_h.pad_hessian_128(Hc.to(device), pad_C)
+            H_rot = tfq3_h.rotate_hessian_torch(H_pad).cpu()
+            del H_pad
+            H_rot_inv = tfq3_h.compute_h_inv_cholesky(H_rot, damp=0.01)
+            u_rot = torch.linalg.cholesky(H_rot_inv.to(torch.float64)).T.to(torch.float32)
+            unique_ch[h_key] = (u_raw, H_rot, H_rot_inv, u_rot)
+        u_raw, H_rot, H_rot_inv, u_rot = unique_ch[h_key]
+        gptq_uinv[nm] = u_raw
         rot_h_cache[nm] = (H_rot, H_rot_inv)
-        rot_uinv_cache[nm] = (H_rot, U_rot_inv)
+        rot_uinv_cache[nm] = (H_rot, u_rot)
+    del unique_ch
+    gc.collect()
     print(f"Precomputed {len(target_linears)} Cholesky & rotated-Hessian factors in {time.time() - t_ch:.1f}s")
 
     with tempfile.TemporaryDirectory(prefix="tfq_bench_") as tmp:
-        tfq3_4b_w, tfq3_4b_s, tfq3_4b_prov = load_real_tfq3_binary_weights(args.model, 4, tmp)
-        tfq3_3b_w, tfq3_3b_s, tfq3_3b_prov = load_real_tfq3_binary_weights(args.model, 3, tmp)
-        tfq4_2b_w, e8p_lut, tfq4_2b_s, tfq4_2b_prov = load_real_tfq4_binary_weights(args.model, tmp)
-        tables = tfq3_ref.load_tables(os.path.join(tmp, "real_tfq3_4b", "pw_v3_tables.bin"))
-
         print("\n=== 4-BIT HEAD-TO-HEAD (All 196 Linear Layers, BF16 Embed/Head) ===")
         run_variant("RTN / Affine 4b (in-house, g64)", "in-house", 4, 4.500, False, lambda nm, W: quant_affine_rtn(W, 4, 64))
         run_variant("RTN / Affine 4b (in-house, g128)", "in-house", 4, 4.250, False, lambda nm, W: quant_affine_rtn(W, 4, 128))
         run_variant("AWQ-style Salient-Scale 4b (in-house, g128)", "in-house", 4, 4.250, True, lambda nm, W: quant_awq_salient(W, H_calib[nm].to(device), 4, 128))
         run_variant("GPTQ-LDLQ 4b (in-house, no act-order, g128)", "in-house", 4, 4.250, True, lambda nm, W: quant_gptq_ldlq(W, H_calib[nm], 4, 128, u_inv=gptq_uinv[nm]))
+        tfq3_4b_w, tfq3_4b_s, tfq3_4b_prov = load_real_tfq3_binary_weights(args.model, 4, tmp)
+        tables = tfq3_ref.load_tables(os.path.join(tmp, "real_tfq3_4b", "pw_v3_tables.bin"))
         run_variant("TFQ3-4b Data-Free (real .tffpw)", "tfq-binary", 4, 4.001, False, lambda nm, W: torch.from_numpy(tfq3_4b_w[nm]).to(device), conv_sec_override=tfq3_4b_s, converter_prov=tfq3_4b_prov)
+        del tfq3_4b_w
+        gc.collect()
         if not args.skip_hessian_tfq:
             run_variant(
                 "TFQ3-4b + Hessian-LDLQ (same TFPN)", "tfq-hessian", 4, 4.001, True,
@@ -651,7 +666,10 @@ def main() -> None:
         run_variant("RTN / Affine 3b (in-house, g64)", "in-house", 3, 3.500, False, lambda nm, W: quant_affine_rtn(W, 3, 64))
         run_variant("AWQ-style Salient-Scale 3b (in-house, g128)", "in-house", 3, 3.250, True, lambda nm, W: quant_awq_salient(W, H_calib[nm].to(device), 3, 128))
         run_variant("GPTQ-LDLQ 3b (in-house, no act-order, g128)", "in-house", 3, 3.250, True, lambda nm, W: quant_gptq_ldlq(W, H_calib[nm], 3, 128, u_inv=gptq_uinv[nm]))
+        tfq3_3b_w, tfq3_3b_s, tfq3_3b_prov = load_real_tfq3_binary_weights(args.model, 3, tmp)
         run_variant("TFQ3-3b Data-Free (real .tffpw)", "tfq-binary", 3, 3.001, False, lambda nm, W: torch.from_numpy(tfq3_3b_w[nm]).to(device), conv_sec_override=tfq3_3b_s, converter_prov=tfq3_3b_prov)
+        del tfq3_3b_w
+        gc.collect()
         if not args.skip_hessian_tfq:
             run_variant(
                 "TFQ3-3b + Hessian-LDLQ (same TFPN)", "tfq-hessian", 3, 3.001, True,
@@ -665,7 +683,10 @@ def main() -> None:
         print("\n=== 2-BIT HEAD-TO-HEAD (All 196 Linear Layers, BF16 Embed/Head) ===")
         run_variant("RTN / Affine 2b (in-house, g64)", "in-house", 2, 2.500, False, lambda nm, W: quant_affine_rtn(W, 2, 64))
         run_variant("GPTQ-LDLQ 2b (in-house, no act-order, g128)", "in-house", 2, 2.250, True, lambda nm, W: quant_gptq_ldlq(W, H_calib[nm], 2, 128, u_inv=gptq_uinv[nm]))
+        tfq4_2b_w, e8p_lut, tfq4_2b_s, tfq4_2b_prov = load_real_tfq4_binary_weights(args.model, tmp)
         run_variant("TFQ4-E8P 2b Data-Free (real .tffp4)", "tfq-binary", 2, 2.001, False, lambda nm, W: torch.from_numpy(tfq4_2b_w[nm]).to(device), conv_sec_override=tfq4_2b_s, converter_prov=tfq4_2b_prov)
+        del tfq4_2b_w
+        gc.collect()
         if not args.skip_hessian_tfq:
             run_variant(
                 "TFQ4-E8P 2b + Hessian-LDLQ (same TFP4)", "tfq-hessian", 2, 2.001, True,
